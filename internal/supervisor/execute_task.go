@@ -51,16 +51,18 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	}
 
 	workerID := fmt.Sprintf("worker-%d", time.Now().UTC().UnixNano())
-	capabilities := harness.Descriptor().Capabilities
-	if s.config.SafeMode {
-		capabilities.PermissionEvents = false
-		capabilities.Hooks = false
-	}
+	capSet := s.computeSessionCapabilities(harness, runtime.Task)
 	seed := domain.WorkerSession{
 		WorkerID: domain.WorkerID(workerID), TaskID: runtime.Task.TaskID, Harness: s.config.Harness,
 		AdapterVersion: harness.Descriptor().AdapterVersion, StartedAt: time.Now().UTC(),
 		LastEventAt: time.Now().UTC(), LastProgressAt: time.Now().UTC(),
-		Capabilities: capabilityMap(capabilities),
+		Capabilities:           adapter.CapabilityMap(capSet.Effective),
+		DeclaredCapabilities:   adapter.CapabilityMap(capSet.Declared),
+		ProbeCapabilities:      adapter.CapabilityMap(capSet.Probe),
+		ConfiguredCapabilities: adapter.CapabilityMap(capSet.Configured),
+		CapabilityDowngrades:   append([]string(nil), capSet.Downgrades...),
+		PermissionMode:         s.config.PermissionMode,
+		HooksInstalled:         capSet.Configured.Hooks,
 		StatusDimensions: state.Dimensions{
 			Process: state.ProcessStarting, Protocol: state.ProtocolInitializing,
 			Progress: state.ProgressActive, Task: state.TaskRunning,

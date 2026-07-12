@@ -149,21 +149,29 @@ type Task struct {
 }
 
 type WorkerSession struct {
-	WorkerID             WorkerID         `json:"worker_id"`
-	TaskID               TaskID           `json:"task_id"`
-	Harness              string           `json:"harness"`
-	AdapterVersion       string           `json:"adapter_version"`
-	NativeSessionID      string           `json:"native_session_id,omitempty"`
-	NativeTurnID         string           `json:"native_turn_id,omitempty"`
-	PID                  int              `json:"pid,omitempty"`
-	ProcessStartToken    string           `json:"process_start_token,omitempty"`
-	ProcessGroupIdentity string           `json:"process_group_identity,omitempty"`
-	StartedAt            time.Time        `json:"started_at"`
-	LastEventAt          time.Time        `json:"last_event_at"`
-	LastProgressAt       time.Time        `json:"last_progress_at"`
-	EndedAt              *time.Time       `json:"ended_at,omitempty"`
-	ExitCode             *int             `json:"exit_code,omitempty"`
-	Capabilities         map[string]bool  `json:"capabilities"`
-	Attempt              int              `json:"attempt"`
-	StatusDimensions     state.Dimensions `json:"status_dimensions"`
+	WorkerID             WorkerID        `json:"worker_id"`
+	TaskID               TaskID          `json:"task_id"`
+	Harness              string          `json:"harness"`
+	AdapterVersion       string          `json:"adapter_version"`
+	NativeSessionID      string          `json:"native_session_id,omitempty"`
+	NativeTurnID         string          `json:"native_turn_id,omitempty"`
+	PID                  int             `json:"pid,omitempty"`
+	ProcessStartToken    string          `json:"process_start_token,omitempty"`
+	ProcessGroupIdentity string          `json:"process_group_identity,omitempty"`
+	StartedAt            time.Time       `json:"started_at"`
+	LastEventAt          time.Time       `json:"last_event_at"`
+	LastProgressAt       time.Time       `json:"last_progress_at"`
+	EndedAt              *time.Time      `json:"ended_at,omitempty"`
+	ExitCode             *int            `json:"exit_code,omitempty"`
+	Capabilities         map[string]bool `json:"capabilities"` // EffectiveCapabilities map form
+	// Capability layers for audit (JSON-friendly maps).
+	DeclaredCapabilities   map[string]bool  `json:"declared_capabilities,omitempty"`
+	ProbeCapabilities      map[string]bool  `json:"probe_capabilities,omitempty"`
+	ConfiguredCapabilities map[string]bool  `json:"configured_capabilities,omitempty"`
+	CapabilityDowngrades   []string         `json:"capability_downgrades,omitempty"`
+	PermissionMode         string           `json:"permission_mode,omitempty"`
+	HooksInstalled         bool             `json:"hooks_installed,omitempty"`
+	Attempt                int              `json:"attempt"`
+	AttemptMode            string           `json:"attempt_mode,omitempty"`
+	StatusDimensions       state.Dimensions `json:"status_dimensions"`
 }

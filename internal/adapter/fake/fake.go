@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,21 @@ func New(capabilities adapter.Capabilities) *Adapter {
 
 func (a *Adapter) Descriptor() adapter.Descriptor {
 	return adapter.Descriptor{Name: adapter.HarnessFake, AdapterVersion: "1.0.0", RuntimeImplemented: true, Compatibility: "verified", Capabilities: a.capabilities}
+}
+
+// SessionConfigFact reports what the fake installs. Steer is considered
+// contract-verified for tests that declare SteerActiveTurn (fake models true immediate).
+func (a *Adapter) SessionConfigFact(req adapter.StartRequest) adapter.SessionConfigFact {
+	safe := strings.EqualFold(req.Options["safe_mode"], "true")
+	hooks := a.capabilities.Hooks && !safe
+	return adapter.SessionConfigFact{
+		PermissionMode:   req.Options["permission_mode"],
+		HooksInstalled:   hooks && a.capabilities.PermissionEvents,
+		MCPEnabled:       !safe,
+		SafeMode:         safe,
+		SteerVerified:    a.capabilities.SteerActiveTurn,
+		NextTurnDelivery: !a.capabilities.SteerActiveTurn && a.capabilities.BidirectionalStream,
+	}
 }
 
 func (a *Adapter) Probe(context.Context, adapter.ProbeRequest) (adapter.ProbeResult, error) {

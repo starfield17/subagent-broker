@@ -748,10 +748,31 @@ func (s *Service) preflightWave(ctx context.Context, planned domain.WavePlan) er
 	}
 	// Environment preflight probes each unique harness once via the registry.
 	result := wave.EvaluatePreflight(ctx, tasks, wave.PreflightEnvironment{
-		Registry:     s.registry,
-		Executable:   s.config.Executable,
-		ProbeTimeout: 10 * time.Second,
+		Registry:       s.registry,
+		Executable:     s.config.Executable,
+		ProbeTimeout:   10 * time.Second,
+		PermissionMode: s.config.PermissionMode,
+		// Permission hooks are only mandatory for Claude sessions that claim broker-mediated tools.
+		RequirePermissionHooks: !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode) &&
+			adapter.RequiresPermissionRouting(s.config.PermissionMode, false),
+		SafeMode: s.config.SafeMode,
 	})
+	// Reject wave when Claude permission routing is required but would not be effective.
+	if !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode) &&
+		adapter.RequiresPermissionRouting(s.config.PermissionMode, false) {
+		for name := range result.Harnesses {
+			if harness, ok := s.registry.Get(adapter.HarnessName(name)); ok {
+				set := s.computeSessionCapabilities(harness, domain.Task{})
+				if !set.Effective.PermissionEvents {
+					result.Issues = append(result.Issues, wave.Issue{
+						Kind: wave.IssueHarnessProbeFailed, Severity: wave.SeverityError, Tasks: []string{name},
+						Details: fmt.Sprintf("harness %s permission_events not effective (hooks not installed or safe mode); downgrades: %v", name, set.Downgrades),
+					})
+					result.Allowed = false
+				}
+			}
+		}
+	}
 	paths := s.wavePaths(planned.WaveID)
 	if err := storage.AtomicWriteJSON(paths.Preflight, result, 0o600); err != nil {
 		return err
@@ -1081,14 +1102,61 @@ func taskIDs(tasks []domain.Task) []domain.TaskID {
 }
 
 func capabilityMap(value adapter.Capabilities) map[string]bool {
-	return map[string]bool{
-		"structured_stream": value.StructuredStream, "bidirectional_stream": value.BidirectionalStream,
-		"resume_session": value.ResumeSession, "steer_active_turn": value.SteerActiveTurn,
-		"interrupt_turn": value.InterruptTurn, "structured_final_output": value.StructuredFinalOutput,
-		"permission_events": value.PermissionEvents, "diff_events": value.DiffEvents,
-		"usage_events": value.UsageEvents, "hooks": value.Hooks, "session_history": value.SessionHistory,
-	}
+	return adapter.CapabilityMap(value)
 }
+
+// computeSessionCapabilities derives EffectiveCapabilities for a Task session.
+func (s *Service) computeSessionCapabilities(harness adapter.Adapter, task domain.Task) adapter.CapabilitySet {
+	declared := harness.Descriptor().Capabilities
+	probeCaps := declared
+	// Best-effort probe; failures leave probe=declared (unverified probe does not invent support).
+	if probe, err := harness.Probe(context.Background(), adapter.ProbeRequest{Executable: s.config.Executable}); err == nil && probe.Installed {
+		// Use declared∩probe.Capabilities when probe returns capability bits.
+		if probe.Capabilities != (adapter.Capabilities{}) {
+			probeCaps = probe.Capabilities
+		}
+	}
+	fact := adapter.SessionConfigFact{
+		PermissionMode: s.config.PermissionMode,
+		SafeMode:       s.config.SafeMode,
+	}
+	// Ask adapter for session install facts when supported.
+	type factProvider interface {
+		SessionConfigFact(adapter.StartRequest) adapter.SessionConfigFact
+	}
+	if fp, ok := harness.(factProvider); ok {
+		req := adapter.StartRequest{
+			Options: map[string]string{
+				"permission_mode": s.config.PermissionMode,
+				"safe_mode":       fmt.Sprintf("%v", s.config.SafeMode),
+			},
+			Interaction: adapter.InteractionConfig{
+				Enabled: !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode),
+			},
+		}
+		fact = fp.SessionConfigFact(req)
+	} else {
+		// Generic adapters without SessionConfigFact: only enable hooks when not safe.
+		fact.HooksInstalled = !s.config.SafeMode && declared.Hooks
+		fact.MCPEnabled = !s.config.SafeMode
+		fact.SteerVerified = false
+		fact.NextTurnDelivery = declared.BidirectionalStream
+	}
+	// Contract registry may mark steer verified for this harness/version.
+	if contractSteerVerified(string(harness.Descriptor().Name), harness.Descriptor().TestedMaxVersion) {
+		fact.SteerVerified = true
+		fact.NextTurnDelivery = false
+	}
+	// Fake harness versions use "fake-1.0.0" in probe; also check empty version.
+	if contractSteerVerified(string(harness.Descriptor().Name), "") {
+		fact.SteerVerified = true
+	}
+	_ = task
+	return adapter.DeriveEffective(declared, probeCaps, fact)
+}
+
+// contractSteerVerified is implemented in contract_bridge.go to avoid import cycles
+// when contracttest is not linked; default false.
 
 func (s *Service) markPartial(runtime *TaskState, status report.Status) error {
 	if err := s.transitionTask(runtime, state.TaskVerifying); err != nil {

@@ -163,11 +163,15 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 		if err != nil {
 			return adapter.Session{}, err
 		}
+		// Install permission hooks for every permission mode that claims PermissionEvents.
+		// Previously only "default" installed hooks while capability still advertised true.
 		hookCommand := strings.Join([]string{shellQuote(req.Interaction.BrokerExecutable), "claude-hook", "--run-dir", shellQuote(req.Interaction.RunDir), "--task", shellQuote(req.TaskID), "--worker", shellQuote(req.WorkerID)}, " ")
-		settingsValue := map[string]any{}
-		if req.Options["permission_mode"] == "default" {
-			settingsValue["permissions"] = map[string]any{"allow": []string{"Bash", "Write", "Edit"}}
-			settingsValue["hooks"] = map[string]any{"PreToolUse": []any{map[string]any{"matcher": "Bash|Write|Edit", "hooks": []any{map[string]any{"type": "command", "command": hookCommand}}}}}
+		settingsValue := map[string]any{
+			"permissions": map[string]any{"allow": []string{"Bash", "Write", "Edit"}},
+			"hooks": map[string]any{"PreToolUse": []any{map[string]any{
+				"matcher": "Bash|Write|Edit",
+				"hooks":   []any{map[string]any{"type": "command", "command": hookCommand}},
+			}}},
 		}
 		settings, err := json.Marshal(settingsValue)
 		if err != nil {
@@ -258,11 +262,30 @@ func (a *Adapter) SendMessage(_ context.Context, id, message string) (adapter.De
 	if err := sendUserMessage(state, message); err != nil {
 		return adapter.DeliveryResult{}, err
 	}
-	return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: message}, nil
+	// Stdin write alone only proves next-turn queueing unless a contract test
+	// has verified same-turn steer for this harness version.
+	return adapter.DeliveryResult{Mode: adapter.DeliveryNextTurn, MessageID: message}, nil
 }
 
 func (a *Adapter) SteerActiveTurn(ctx context.Context, id, message string) (adapter.DeliveryResult, error) {
+	// Without a verified active-turn contract, do not claim DeliveryImmediate.
+	// Writing stdin successfully is not proof of same-turn injection.
 	return a.SendMessage(ctx, id, message)
+}
+
+// SessionConfigFact returns what this adapter actually installs for a start request.
+func (a *Adapter) SessionConfigFact(req adapter.StartRequest) adapter.SessionConfigFact {
+	mode := req.Options["permission_mode"]
+	safe := strings.EqualFold(req.Options["safe_mode"], "true")
+	hooks := req.Interaction.Enabled && !safe
+	return adapter.SessionConfigFact{
+		PermissionMode:   mode,
+		HooksInstalled:   hooks,
+		MCPEnabled:       req.Interaction.Enabled && !safe,
+		SafeMode:         safe,
+		SteerVerified:    false, // real contract test may flip this via contract registry
+		NextTurnDelivery: true,
+	}
 }
 
 func (a *Adapter) InterruptTurn(ctx context.Context, id string) error {

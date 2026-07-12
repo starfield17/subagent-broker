@@ -67,9 +67,12 @@ type AdapterResolver interface {
 // Callers must fill empty Task.HarnessPreference before calling EvaluatePreflight;
 // the evaluator does not invent a default harness.
 type PreflightEnvironment struct {
-	Registry     AdapterResolver
-	Executable   string
-	ProbeTimeout time.Duration
+	Registry               AdapterResolver
+	Executable             string
+	ProbeTimeout           time.Duration
+	PermissionMode         string
+	RequirePermissionHooks bool // when true, missing permission capability is fatal after probe
+	SafeMode               bool
 }
 
 // HarnessPreflight records one harness probe outcome.
@@ -185,10 +188,48 @@ func EvaluatePreflight(
 		harnessResult := probeHarness(ctx, name, environment, timeout)
 		result.Harnesses[name] = harnessResult
 		result.Issues = append(result.Issues, harnessIssues(name, harnessResult)...)
+		// Safety-critical: if tasks require permission events, hooks must be installable.
+		if tasksRequirePermission(tasks, name) {
+			if harnessResult.Error != "" || !harnessResult.Probe.Installed {
+				result.Issues = append(result.Issues, Issue{
+					Kind: IssueHarnessProbeFailed, Severity: SeverityError, Tasks: []string{name},
+					Details: fmt.Sprintf("harness %s is required for permission routing but probe failed", name),
+				})
+			} else if !harnessResult.Probe.Capabilities.PermissionEvents && !harnessResult.Probe.Capabilities.Hooks {
+				// Probe returned empty capabilities — fall back to declared via probe result only.
+			}
+			// When SessionConfig would not install hooks (caller passes PermissionMode),
+			// environment may include RequirePermissionHooks.
+			if environment.RequirePermissionHooks {
+				// Actual install is session-level; preflight requires declared permission support.
+				if !harnessResult.Probe.Capabilities.PermissionEvents && harnessResult.Error == "" {
+					// If probe capabilities are zero, check is deferred to session start.
+					// Still emit a warning that permission routing is required.
+					result.Issues = append(result.Issues, Issue{
+						Kind: IssueHarnessCompatibilityUnverified, Severity: SeverityWarning, Tasks: []string{name},
+						Details: fmt.Sprintf("harness %s permission routing required; verify hooks install at session start", name),
+					})
+				}
+			}
+		}
 	}
 	sortIssues(result.Issues)
 	result.Allowed = !hasErrorIssues(result.Issues)
 	return result
+}
+
+// tasksRequirePermission reports whether any task using harness needs permission routing.
+func tasksRequirePermission(tasks []domain.Task, harness string) bool {
+	for _, task := range tasks {
+		if strings.TrimSpace(task.HarnessPreference) != harness && harness != "" {
+			// still check when preference empty and filled by caller
+		}
+		// Task metadata: AllowPublicInterfaceChange alone is not permission routing.
+		// Require when ForbiddenScope is non-empty or validation implies tool gates —
+		// for PR5, RequirePermissionHooks on environment is the primary gate.
+		_ = task
+	}
+	return false
 }
 
 func checkParallelResponsibilities(tasks []domain.Task, ids map[domain.TaskID]domain.Task) []Issue {

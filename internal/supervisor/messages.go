@@ -182,35 +182,61 @@ func (s *Service) SendInstruction(ctx context.Context, taskID, text string) (ada
 	return s.deliverInstruction(ctx, queued, text)
 }
 
+func (s *Service) effectiveCapsForTask(taskID string, harness adapter.Adapter) adapter.Capabilities {
+	if runtime, ok := s.taskState(domain.TaskID(taskID)); ok && runtime.Worker != nil && len(runtime.Worker.Capabilities) > 0 {
+		return adapter.CapabilitiesFromMap(runtime.Worker.Capabilities)
+	}
+	if harness != nil {
+		return s.computeSessionCapabilities(harness, domain.Task{TaskID: domain.TaskID(taskID)}).Effective
+	}
+	return adapter.Capabilities{}
+}
+
 func (s *Service) selectInstructionRoute(taskID string) (message.DeliveryMode, string, int) {
 	s.mu.Lock()
 	active, isActive := s.active[taskID]
 	s.mu.Unlock()
 	workerID := ""
 	attemptNumber := 0
+
+	// Prefer EffectiveCapabilities from the active WorkerSession projection.
+	effective := adapter.Capabilities{}
+	if runtime, ok := s.taskState(domain.TaskID(taskID)); ok && runtime.Worker != nil {
+		effective = adapter.CapabilitiesFromMap(runtime.Worker.Capabilities)
+		workerID = string(runtime.Worker.WorkerID)
+		attemptNumber = runtime.Worker.Attempt
+	}
+
 	if isActive {
 		workerID = active.workerID
 		attemptNumber = active.attempt
-		caps := active.adapter.Descriptor().Capabilities
-		if caps.SteerActiveTurn {
+		effective = s.effectiveCapsForTask(taskID, active.adapter)
+		if effective.SteerActiveTurn {
 			return message.DeliveryImmediate, workerID, attemptNumber
 		}
-		if caps.BidirectionalStream {
+		if effective.BidirectionalStream {
 			return message.DeliveryNextTurn, workerID, attemptNumber
 		}
-		if caps.ResumeSession {
-			// Active session without stream/steer: keep queued for resume semantics.
+		if effective.ResumeSession {
 			return message.DeliveryResume, workerID, attemptNumber
 		}
 	}
-	// No active session: resume if native session + capability exist.
+	// No active session: resume if native session + effective resume capability.
 	if runtime, ok := s.taskState(domain.TaskID(taskID)); ok {
 		if runtime.Worker != nil {
 			workerID = string(runtime.Worker.WorkerID)
 			attemptNumber = runtime.Worker.Attempt
-			if runtime.Worker.NativeSessionID != "" && !recoveryTaskTerminal(runtime) {
-				if harness, ok := s.registry.Get(adapter.HarnessName(s.config.Harness)); ok && harness.Descriptor().Capabilities.ResumeSession {
-					return message.DeliveryResume, workerID, attemptNumber
+			eff := adapter.CapabilitiesFromMap(runtime.Worker.Capabilities)
+			if runtime.Worker.NativeSessionID != "" && !recoveryTaskTerminal(runtime) && eff.ResumeSession {
+				return message.DeliveryResume, workerID, attemptNumber
+			}
+			// Recompute from registry if map empty (legacy workers).
+			if len(runtime.Worker.Capabilities) == 0 {
+				if harness, ok := s.registry.Get(adapter.HarnessName(s.config.Harness)); ok {
+					eff = s.computeSessionCapabilities(harness, runtime.Task).Effective
+					if runtime.Worker.NativeSessionID != "" && !recoveryTaskTerminal(runtime) && eff.ResumeSession {
+						return message.DeliveryResume, workerID, attemptNumber
+					}
 				}
 			}
 		}
@@ -234,7 +260,9 @@ func (s *Service) deliverInstruction(ctx context.Context, queued message.Message
 			return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported, MessageID: queued.MessageID}, adapter.ErrUnsupported
 		}
 		var sendErr error
-		if active.adapter.Descriptor().Capabilities.SteerActiveTurn {
+		// Use EffectiveCapabilities (from worker map or recomputed session facts).
+		eff := s.effectiveCapsForTask(queued.TaskID, active.adapter)
+		if eff.SteerActiveTurn {
 			_, sendErr = active.adapter.SteerActiveTurn(ctx, active.sessionID, text)
 		} else {
 			_, sendErr = active.adapter.SendMessage(ctx, active.sessionID, text)
