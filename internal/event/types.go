@@ -43,4 +43,15 @@ const (
 	TaskReportedComplete    = "task.reported_complete"
 	TaskVerifiedSuccess     = "task.verified_success"
 	TaskVerificationFailed  = "task.verification_failed"
+
+	// Replayable state transitions (PR1). Payload carries from/to/reason and
+	// enough field data for the Snapshot reducer to reapply after restart.
+	RunStateChanged      = "run.state_changed"
+	WaveStateChanged     = "wave.state_changed"
+	TaskStateChanged     = "task.state_changed"
+	ProcessStateChanged  = "process.state_changed"
+	ProtocolStateChanged = "protocol.state_changed"
+	ProgressStateChanged = "progress.state_changed"
+	TaskRuntimeUpdated   = "task.runtime_updated"
+	SupervisorHeartbeat  = "supervisor.heartbeat"
 )

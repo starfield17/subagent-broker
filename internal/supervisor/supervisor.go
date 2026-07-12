@@ -10,6 +10,12 @@ import (
 // EventSink is the only path through which adapters and workers may propose
 // Run facts. The Run-scoped Supervisor owns the concrete single-writer
 // implementation and state transitions.
+//
+// For Supervisor-owned state changes that must also update the Snapshot
+// projection, prefer Service.Commit: it deep-copies a candidate Snapshot,
+// appends one event, persists the projection, then installs memory only on
+// full success. Event append still precedes Snapshot write; a snapshot-stage
+// failure is fail-closed and is not a multi-file database rollback.
 type EventSink interface {
 	Append(event.Input) (event.Event, error)
 }

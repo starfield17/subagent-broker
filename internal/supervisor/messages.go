@@ -62,7 +62,7 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 	} else if messageType == message.PermissionRequest {
 		eventType = event.PermissionRequested
 	}
-	s.append(event.Input{TaskID: taskID, WorkerID: workerID, Source: "message-router", Type: eventType, Severity: "warning", Payload: map[string]any{"message_id": id, "type": messageType}})
+	_ = s.appendEvent(event.Input{TaskID: taskID, WorkerID: workerID, Source: "message-router", Type: eventType, Severity: "warning", Payload: map[string]any{"message_id": id, "type": messageType}})
 	select {
 	case resolution := <-wait:
 		return resolution, id, nil
@@ -118,7 +118,7 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 	} else if value.Type == message.PermissionRequest {
 		eventType = event.PermissionResolved
 	}
-	s.append(event.Input{TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router", Type: eventType, Severity: "info", Payload: map[string]any{"message_id": id}})
+	_ = s.appendEvent(event.Input{TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router", Type: eventType, Severity: "info", Payload: map[string]any{"message_id": id}})
 	return nil
 }
 
@@ -126,39 +126,96 @@ func (s *Service) SendInstruction(ctx context.Context, taskID, text string) (ada
 	if strings.TrimSpace(text) == "" {
 		return adapter.DeliveryResult{}, fmt.Errorf("instruction text is required")
 	}
+	if s.router == nil {
+		return adapter.DeliveryResult{}, fmt.Errorf("message router is not initialized")
+	}
+
 	s.mu.Lock()
 	active, isActive := s.active[taskID]
 	s.mu.Unlock()
-	if !isActive {
-		return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported}, adapter.ErrUnsupported
+
+	mode := message.DeliveryUnsupported
+	workerID := ""
+	if isActive {
+		caps := active.adapter.Descriptor().Capabilities
+		if caps.SteerActiveTurn {
+			mode = message.DeliveryImmediate
+		} else if caps.BidirectionalStream {
+			// Without active-turn steer, instructions stay in the next-turn outbox.
+			mode = message.DeliveryNextTurn
+		} else if caps.ResumeSession {
+			mode = message.DeliveryResume
+		}
 	}
-	descriptor := active.adapter.Descriptor()
-	var result adapter.DeliveryResult
-	var err error
-	if descriptor.Capabilities.SteerActiveTurn {
-		result, err = active.adapter.SteerActiveTurn(ctx, active.sessionID, text)
-	} else if descriptor.Capabilities.BidirectionalStream {
-		result, err = active.adapter.SendMessage(ctx, active.sessionID, text)
-	} else {
-		return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported}, adapter.ErrUnsupported
-	}
+
+	// Persist first — never call the adapter before a durable queued record exists.
+	queued, err := s.router.EnqueueInstruction(taskID, workerID, text, mode)
 	if err != nil {
-		return result, err
+		return adapter.DeliveryResult{}, err
 	}
-	now := time.Now().UTC()
-	id, err := message.NewID(now)
-	if err != nil {
-		return result, err
+	s.syncMessageProjection(queued)
+
+	switch mode {
+	case message.DeliveryImmediate:
+		if !isActive {
+			failed, transitionErr := s.router.Transition(queued.MessageID, message.Failed, mode, nil, adapter.ErrUnsupported)
+			if transitionErr == nil {
+				s.syncMessageProjection(failed)
+			}
+			return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported, MessageID: queued.MessageID}, adapter.ErrUnsupported
+		}
+		var result adapter.DeliveryResult
+		var sendErr error
+		if active.adapter.Descriptor().Capabilities.SteerActiveTurn {
+			result, sendErr = active.adapter.SteerActiveTurn(ctx, active.sessionID, text)
+		} else {
+			result, sendErr = active.adapter.SendMessage(ctx, active.sessionID, text)
+		}
+		if sendErr != nil {
+			failed, transitionErr := s.router.Transition(queued.MessageID, message.Failed, mode, nil, sendErr)
+			if transitionErr == nil {
+				s.syncMessageProjection(failed)
+			}
+			// Broker MessageID is the source of truth; do not adopt adapter ids.
+			return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, sendErr
+		}
+		delivered, transitionErr := s.router.Transition(queued.MessageID, message.Delivered, mode, nil, nil)
+		if transitionErr != nil {
+			return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, transitionErr
+		}
+		s.syncMessageProjection(delivered)
+		_ = result // adapter delivery mode/id are observational only
+		return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, nil
+
+	case message.DeliveryNextTurn:
+		return adapter.DeliveryResult{Mode: adapter.DeliveryNextTurn, MessageID: queued.MessageID}, nil
+
+	case message.DeliveryResume:
+		return adapter.DeliveryResult{Mode: adapter.DeliveryResume, MessageID: queued.MessageID}, nil
+
+	default:
+		failed, transitionErr := s.router.Transition(queued.MessageID, message.Failed, message.DeliveryUnsupported, nil, adapter.ErrUnsupported)
+		if transitionErr == nil {
+			s.syncMessageProjection(failed)
+		}
+		return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported, MessageID: queued.MessageID}, adapter.ErrUnsupported
 	}
-	payload, _ := json.Marshal(message.InstructionPayload{Text: text})
-	value := message.Message{SchemaVersion: SchemaVersion, MessageID: id, RunID: string(s.snapshot.Run.RunID), TaskID: taskID, Type: message.Instruction, Status: message.Delivered, DeliveryMode: string(result.Mode), CreatedAt: now, UpdatedAt: now, Payload: payload}
-	if err := s.messages.Append(value); err != nil {
-		return result, err
-	}
+}
+
+// syncMessageProjection updates the legacy messageIndex / snapshot projection
+// after a Router mutation. Router remains the authority for instruction state.
+func (s *Service) syncMessageProjection(value message.Message) {
 	s.mu.Lock()
-	s.messageIndex[id] = value
-	s.mu.Unlock()
-	return result, nil
+	defer s.mu.Unlock()
+	if s.messageIndex == nil {
+		s.messageIndex = map[string]message.Message{}
+	}
+	s.messageIndex[value.MessageID] = value
+	if s.router != nil {
+		s.snapshot.Messages = s.router.Snapshot(false)
+	} else {
+		s.snapshot.Messages = message.Sorted(s.messageIndex, false)
+	}
 }
 
 func (s *Service) approveScope(value message.Message, decision message.DecisionPayload) error {

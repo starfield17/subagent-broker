@@ -94,25 +94,34 @@ type ValidationResult struct {
 }
 
 type TaskState struct {
-	Task               domain.Task           `json:"task"`
-	Worker             *domain.WorkerSession `json:"worker,omitempty"`
-	Dimensions         state.Dimensions      `json:"status_dimensions"`
-	ReportPath         string                `json:"report_path,omitempty"`
-	Validation         []ValidationResult    `json:"validation,omitempty"`
-	LastError          string                `json:"last_error,omitempty"`
-	LastProgress       time.Time             `json:"last_progress_at,omitempty"`
-	PendingInstruction string                `json:"pending_instruction,omitempty"`
+	Task         domain.Task           `json:"task"`
+	Worker       *domain.WorkerSession `json:"worker,omitempty"`
+	Dimensions   state.Dimensions      `json:"status_dimensions"`
+	ReportPath   string                `json:"report_path,omitempty"`
+	Validation   []ValidationResult    `json:"validation,omitempty"`
+	LastError    string                `json:"last_error,omitempty"`
+	LastProgress time.Time             `json:"last_progress_at,omitempty"`
+	// Deprecated: PendingInstruction is retained only for JSON compatibility with
+	// older snapshots. It is not an outbox; durable instructions use message.Router.
+	PendingInstruction string `json:"pending_instruction,omitempty"`
 }
 
 type Snapshot struct {
-	SchemaVersion string            `json:"schema_version"`
-	Run           domain.Run        `json:"run"`
-	Wave          domain.Wave       `json:"wave"`
-	Waves         []domain.Wave     `json:"waves,omitempty"`
-	Tasks         []TaskState       `json:"tasks"`
-	Messages      []message.Message `json:"messages,omitempty"`
-	UpdatedAt     time.Time         `json:"updated_at"`
-	LastError     string            `json:"last_error,omitempty"`
+	SchemaVersion   string            `json:"schema_version"`
+	Run             domain.Run        `json:"run"`
+	Wave            domain.Wave       `json:"wave"`
+	Waves           []domain.Wave     `json:"waves,omitempty"`
+	Tasks           []TaskState       `json:"tasks"`
+	Messages        []message.Message `json:"messages,omitempty"`
+	UpdatedAt       time.Time         `json:"updated_at"`
+	LastError       string            `json:"last_error,omitempty"`
+	AppliedEventSeq uint64            `json:"applied_event_seq"`
+}
+
+// eventAppender is the internal write boundary for run events. Tests may inject
+// a fake implementation; production uses *event.Store.
+type eventAppender interface {
+	Append(event.Input) (event.Event, error)
 }
 
 type Service struct {
@@ -122,7 +131,7 @@ type Service struct {
 	registry       *adapter.Registry
 	config         Config
 	snapshot       Snapshot
-	events         *event.Store
+	events         eventAppender
 	listener       net.Listener
 	terminal       chan struct{}
 	cancelled      bool
@@ -131,9 +140,18 @@ type Service struct {
 	plan           domain.RunPlan
 	messages       *message.Store
 	messageIndex   map[string]message.Message
+	router         *message.Router
 	pending        map[string]chan message.Resolution
 	active         map[string]activeWorker
 	runBaseline    verify.WorkspaceSnapshot
+
+	// Commit fail-closed control plane.
+	fatalPersistence chan error
+	acceptingWork    bool
+
+	// persistSnapshotFn overrides disk persistence for tests. When nil,
+	// persistSnapshotLocked writes the multi-file Snapshot projection.
+	persistSnapshotFn func(value Snapshot) error
 }
 
 type activeWorker struct {
@@ -224,80 +242,153 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 			}
 		}
 	}
-	snapshot := Snapshot{SchemaVersion: SchemaVersion, Run: run, Wave: waveValue, Waves: waves, Tasks: tasks, UpdatedAt: time.Now().UTC()}
+	// 1) Build base snapshot from run+plan (+task files).
+	base := Snapshot{SchemaVersion: SchemaVersion, Run: run, Wave: waveValue, Waves: waves, Tasks: tasks, UpdatedAt: time.Now().UTC()}
+	// 2) Load checkpoint if present.
+	checkpoint := base
+	hasCheckpoint := false
 	if data, readErr := os.ReadFile(paths.State); readErr == nil {
 		var persisted Snapshot
-		if json.Unmarshal(data, &persisted) == nil && persisted.Run.RunID == run.RunID && len(persisted.Tasks) == len(tasks) {
-			snapshot = persisted
+		if err := json.Unmarshal(data, &persisted); err != nil {
+			return nil, fmt.Errorf("decode state.json: %w", err)
 		}
+		if persisted.Run.RunID != "" && persisted.Run.RunID != run.RunID {
+			return nil, fmt.Errorf("state.json run_id %q does not match run.json %q", persisted.Run.RunID, run.RunID)
+		}
+		if len(persisted.Tasks) > 0 {
+			checkpoint = persisted
+			hasCheckpoint = true
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("read state.json: %w", readErr)
 	}
-	if len(snapshot.Waves) == 0 {
-		snapshot.Waves = waves
+	if len(checkpoint.Waves) == 0 {
+		checkpoint.Waves = waves
 	}
+	// 3) Replay repairable event journal.
 	replay, err := event.Replay(paths.Events)
 	if err != nil {
 		return nil, fmt.Errorf("replay run events: %w", err)
+	}
+	lastSeq := lastSequence(replay)
+	if hasCheckpoint && checkpoint.AppliedEventSeq > lastSeq {
+		return nil, fmt.Errorf("snapshot applied_event_seq %d is ahead of event log last seq %d", checkpoint.AppliedEventSeq, lastSeq)
+	}
+	// 4) Apply events after checkpoint.
+	snapshot, err := ReplayEvents(checkpoint, replay.Events)
+	if err != nil {
+		return nil, fmt.Errorf("reduce events onto snapshot: %w", err)
+	}
+	// 5) Persist caught-up checkpoint when events advanced the state.
+	if snapshot.AppliedEventSeq != checkpoint.AppliedEventSeq || !hasCheckpoint {
+		if err := storage.AtomicWriteJSON(paths.State, snapshot, 0o600); err != nil {
+			return nil, fmt.Errorf("write recovered state.json: %w", err)
+		}
 	}
 	messageIndex, err := message.Replay(paths.Messages)
 	if err != nil {
 		return nil, fmt.Errorf("replay messages: %w", err)
 	}
 	snapshot.Messages = message.Sorted(messageIndex, false)
+	messageStore := message.NewStore(paths.Messages)
+	router, err := message.NewRouter(message.NewRouterOptions{
+		RunID:   string(run.RunID),
+		Store:   messageStore,
+		Initial: messageIndex,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("init message router: %w", err)
+	}
 	var runBaseline verify.WorkspaceSnapshot
 	if data, readErr := os.ReadFile(paths.Baseline); readErr == nil {
-		_ = json.Unmarshal(data, &runBaseline)
+		if err := json.Unmarshal(data, &runBaseline); err != nil {
+			return nil, fmt.Errorf("decode baseline: %w", err)
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("read baseline: %w", readErr)
 	}
 	return &Service{
 		runDir: runDir, paths: paths, registry: registry, config: config,
-		snapshot: snapshot, events: event.NewStore(paths.Events, string(run.RunID), lastSequence(replay)),
+		snapshot: snapshot, events: event.NewStore(paths.Events, string(run.RunID), lastSeq),
 		terminal: make(chan struct{}), recovering: recovering, plan: plan,
-		messages: message.NewStore(paths.Messages), messageIndex: messageIndex, pending: map[string]chan message.Resolution{}, active: map[string]activeWorker{}, cancelledTasks: map[string]bool{}, runBaseline: runBaseline,
+		messages: messageStore, messageIndex: messageIndex, router: router, pending: map[string]chan message.Resolution{}, active: map[string]activeWorker{}, cancelledTasks: map[string]bool{}, runBaseline: runBaseline,
+		fatalPersistence: make(chan error, 1), acceptingWork: true,
 	}, nil
 }
 
 func (s *Service) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if err := s.prepareIPC(); err != nil {
 		return err
 	}
 	if err := s.writeSupervisorIdentity(""); err != nil {
 		return err
 	}
+	go s.watchPersistenceFailures(cancel)
 	go s.heartbeat(ctx)
 	if s.recovering {
 		if err := s.reconcileRecovery(ctx); err != nil {
 			return err
 		}
 	} else {
-		s.setRunStatus(domain.RunStarting, "")
-		s.append(event.Input{Source: "supervisor", Type: event.RunStarted, Severity: "info"})
+		if err := s.setRunStatus(domain.RunStarting, ""); err != nil {
+			return err
+		}
+		if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.RunStarted, Severity: "info"}); err != nil {
+			return err
+		}
 	}
 	go s.serveIPC(ctx)
 	err := s.execute(ctx)
+	if err == nil && !s.AcceptingWork() {
+		err = fmt.Errorf("supervisor stopped after a fatal persistence failure")
+	}
 	s.mu.Lock()
 	if s.listener != nil {
 		_ = s.listener.Close()
 		s.listener = nil
 	}
 	_ = os.Remove(SocketPath(s.runDir))
+	status := s.snapshot.Run.Status
 	s.mu.Unlock()
-	_ = s.writeSupervisorIdentity(shutdownReason(err, s.snapshot.Run.Status))
+	// Best-effort final identity write; do not fail-close again if already closed.
+	_ = s.writeSupervisorIdentity(shutdownReason(err, status))
 	close(s.terminal)
 	return err
+}
+
+func (s *Service) watchPersistenceFailures(cancel context.CancelFunc) {
+	err, ok := <-s.FatalPersistenceErrors()
+	if !ok || err == nil {
+		return
+	}
+	s.cancelAllActiveWorkers()
+	cancel()
 }
 
 func (s *Service) Terminal() <-chan struct{} { return s.terminal }
 
 func (s *Service) Initialize() error {
-	s.append(event.Input{Source: "dispatch", Type: event.RunCreated, Severity: "info"})
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saveLocked()
+	return s.commitMutate(context.Background(), event.Input{
+		Source: "dispatch", Type: event.RunCreated, Severity: "info",
+		Payload: map[string]any{"reason": "initialize"},
+	}, func(candidate *Snapshot) error {
+		candidate.UpdatedAt = time.Now().UTC()
+		return nil
+	})
 }
 
 func (s *Service) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return cloneSnapshot(s.snapshot)
+	copy, err := cloneSnapshot(s.snapshot)
+	if err != nil {
+		// Snapshot is always JSON-serializable in normal operation; return a
+		// zero value rather than a shared mutable alias on rare marshal failure.
+		return Snapshot{}
+	}
+	return copy
 }
 
 func (s *Service) RequestCancel(ctx context.Context) error {
@@ -320,7 +411,7 @@ func (s *Service) RequestCancel(ctx context.Context) error {
 			worker.cancel()
 		})
 	}
-	s.append(event.Input{Source: "supervisor", Type: "run.cancel_requested", Severity: "warning"})
+	s.appendEvent(event.Input{Source: "supervisor", Type: "run.cancel_requested", Severity: "warning"})
 	return nil
 }
 
@@ -338,26 +429,32 @@ func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 		_ = worker.adapter.TerminateSession(context.Background(), worker.sessionID)
 		worker.cancel()
 	})
-	s.append(event.Input{TaskID: taskID, Source: "supervisor", Type: "task.cancel_requested", Severity: "warning"})
+	s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: "task.cancel_requested", Severity: "warning"})
 	return nil
 }
 
 func (s *Service) execute(ctx context.Context) error {
-	if len(s.snapshot.Tasks) == 0 {
+	if len(s.Snapshot().Tasks) == 0 {
 		return s.finishRun(domain.RunFailed, "run has no tasks")
 	}
-	if s.snapshot.Run.Status == domain.RunCompleted || s.snapshot.Run.Status == domain.RunFailed || s.snapshot.Run.Status == domain.RunCancelled || s.snapshot.Run.Status == domain.RunDegraded {
+	status := s.Snapshot().Run.Status
+	if status == domain.RunCompleted || status == domain.RunFailed || status == domain.RunCancelled || status == domain.RunDegraded {
 		return nil
 	}
 	for ordinal, planned := range s.plan.Waves {
-		if s.isCancelled() {
+		if !s.AcceptingWork() {
+			return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
+		}
+		if s.isCancelled() || ctx.Err() != nil {
 			return s.finishRun(domain.RunCancelled, "run cancelled")
 		}
 		if s.waveAlreadyVerified(planned.WaveID) {
 			continue
 		}
-		s.selectWave(planned.WaveID)
-		if err := s.preflightWave(planned); err != nil {
+		if err := s.selectWave(planned.WaveID); err != nil {
+			return err
+		}
+		if err := s.preflightWave(ctx, planned); err != nil {
 			return s.finishRun(domain.RunFailed, err.Error())
 		}
 		baseline, err := verify.CaptureWorkspace(s.projectRoot(), s.config.BrokerHome)
@@ -368,11 +465,20 @@ func (s *Service) execute(ctx context.Context) error {
 		if err := storage.AtomicWriteJSON(wavePaths.Baseline, baseline, 0o600); err != nil {
 			return s.finishRun(domain.RunFailed, err.Error())
 		}
-		s.setWaveStatus(domain.WaveRunning)
-		s.append(event.Input{Source: "supervisor", Type: event.WaveStarted, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID, "ordinal": ordinal + 1}})
-		s.executeWave(ctx, planned)
-		if s.isCancelled() {
+		if err := s.setWaveStatus(domain.WaveRunning); err != nil {
+			return err
+		}
+		if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.WaveStarted, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID, "ordinal": ordinal + 1}}); err != nil {
+			return err
+		}
+		if err := s.executeWave(ctx, planned); err != nil {
+			return err
+		}
+		if s.isCancelled() || ctx.Err() != nil {
 			return s.finishRun(domain.RunCancelled, "run cancelled")
+		}
+		if !s.AcceptingWork() {
+			return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
 		}
 		verification, err := s.runBarrier(ctx, planned, baseline)
 		if err != nil {
@@ -384,8 +490,12 @@ func (s *Service) execute(ctx context.Context) error {
 		if verification.Result != domain.BarrierPassed {
 			return s.finishRun(domain.RunFailed, "Wave barrier ended with "+string(verification.Result))
 		}
-		s.setWaveStatus(domain.WaveVerified)
-		s.append(event.Input{Source: "supervisor", Type: event.WaveVerified, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID}})
+		if err := s.setWaveStatus(domain.WaveVerified); err != nil {
+			return err
+		}
+		if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.WaveVerified, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID}}); err != nil {
+			return err
+		}
 	}
 	final, err := s.runFinalVerification(ctx)
 	if err != nil {
@@ -397,13 +507,21 @@ func (s *Service) execute(ctx context.Context) error {
 	return s.finishRun(domain.RunCompleted, "")
 }
 
-func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) {
+func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) error {
+	if !s.AcceptingWork() {
+		return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
+	}
 	sem := make(chan struct{}, s.config.MaxConcurrency)
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
 	for _, taskID := range taskIDs(planned.Tasks) {
 		runtime, ok := s.taskState(taskID)
 		if !ok || runtime.Task.Status == state.TaskVerifiedSuccess {
 			continue
+		}
+		if !s.AcceptingWork() {
+			break
 		}
 		wg.Add(1)
 		go func(runtime TaskState) {
@@ -414,11 +532,24 @@ func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) {
 				return
 			}
 			defer func() { <-sem }()
-			_ = s.executeTask(ctx, &runtime)
-			s.saveRuntime(runtime)
+			if err := s.executeTask(ctx, &runtime); err != nil {
+				mu.Lock()
+				if firstErr == nil && !s.AcceptingWork() {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+			_ = s.saveRuntime(runtime)
 		}(runtime)
 	}
 	wg.Wait()
+	if !s.AcceptingWork() {
+		if firstErr != nil {
+			return firstErr
+		}
+		return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
+	}
+	return nil
 }
 
 func (s *Service) executeTask(parent context.Context, runtime *TaskState) error {
@@ -442,12 +573,23 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		worker.Attempt = runtime.Worker.Attempt + 1
 	}
 	runtime.Worker = worker
-	runtime.Task.Status = state.TaskRunning
 	runtime.Dimensions = worker.StatusDimensions
 	runtime.LastProgress = worker.LastProgressAt
-	s.setRunStatus(domain.RunRunning, "")
-	s.saveRuntime(*runtime)
-	s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.SessionStarting, Severity: "info"})
+	if err := s.setRunStatus(domain.RunRunning, ""); err != nil {
+		return err
+	}
+	// Persist worker + dimensions first, then transition task status via Commit.
+	if err := s.saveRuntime(*runtime); err != nil {
+		return err
+	}
+	if runtime.Task.Status != state.TaskRunning {
+		if err := s.transitionTask(runtime, state.TaskRunning); err != nil {
+			return err
+		}
+	}
+	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.SessionStarting, Severity: "info"}); err != nil {
+		return err
+	}
 
 	options := map[string]string{"permission_mode": s.config.PermissionMode, "max_turns": fmt.Sprintf("%d", s.config.MaxTurns), "scenario": s.config.Scenario}
 	if s.config.SafeMode {
@@ -461,14 +603,16 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	if runtime.Task.ModelPreference != "" {
 		model = runtime.Task.ModelPreference
 	}
-	prompt := buildWorkerPrompt(runtime.Task, s.snapshot.Run.RunID, workerID)
+	runID := s.Snapshot().Run.RunID
+	prompt := buildWorkerPrompt(runtime.Task, runID, workerID)
+	// Deprecated PendingInstruction is read only for old snapshots; never written as an outbox.
 	if runtime.PendingInstruction != "" {
 		prompt += "\n\nMain Agent follow-up instruction:\n" + runtime.PendingInstruction
 		runtime.PendingInstruction = ""
 	}
 	executable, _ := os.Executable()
 	interaction := adapter.InteractionConfig{Enabled: !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode), BrokerExecutable: executable, RunDir: s.runDir}
-	request := adapter.StartRequest{RunID: string(s.snapshot.Run.RunID), TaskID: string(runtime.Task.TaskID), WorkerID: workerID, ProjectRoot: runtime.Task.ProjectRoot, Contract: prompt, Model: model, Scenario: s.config.Scenario, Options: options, Interaction: interaction}
+	request := adapter.StartRequest{RunID: string(runID), TaskID: string(runtime.Task.TaskID), WorkerID: workerID, ProjectRoot: runtime.Task.ProjectRoot, Contract: prompt, Model: model, Scenario: s.config.Scenario, Options: options, Interaction: interaction}
 	var session adapter.Session
 	var err error
 	if resumeSessionID != "" {
@@ -494,9 +638,15 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	worker.ProcessStartToken = session.ProcessStartToken
 	worker.StatusDimensions.Process = state.ProcessAlive
 	runtime.Dimensions = worker.StatusDimensions
-	s.saveRuntime(*runtime)
-	s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ProcessSpawned, Severity: "info", Payload: map[string]any{"pid": session.PID}})
-	s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.SessionStarted, Severity: "info"})
+	if err := s.saveRuntime(*runtime); err != nil {
+		return err
+	}
+	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ProcessSpawned, Severity: "info", Payload: map[string]any{"pid": session.PID, "from": string(state.ProcessStarting), "to": string(state.ProcessAlive), "reason": "spawned"}}); err != nil {
+		return err
+	}
+	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.SessionStarted, Severity: "info"}); err != nil {
+		return err
+	}
 
 	events := session.Events
 	stderr := session.Stderr
@@ -544,8 +694,14 @@ eventLoop:
 	worker.EndedAt = timePtr(time.Now().UTC())
 	worker.StatusDimensions.Process = state.ProcessExited
 	runtime.Dimensions = worker.StatusDimensions
-	s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ProcessExited, Severity: severityForExit(exit.Code), Payload: exit})
-	s.saveRuntime(*runtime)
+	if err := s.saveRuntime(*runtime); err != nil {
+		cancel()
+		return err
+	}
+	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ProcessExited, Severity: severityForExit(exit.Code), Payload: map[string]any{"from": string(state.ProcessAlive), "to": string(state.ProcessExited), "exit": exit}}); err != nil {
+		cancel()
+		return err
+	}
 	cancel()
 	s.mu.Lock()
 	delete(s.active, string(runtime.Task.TaskID))
@@ -582,7 +738,12 @@ eventLoop:
 		return s.failTask(runtime, "result_validation", err)
 	}
 	runtime.ReportPath = filepath.Join(taskDir, "report.md")
-	s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ReportPublished, Severity: "info"})
+	if err := s.saveRuntime(*runtime); err != nil {
+		return err
+	}
+	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ReportPublished, Severity: "info"}); err != nil {
+		return err
+	}
 	if err := s.transitionTask(runtime, state.TaskReportedComplete); err != nil {
 		return err
 	}
@@ -594,15 +755,16 @@ eventLoop:
 	}
 	passed := s.runValidation(parent, runtime)
 	if !passed {
-		_ = s.transitionTask(runtime, state.TaskVerificationFailed)
-		s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"})
+		if err := s.transitionTask(runtime, state.TaskVerificationFailed); err != nil {
+			return err
+		}
+		_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"})
 		return fmt.Errorf("task validation failed")
 	}
 	if err := s.transitionTask(runtime, state.TaskVerifiedSuccess); err != nil {
 		return err
 	}
-	s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerifiedSuccess, Severity: "info"})
-	return nil
+	return s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerifiedSuccess, Severity: "info"})
 }
 
 func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, native adapter.NativeEvent, workerID string) {
@@ -612,7 +774,7 @@ func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, nati
 	}
 	input.TaskID = string(runtime.Task.TaskID)
 	input.WorkerID = workerID
-	s.append(input)
+	_ = s.appendEvent(input)
 	line := append(append([]byte(nil), native.Payload...), '\n')
 	_ = appendFile(filepath.Join(s.taskDir(runtime.Task), "stdout.log"), line)
 	worker := runtime.Worker
@@ -650,7 +812,7 @@ func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, nati
 		worker.StatusDimensions.Protocol = state.ProtocolError
 	}
 	runtime.Dimensions = worker.StatusDimensions
-	s.saveRuntime(*runtime)
+	_ = s.saveRuntime(*runtime)
 }
 
 func (s *Service) updateProgress(runtime *TaskState, now time.Time) {
@@ -673,13 +835,14 @@ func (s *Service) updateProgress(runtime *TaskState, now time.Time) {
 	if desired == worker.StatusDimensions.Progress {
 		return
 	}
-	if err := state.ValidateProgressTransition(worker.StatusDimensions.Progress, desired); err != nil {
+	from := worker.StatusDimensions.Progress
+	if err := state.ValidateProgressTransition(from, desired); err != nil {
 		return
 	}
 	worker.StatusDimensions.Progress = desired
 	runtime.Dimensions = worker.StatusDimensions
-	s.saveRuntime(*runtime)
-	s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: string(worker.WorkerID), Source: "supervisor", Type: "progress." + string(desired), Severity: "warning", Payload: map[string]any{"quiet_for": elapsed.String()}})
+	_ = s.saveRuntime(*runtime)
+	_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: string(worker.WorkerID), Source: "supervisor", Type: event.ProgressStateChanged, Severity: "warning", Payload: map[string]any{"from": string(from), "to": string(desired), "quiet_for": elapsed.String(), "reason": "stall_watch"}})
 }
 
 func (s *Service) runValidation(ctx context.Context, runtime *TaskState) bool {
@@ -702,36 +865,56 @@ func (s *Service) runValidation(ctx context.Context, runtime *TaskState) bool {
 			allPassed = false
 		}
 	}
-	s.saveRuntime(*runtime)
+	_ = s.saveRuntime(*runtime)
 	return allPassed
 }
 
 func (s *Service) reconcileRecovery(ctx context.Context) error {
-	s.setRunStatus(domain.RunRecovering, "")
-	s.append(event.Input{Source: "recovery", Type: "run.recovering", Severity: "warning"})
-	for i := range s.snapshot.Tasks {
-		runtime := &s.snapshot.Tasks[i]
+	if err := s.setRunStatus(domain.RunRecovering, ""); err != nil {
+		return err
+	}
+	if err := s.appendEvent(event.Input{Source: "recovery", Type: "run.recovering", Severity: "warning"}); err != nil {
+		return err
+	}
+	snapshot := s.Snapshot()
+	for _, runtime := range snapshot.Tasks {
 		if runtime.Worker == nil || runtime.Task.Status != state.TaskRunning {
 			continue
 		}
 		if runtime.Worker.PID > 0 && runtime.Worker.ProcessStartToken != "" {
 			identity, err := process.Inspect(ctx, runtime.Worker.PID)
 			if err == nil && runtime.Worker.ProcessStartToken == identity.StartToken {
-				runtime.Dimensions.Process = state.ProcessOrphaned
-				runtime.Worker.StatusDimensions.Process = state.ProcessOrphaned
-				s.snapshot.Run.Status = domain.RunDegraded
-				s.snapshot.LastError = "worker process is alive but cannot be reattached safely"
-				s.save()
-				s.append(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: string(runtime.Worker.WorkerID), Source: "recovery", Type: event.ProcessOrphaned, Severity: "error"})
-				return nil
+				taskCopy := runtime
+				taskCopy.Dimensions.Process = state.ProcessOrphaned
+				if taskCopy.Worker != nil {
+					taskCopy.Worker.StatusDimensions.Process = state.ProcessOrphaned
+				}
+				if err := s.saveRuntime(taskCopy); err != nil {
+					return err
+				}
+				if err := s.setRunStatus(domain.RunDegraded, "worker process is alive but cannot be reattached safely"); err != nil {
+					return err
+				}
+				return s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: string(runtime.Worker.WorkerID), Source: "recovery", Type: event.ProcessOrphaned, Severity: "error"})
 			}
 		}
 	}
 	return nil
 }
 
-func (s *Service) preflightWave(planned domain.WavePlan) error {
-	result := wave.Preflight(planned.Tasks)
+func (s *Service) preflightWave(ctx context.Context, planned domain.WavePlan) error {
+	tasks := append([]domain.Task(nil), planned.Tasks...)
+	for index := range tasks {
+		if tasks[index].HarnessPreference == "" {
+			tasks[index].HarnessPreference = s.config.Harness
+		}
+	}
+	// Environment preflight probes each unique harness once via the registry.
+	result := wave.EvaluatePreflight(ctx, tasks, wave.PreflightEnvironment{
+		Registry:     s.registry,
+		Executable:   s.config.Executable,
+		ProbeTimeout: 10 * time.Second,
+	})
 	paths := s.wavePaths(planned.WaveID)
 	if err := storage.AtomicWriteJSON(paths.Preflight, result, 0o600); err != nil {
 		return err
@@ -744,39 +927,60 @@ func (s *Service) preflightWave(planned domain.WavePlan) error {
 
 func (s *Service) runBarrier(ctx context.Context, planned domain.WavePlan, baseline verify.WorkspaceSnapshot) (wave.Verification, error) {
 	started := time.Now().UTC()
-	s.setRunStatus(domain.RunBarrier, "")
-	s.setWaveStatus(domain.WaveBarrier)
-	s.append(event.Input{Source: "supervisor", Type: event.WaveBarrierStarted, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID}})
-	verification := wave.Verification{SchemaVersion: SchemaVersion, WaveID: planned.WaveID, StartedAt: started}
+	if err := s.setRunStatus(domain.RunBarrier, ""); err != nil {
+		return wave.Verification{}, err
+	}
+	if err := s.setWaveStatus(domain.WaveBarrier); err != nil {
+		return wave.Verification{}, err
+	}
+	if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.WaveBarrierStarted, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID}}); err != nil {
+		return wave.Verification{}, err
+	}
+
 	cancelled := false
+	reports := make([]wave.ReportAssessment, 0, len(planned.Tasks))
 	for _, item := range planned.Tasks {
 		runtime, ok := s.taskState(item.TaskID)
 		if !ok {
-			verification.Errors = append(verification.Errors, "missing task state: "+string(item.TaskID))
+			reports = append(reports, wave.ReportAssessment{
+				TaskID:  item.TaskID,
+				Present: false,
+				Error:   "missing task state: " + string(item.TaskID),
+			})
 			continue
 		}
-		switch runtime.Task.Status {
-		case state.TaskVerifiedSuccess:
-		case state.TaskCancelled:
+		if runtime.Task.Status == state.TaskCancelled {
 			cancelled = true
-		case state.TaskVerifiedPartial, state.TaskBlocked, state.TaskReportedComplete:
-			verification.Errors = append(verification.Errors, fmt.Sprintf("task %s is %s", item.TaskID, runtime.Task.Status))
+		}
+		// TODO(pr1): reread report.meta.json / report.md from disk and validate identity.
+		// TODO(pr1): collect pending decisions from the message router for this Wave.
+		// TODO(pr1): collect high-risk changes from the actual workspace diff.
+		assessment := wave.ReportAssessment{
+			TaskID:        item.TaskID,
+			RuntimeStatus: runtime.Task.Status,
+			Present:       true,
+			MetaValid:     true,
+			MarkdownValid: true,
+			IdentityValid: true,
+		}
+		switch runtime.Task.Status {
+		case state.TaskVerifiedSuccess, state.TaskVerifiedPartial, state.TaskBlocked, state.TaskCancelled,
+			state.TaskFailed, state.TaskVerificationFailed:
 		default:
-			verification.Errors = append(verification.Errors, fmt.Sprintf("task %s failed to verify: %s", item.TaskID, runtime.Task.Status))
+			assessment.Error = fmt.Sprintf("task %s failed to verify: %s", item.TaskID, runtime.Task.Status)
 		}
+		reports = append(reports, assessment)
 	}
+
+	checks := make([]wave.CheckResult, 0, len(planned.IntegrationChecks))
 	for index, check := range planned.IntegrationChecks {
-		result := s.runCheck(ctx, check, filepath.Join(s.wavePaths(planned.WaveID).Root, fmt.Sprintf("check-%03d.log", index+1)))
-		verification.Checks = append(verification.Checks, result)
-		if !result.Passed {
-			verification.Errors = append(verification.Errors, "integration check failed: "+check.Command)
-		}
+		checks = append(checks, s.runCheck(ctx, check, filepath.Join(s.wavePaths(planned.WaveID).Root, fmt.Sprintf("check-%03d.log", index+1))))
 	}
 	after, err := verify.CaptureWorkspace(s.projectRoot(), s.config.BrokerHome)
 	if err != nil {
-		return verification, err
+		return wave.Verification{}, err
 	}
-	verification.ChangedFiles = verify.ChangedFiles(baseline, after)
+	changed := verify.ChangedFiles(baseline, after)
 	leases := map[string][]string{}
 	for _, item := range planned.Tasks {
 		runtime, ok := s.taskState(item.TaskID)
@@ -784,23 +988,23 @@ func (s *Service) runBarrier(ctx context.Context, planned domain.WavePlan, basel
 			leases[string(item.TaskID)] = append([]string(nil), runtime.Task.WriteScope...)
 		}
 	}
-	verification.ScopeAudit, err = verify.AuditScopes(verification.ChangedFiles, leases)
+	scopeAudit, err := verify.AuditScopes(changed, leases)
 	if err != nil {
-		return verification, err
+		return wave.Verification{}, err
 	}
-	for _, path := range verification.ScopeAudit.Unauthorized {
-		verification.Errors = append(verification.Errors, "unauthorized file: "+path)
-	}
-	verification.Result = domain.BarrierPassed
-	if cancelled {
-		verification.Result = domain.BarrierCancelled
-	} else if len(verification.Errors) > 0 {
-		verification.Result = domain.BarrierFailed
-	}
-	if len(verification.Warnings) > 0 && verification.Result == domain.BarrierPassed {
-		verification.Result = domain.BarrierPassedWithWarnings
-	}
-	verification.EndedAt = time.Now().UTC()
+
+	verification := wave.EvaluateBarrier(wave.BarrierInputs{
+		WaveID:       planned.WaveID,
+		Cancelled:    cancelled,
+		Reports:      reports,
+		ChangedFiles: changed,
+		ScopeAudit:   scopeAudit,
+		Checks:       checks,
+		// Pending / HighRiskChanges intentionally empty until PR1 collectors land.
+	}, time.Now().UTC())
+	verification.SchemaVersion = SchemaVersion
+	verification.StartedAt = started
+
 	paths := s.wavePaths(planned.WaveID)
 	if err := storage.AtomicWriteJSON(paths.Verification, verification, 0o600); err != nil {
 		return verification, err
@@ -808,16 +1012,28 @@ func (s *Service) runBarrier(ctx context.Context, planned domain.WavePlan, basel
 	if err := storage.AtomicWriteFile(paths.Barrier, []byte(wave.RenderBarrier(verification)), 0o600); err != nil {
 		return verification, err
 	}
-	s.mu.Lock()
-	for index := range s.snapshot.Waves {
-		if s.snapshot.Waves[index].WaveID == planned.WaveID {
-			s.snapshot.Waves[index].BarrierResult = verification.Result
-			s.snapshot.Wave = s.snapshot.Waves[index]
-			break
+	if err := s.commitMutate(ctx, event.Input{
+		Source: "supervisor", Type: event.WaveStateChanged, Severity: "info",
+		Payload: map[string]any{
+			"wave_id":        string(planned.WaveID),
+			"from":           string(domain.WaveBarrier),
+			"to":             string(domain.WaveBarrier),
+			"reason":         "barrier_result",
+			"barrier_result": string(verification.Result),
+		},
+	}, func(candidate *Snapshot) error {
+		for index := range candidate.Waves {
+			if candidate.Waves[index].WaveID == planned.WaveID {
+				candidate.Waves[index].BarrierResult = verification.Result
+				candidate.Wave = candidate.Waves[index]
+				break
+			}
 		}
+		candidate.UpdatedAt = time.Now().UTC()
+		return nil
+	}); err != nil {
+		return verification, err
 	}
-	_ = s.saveLocked()
-	s.mu.Unlock()
 	return verification, nil
 }
 
@@ -836,36 +1052,34 @@ func (s *Service) runCheck(ctx context.Context, check domain.ValidationCommand, 
 }
 
 func (s *Service) runFinalVerification(ctx context.Context) (wave.Verification, error) {
-	value := wave.Verification{SchemaVersion: SchemaVersion, WaveID: "run-final", StartedAt: time.Now().UTC(), Result: domain.BarrierPassed}
+	started := time.Now().UTC()
+	checks := make([]wave.CheckResult, 0, len(s.plan.FinalChecks))
 	for index, check := range s.plan.FinalChecks {
-		result := s.runCheck(ctx, check, filepath.Join(s.runDir, fmt.Sprintf("final-check-%03d.log", index+1)))
-		value.Checks = append(value.Checks, result)
-		if !result.Passed {
-			value.Errors = append(value.Errors, "final check failed: "+check.Command)
-		}
+		checks = append(checks, s.runCheck(ctx, check, filepath.Join(s.runDir, fmt.Sprintf("final-check-%03d.log", index+1))))
 	}
 	after, err := verify.CaptureWorkspace(s.projectRoot(), s.config.BrokerHome)
 	if err != nil {
-		return value, err
+		return wave.Verification{}, err
 	}
-	value.ChangedFiles = verify.ChangedFiles(s.runBaseline, after)
+	changed := verify.ChangedFiles(s.runBaseline, after)
 	leases := map[string][]string{}
 	s.mu.Lock()
 	for _, runtime := range s.snapshot.Tasks {
 		leases[string(runtime.Task.TaskID)] = append([]string(nil), runtime.Task.WriteScope...)
 	}
 	s.mu.Unlock()
-	value.ScopeAudit, err = verify.AuditScopes(value.ChangedFiles, leases)
+	scopeAudit, err := verify.AuditScopes(changed, leases)
 	if err != nil {
-		return value, err
+		return wave.Verification{}, err
 	}
-	for _, path := range value.ScopeAudit.Unauthorized {
-		value.Errors = append(value.Errors, "unauthorized file: "+path)
-	}
-	if len(value.Errors) > 0 {
-		value.Result = domain.BarrierFailed
-	}
-	value.EndedAt = time.Now().UTC()
+	value := wave.EvaluateBarrier(wave.BarrierInputs{
+		WaveID:       "run-final",
+		ChangedFiles: changed,
+		ScopeAudit:   scopeAudit,
+		Checks:       checks,
+	}, time.Now().UTC())
+	value.SchemaVersion = SchemaVersion
+	value.StartedAt = started
 	if err := storage.AtomicWriteJSON(s.paths.Verification, value, 0o600); err != nil {
 		return value, err
 	}
@@ -881,36 +1095,6 @@ func (s *Service) taskState(taskID domain.TaskID) (TaskState, bool) {
 		}
 	}
 	return TaskState{}, false
-}
-
-func (s *Service) saveRuntime(runtime TaskState) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for index := range s.snapshot.Tasks {
-		if s.snapshot.Tasks[index].Task.TaskID == runtime.Task.TaskID {
-			runtime.Task.WriteScope = append([]string(nil), s.snapshot.Tasks[index].Task.WriteScope...)
-			runtime.Task.AllowPublicInterfaceChange = s.snapshot.Tasks[index].Task.AllowPublicInterfaceChange
-			for _, pending := range s.messageIndex {
-				if pending.TaskID == string(runtime.Task.TaskID) && pending.Status != message.Answered && pending.Status != message.Failed && pending.Status != message.Expired {
-					runtime.Task.Status = state.TaskBlocked
-					runtime.Dimensions.Task = state.TaskBlocked
-					runtime.Dimensions.Progress = state.ProgressQuiet
-					switch pending.Type {
-					case message.ScopeExpansionRequest:
-						runtime.Dimensions.Protocol = state.ProtocolWaitingScope
-					case message.PermissionRequest:
-						runtime.Dimensions.Protocol = state.ProtocolWaitingPermission
-					default:
-						runtime.Dimensions.Protocol = state.ProtocolWaitingUser
-					}
-					break
-				}
-			}
-			s.snapshot.Tasks[index] = cloneTaskState(runtime)
-			break
-		}
-	}
-	_ = s.saveLocked()
 }
 
 func (s *Service) taskHasPendingMessage(taskID string) bool {
@@ -936,17 +1120,21 @@ func cloneTaskState(source TaskState) TaskState {
 	return result
 }
 
-func (s *Service) selectWave(id domain.WaveID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.snapshot.Run.CurrentWave = id
-	for _, value := range s.snapshot.Waves {
-		if value.WaveID == id {
-			s.snapshot.Wave = value
-			break
+func (s *Service) selectWave(id domain.WaveID) error {
+	return s.commitMutate(context.Background(), event.Input{
+		Source: "supervisor", Type: event.WaveStateChanged, Severity: "info",
+		Payload: map[string]any{"wave_id": string(id), "from": string(s.Snapshot().Wave.WaveID), "to": string(id), "reason": "select_wave"},
+	}, func(candidate *Snapshot) error {
+		candidate.Run.CurrentWave = id
+		for _, value := range candidate.Waves {
+			if value.WaveID == id {
+				candidate.Wave = value
+				break
+			}
 		}
-	}
-	_ = s.saveLocked()
+		candidate.UpdatedAt = time.Now().UTC()
+		return nil
+	})
 }
 
 func (s *Service) waveAlreadyVerified(id domain.WaveID) bool {
@@ -961,17 +1149,17 @@ func (s *Service) waveAlreadyVerified(id domain.WaveID) bool {
 }
 
 func (s *Service) projectRoot() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.snapshot.Tasks) == 0 {
+	snap := s.Snapshot()
+	if len(snap.Tasks) == 0 {
 		return ""
 	}
-	return s.snapshot.Tasks[0].Task.ProjectRoot
+	return snap.Tasks[0].Task.ProjectRoot
 }
 
 func (s *Service) wavePaths(id domain.WaveID) storage.WavePaths {
 	layout, _ := storage.NewLayout(s.config.BrokerHome)
-	paths, _ := layout.WavePaths(string(s.snapshot.Run.ProjectID), string(s.snapshot.Run.RunID), string(id))
+	snap := s.Snapshot()
+	paths, _ := layout.WavePaths(string(snap.Run.ProjectID), string(snap.Run.RunID), string(id))
 	return paths
 }
 
@@ -993,22 +1181,6 @@ func capabilityMap(value adapter.Capabilities) map[string]bool {
 	}
 }
 
-func (s *Service) transitionTask(runtime *TaskState, next state.Task) error {
-	if err := state.ValidateTaskTransition(runtime.Task.Status, next); err != nil {
-		return err
-	}
-	runtime.Task.Status = next
-	if runtime.Worker != nil {
-		runtime.Worker.StatusDimensions.Task = next
-		runtime.Dimensions.Task = next
-	}
-	s.saveRuntime(*runtime)
-	if next == state.TaskReportedComplete {
-		s.append(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.TaskReportedComplete, Severity: "info"})
-	}
-	return nil
-}
-
 func (s *Service) markPartial(runtime *TaskState, status report.Status) error {
 	if err := s.transitionTask(runtime, state.TaskVerifying); err != nil {
 		return err
@@ -1017,8 +1189,7 @@ func (s *Service) markPartial(runtime *TaskState, status report.Status) error {
 		return err
 	}
 	runtime.LastError = fmt.Sprintf("worker reported %s", status)
-	s.saveRuntime(*runtime)
-	return nil
+	return s.saveRuntime(*runtime)
 }
 
 func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
@@ -1037,10 +1208,13 @@ func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
 		failed := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusFailed, Summary: "Worker execution failed", NoFilesChangedReason: "No verified file list was available after the failure", ValidationNotRunReason: "validation was not reached", FailureStage: stage, ErrorSummary: err.Error(), WorkspaceState: "Workspace was left in place; no rollback was performed", HandoffNotes: []string{"Main Agent should inspect the workspace before retrying."}}
 		if publishErr := report.Publish(s.taskDir(runtime.Task), failed, time.Now().UTC()); publishErr == nil {
 			runtime.ReportPath = filepath.Join(s.taskDir(runtime.Task), "report.md")
-			s.append(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.ReportPublished, Severity: "error"})
+			_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.ReportPublished, Severity: "error"})
 		}
 	}
-	s.append(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.TurnFailed, Severity: "error", Payload: map[string]string{"stage": stage, "error": err.Error()}})
+	if saveErr := s.saveRuntime(*runtime); saveErr != nil {
+		return saveErr
+	}
+	_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.TurnFailed, Severity: "error", Payload: map[string]string{"stage": stage, "error": err.Error()}})
 	return err
 }
 
@@ -1054,19 +1228,24 @@ func (s *Service) cancelTask(runtime *TaskState, reason string) error {
 	result := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusCancelled, Summary: "Task was cancelled", NoFilesChangedReason: "cancellation state was collected before verification", ValidationNotRunReason: "run cancelled", StopReason: reason, WorkspaceState: "workspace was left in place; no rollback was performed", HandoffNotes: []string{"Main Agent must inspect the current workspace before retrying."}}
 	if err := report.Publish(s.taskDir(runtime.Task), result, time.Now().UTC()); err == nil {
 		runtime.ReportPath = filepath.Join(s.taskDir(runtime.Task), "report.md")
-		s.append(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.ReportPublished, Severity: "warning"})
+		_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.ReportPublished, Severity: "warning"})
 	}
-	s.saveRuntime(*runtime)
-	return nil
+	return s.saveRuntime(*runtime)
 }
 
 func (s *Service) finishRun(status domain.RunStatus, reason string) error {
 	if status == domain.RunFailed || status == domain.RunDegraded {
-		s.setWaveStatus(domain.WaveFailed)
+		if err := s.setWaveStatus(domain.WaveFailed); err != nil {
+			return err
+		}
 	} else if status == domain.RunCancelled {
-		s.setWaveStatus(domain.WaveCancelled)
+		if err := s.setWaveStatus(domain.WaveCancelled); err != nil {
+			return err
+		}
 	}
-	s.setRunStatus(status, reason)
+	if err := s.setRunStatus(status, reason); err != nil {
+		return err
+	}
 	typeName := event.RunCompleted
 	severity := "info"
 	if status == domain.RunFailed || status == domain.RunDegraded {
@@ -1076,9 +1255,7 @@ func (s *Service) finishRun(status domain.RunStatus, reason string) error {
 		typeName = "run.cancelled"
 		severity = "warning"
 	}
-	s.append(event.Input{Source: "supervisor", Type: typeName, Severity: severity, Payload: map[string]string{"reason": reason}})
-	s.save()
-	return nil
+	return s.appendEvent(event.Input{Source: "supervisor", Type: typeName, Severity: severity, Payload: map[string]string{"reason": reason}})
 }
 
 func (s *Service) isCancelled() bool {
@@ -1093,69 +1270,41 @@ func (s *Service) isTaskCancelled(taskID string) bool {
 	return s.cancelledTasks[taskID]
 }
 
-func (s *Service) setRunStatus(status domain.RunStatus, reason string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	s.snapshot.Run.Status = status
-	if reason != "" {
-		s.snapshot.LastError = reason
-	}
-	if s.snapshot.Run.StartedAt == nil && status != domain.RunPlanned {
-		s.snapshot.Run.StartedAt = &now
-	}
-	if status == domain.RunCompleted || status == domain.RunFailed || status == domain.RunCancelled || status == domain.RunDegraded {
-		s.snapshot.Run.EndedAt = &now
-	}
-	s.snapshot.UpdatedAt = now
-	_ = s.saveLocked()
-}
-
-func (s *Service) setWaveStatus(status domain.WaveStatus) {
-	s.mu.Lock()
-	s.snapshot.Wave.Status = status
-	now := time.Now().UTC()
-	if status == domain.WaveRunning {
-		s.snapshot.Wave.StartedAt = &now
-	}
-	if status == domain.WaveVerified || status == domain.WaveFailed || status == domain.WaveCancelled {
-		s.snapshot.Wave.EndedAt = &now
-	}
-	for index := range s.snapshot.Waves {
-		if s.snapshot.Waves[index].WaveID == s.snapshot.Wave.WaveID {
-			s.snapshot.Waves[index] = s.snapshot.Wave
-			break
-		}
-	}
-	s.snapshot.UpdatedAt = now
-	_ = s.saveLocked()
-	s.mu.Unlock()
-}
-
-func (s *Service) append(input event.Input) {
-	_, _ = s.events.Append(input)
-}
-
-func (s *Service) save() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_ = s.saveLocked()
-}
-
+// saveLocked is retained only for rare non-event projections (legacy tests).
+// Production state changes must use Commit.
 func (s *Service) saveLocked() error {
-	s.snapshot.UpdatedAt = time.Now().UTC()
-	if err := storage.AtomicWriteJSON(s.paths.State, s.snapshot, 0o600); err != nil {
+	if !s.acceptingWork {
+		return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
+	}
+	candidate := s.snapshot
+	candidate.UpdatedAt = time.Now().UTC()
+	if err := s.persistSnapshotLocked(candidate); err != nil {
+		s.acceptingWork = false
+		s.reportPersistenceFailure(err)
 		return err
 	}
-	if err := storage.AtomicWriteJSON(s.paths.Run, s.snapshot.Run, 0o600); err != nil {
+	s.snapshot = candidate
+	return nil
+}
+
+// persistSnapshotLocked writes the multi-file Snapshot projection using only
+// the provided value. It must not read or mutate s.snapshot.
+func (s *Service) persistSnapshotLocked(value Snapshot) error {
+	if s.persistSnapshotFn != nil {
+		return s.persistSnapshotFn(value)
+	}
+	if err := storage.AtomicWriteJSON(s.paths.State, value, 0o600); err != nil {
 		return err
 	}
-	for _, runtime := range s.snapshot.Tasks {
-		taskPaths, err := storage.NewLayout(s.config.BrokerHome)
-		if err != nil {
-			return err
-		}
-		paths, err := taskPaths.TaskPaths(string(s.snapshot.Run.ProjectID), string(s.snapshot.Run.RunID), string(runtime.Task.TaskID))
+	if err := storage.AtomicWriteJSON(s.paths.Run, value.Run, 0o600); err != nil {
+		return err
+	}
+	layout, err := storage.NewLayout(s.config.BrokerHome)
+	if err != nil {
+		return err
+	}
+	for _, runtime := range value.Tasks {
+		paths, err := layout.TaskPaths(string(value.Run.ProjectID), string(value.Run.RunID), string(runtime.Task.TaskID))
 		if err != nil {
 			return err
 		}
@@ -1163,17 +1312,19 @@ func (s *Service) saveLocked() error {
 			return err
 		}
 	}
-	for _, value := range s.snapshot.Waves {
-		paths := s.wavePaths(value.WaveID)
-		if err := storage.AtomicWriteJSON(paths.Wave, value, 0o600); err != nil {
+	for _, waveValue := range value.Waves {
+		paths, err := layout.WavePaths(string(value.Run.ProjectID), string(value.Run.RunID), string(waveValue.WaveID))
+		if err != nil {
+			return err
+		}
+		if err := storage.AtomicWriteJSON(paths.Wave, waveValue, 0o600); err != nil {
 			return err
 		}
 	}
-	status := renderStatus(s.snapshot)
-	if err := storage.AtomicWriteFile(s.paths.Status, []byte(status), 0o600); err != nil {
+	if err := storage.AtomicWriteFile(s.paths.Status, []byte(renderStatus(value)), 0o600); err != nil {
 		return err
 	}
-	return storage.AtomicWriteFile(s.paths.RunSummary, []byte(renderRunSummary(s.snapshot)), 0o600)
+	return storage.AtomicWriteFile(s.paths.RunSummary, []byte(renderRunSummary(value)), 0o600)
 }
 
 func (s *Service) taskDir(item domain.Task) string {
@@ -1209,12 +1360,14 @@ func (s *Service) writeSupervisorIdentity(reason string) error {
 		return err
 	}
 	value := domain.SupervisorIdentity{PID: identity.PID, ProcessStartToken: identity.StartToken, Executable: os.Args[0], ExecutableVersion: "phase1", IPCEndpoint: SocketPath(s.runDir), HeartbeatAt: time.Now().UTC(), ShutdownReason: reason}
-	s.mu.Lock()
-	s.snapshot.Run.SupervisorIdentity = &value
-	s.snapshot.UpdatedAt = time.Now().UTC()
-	err = s.saveLocked()
-	s.mu.Unlock()
-	return err
+	return s.commitMutate(context.Background(), event.Input{
+		Source: "supervisor", Type: event.SupervisorHeartbeat, Severity: "info",
+		Payload: map[string]any{"reason": reason, "identity": value},
+	}, func(candidate *Snapshot) error {
+		candidate.Run.SupervisorIdentity = &value
+		candidate.UpdatedAt = time.Now().UTC()
+		return nil
+	})
 }
 
 func (s *Service) heartbeat(ctx context.Context) {
@@ -1227,12 +1380,19 @@ func (s *Service) heartbeat(ctx context.Context) {
 		case <-s.terminal:
 			return
 		case now := <-ticker.C:
-			s.mu.Lock()
-			if s.snapshot.Run.SupervisorIdentity != nil {
-				s.snapshot.Run.SupervisorIdentity.HeartbeatAt = now.UTC()
+			if !s.AcceptingWork() {
+				return
 			}
-			_ = s.saveLocked()
-			s.mu.Unlock()
+			_ = s.commitMutate(ctx, event.Input{
+				Source: "supervisor", Type: event.SupervisorHeartbeat, Severity: "info",
+				Payload: map[string]any{"reason": "heartbeat", "at": now.UTC()},
+			}, func(candidate *Snapshot) error {
+				if candidate.Run.SupervisorIdentity != nil {
+					candidate.Run.SupervisorIdentity.HeartbeatAt = now.UTC()
+				}
+				candidate.UpdatedAt = now.UTC()
+				return nil
+			})
 		}
 	}
 }
@@ -1325,16 +1485,18 @@ func appendFile(path string, data []byte) error {
 	return err
 }
 
-func cloneSnapshot(source Snapshot) Snapshot {
-	data, err := json.Marshal(source)
+// cloneSnapshot returns a deep copy of a Snapshot via JSON round-trip.
+// Snapshot is itself a JSON persistence structure, so this matches on-disk form.
+func cloneSnapshot(value Snapshot) (Snapshot, error) {
+	data, err := json.Marshal(value)
 	if err != nil {
-		return source
+		return Snapshot{}, fmt.Errorf("clone snapshot: %w", err)
 	}
 	var copy Snapshot
-	if json.Unmarshal(data, &copy) != nil {
-		return source
+	if err := json.Unmarshal(data, &copy); err != nil {
+		return Snapshot{}, fmt.Errorf("clone snapshot: %w", err)
 	}
-	return copy
+	return copy, nil
 }
 
 func SocketPath(runDir string) string {

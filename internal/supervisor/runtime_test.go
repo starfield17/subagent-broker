@@ -230,6 +230,8 @@ func writeMultiWaveFixture(t *testing.T) (string, storage.Layout) {
 	}
 	a := makeTask("task-a", "wave-1", "a.txt")
 	b := makeTask("task-b", "wave-1", "b.txt")
+	a.ParallelResponsibilities = map[domain.TaskID]string{"task-b": "owns b.txt"}
+	b.ParallelResponsibilities = map[domain.TaskID]string{"task-a": "owns a.txt"}
 	c := makeTask("task-c", "wave-2", "c.txt")
 	c.DependsOn = []domain.TaskID{"task-a", "task-b"}
 	plan := domain.RunPlan{SchemaVersion: run.SchemaVersion, Waves: []domain.WavePlan{{WaveID: "wave-1", Tasks: []domain.Task{a, b}, IntegrationChecks: []domain.ValidationCommand{{Command: "true", Scope: "wave"}}}, {WaveID: "wave-2", Tasks: []domain.Task{c}}}}
