@@ -655,9 +655,15 @@ func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, nati
 		worker.StatusDimensions.Protocol = state.ProtocolIdleBetweenTurns
 	case event.TurnFailed, "protocol.error":
 		worker.StatusDimensions.Protocol = state.ProtocolError
+	case event.TurnCompleted:
+		worker.StatusDimensions.Protocol = state.ProtocolIdleBetweenTurns
 	}
 	runtime.Dimensions = worker.StatusDimensions
 	_ = s.saveRuntime(*runtime)
+	if native.Kind == event.TurnCompleted || native.Kind == event.ResultSubmitted ||
+		worker.StatusDimensions.Protocol == state.ProtocolIdleBetweenTurns {
+		_ = s.FlushInstructionOutbox(context.Background(), string(runtime.Task.TaskID), "turn_boundary")
+	}
 }
 
 func (s *Service) updateProgress(runtime *TaskState, now time.Time) {
@@ -1016,6 +1022,7 @@ func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
 			return transitionErr
 		}
 	}
+	s.onTaskTerminalMessages(string(runtime.Task.TaskID), "task failed: "+stage)
 	if stage != "result" && stage != "result_validation" && runtime.ReportPath == "" {
 		failed := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusFailed, Summary: "Worker execution failed", NoFilesChangedReason: "No verified file list was available after the failure", ValidationNotRunReason: "validation was not reached", FailureStage: stage, ErrorSummary: err.Error(), WorkspaceState: "Workspace was left in place; no rollback was performed", HandoffNotes: []string{"Main Agent should inspect the workspace before retrying."}}
 		if publishErr := report.Publish(s.taskDir(runtime.Task), failed, time.Now().UTC()); publishErr == nil {
@@ -1037,6 +1044,7 @@ func (s *Service) cancelTask(runtime *TaskState, reason string) error {
 			return err
 		}
 	}
+	s.onTaskTerminalMessages(string(runtime.Task.TaskID), "task cancelled: "+reason)
 	result := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusCancelled, Summary: "Task was cancelled", NoFilesChangedReason: "cancellation state was collected before verification", ValidationNotRunReason: "run cancelled", StopReason: reason, WorkspaceState: "workspace was left in place; no rollback was performed", HandoffNotes: []string{"Main Agent must inspect the current workspace before retrying."}}
 	if err := report.Publish(s.taskDir(runtime.Task), result, time.Now().UTC()); err == nil {
 		runtime.ReportPath = filepath.Join(s.taskDir(runtime.Task), "report.md")
@@ -1046,6 +1054,12 @@ func (s *Service) cancelTask(runtime *TaskState, reason string) error {
 }
 
 func (s *Service) finishRun(status domain.RunStatus, reason string) error {
+	// Expire all pending messages across tasks when the Run ends.
+	if status == domain.RunFailed || status == domain.RunCancelled || status == domain.RunDegraded || status == domain.RunCompleted {
+		for _, runtime := range s.Snapshot().Tasks {
+			s.onTaskTerminalMessages(string(runtime.Task.TaskID), "run ended: "+string(status))
+		}
+	}
 	if status == domain.RunFailed || status == domain.RunDegraded {
 		if err := s.setWaveStatus(domain.WaveFailed); err != nil {
 			return err

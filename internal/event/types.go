@@ -63,4 +63,15 @@ const (
 	CancelTreeRequested   = "cancel.tree_requested"
 	CancelTreeCompleted   = "cancel.tree_completed"
 	TaskBlockKindChanged  = "task.block_kind_changed"
+
+	// PR3 message lifecycle.
+	MessageCreated        = "message.created"
+	MessageQueued         = "message.queued"
+	MessageDelivered      = "message.delivered"
+	MessageAcknowledged   = "message.acknowledged"
+	MessageAnswered       = "message.answered"
+	MessageExpired        = "message.expired"
+	MessageFailed         = "message.failed"
+	TaskWaitingRecomputed = "task.waiting_recomputed"
+	InstructionFlushed    = "instruction.flushed"
 )

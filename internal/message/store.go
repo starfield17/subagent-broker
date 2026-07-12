@@ -1,18 +1,15 @@
 package message
 
 import (
-	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/vnai/subagent-broker/internal/storage"
 )
 
 type Store struct {
@@ -21,6 +18,14 @@ type Store struct {
 }
 
 func NewStore(path string) *Store { return &Store{path: path} }
+
+// Path returns the journal file path.
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
 
 func (s *Store) Append(value Message) error {
 	s.mu.Lock()
@@ -32,52 +37,70 @@ func (s *Store) Append(value Message) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
-	}
-	file, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := file.Write(append(line, '\n')); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	return file.Close()
+	return storage.AppendJSONL(s.path, line, 0o600)
 }
 
-func Replay(path string) (map[string]Message, error) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]Message{}, nil
+// ReplayResult captures message journal replay metadata.
+type ReplayResult struct {
+	Messages       map[string]Message
+	TailRepaired   bool
+	QuarantinePath string
+}
+
+// ReplayDetailed replays the message journal with incomplete-tail repair enabled.
+func ReplayDetailed(path string) (ReplayResult, error) {
+	messages := map[string]Message{}
+	type identity struct {
+		RunID  string
+		TaskID string
+		Type   Type
+	}
+	seen := map[string]identity{}
+	repair, err := storage.ReplayJSONL(path, storage.JSONLReplayOptions{RepairIncompleteTail: true}, func(line []byte, _ int) error {
+		var value Message
+		if err := json.Unmarshal(line, &value); err != nil {
+			return fmt.Errorf("decode message: %w", err)
+		}
+		if value.MessageID == "" || value.RunID == "" || value.Type == "" || value.Status == "" {
+			return fmt.Errorf("message_id, run_id, type, and status are required")
+		}
+		if previous, ok := seen[value.MessageID]; ok {
+			if previous.RunID != value.RunID || previous.TaskID != value.TaskID || previous.Type != value.Type {
+				return fmt.Errorf("message %q identity drift: run_id/task_id/type must remain stable", value.MessageID)
+			}
+		} else {
+			seen[value.MessageID] = identity{RunID: value.RunID, TaskID: value.TaskID, Type: value.Type}
+		}
+		return nil
+	}, func(line []byte, _ int) error {
+		var value Message
+		if err := json.Unmarshal(line, &value); err != nil {
+			return fmt.Errorf("decode message: %w", err)
+		}
+		messages[value.MessageID] = value
+		return nil
+	})
+	result := ReplayResult{
+		Messages:       messages,
+		TailRepaired:   repair.Repaired,
+		QuarantinePath: repair.QuarantinePath,
 	}
 	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	result := map[string]Message{}
-	reader := bufio.NewReader(file)
-	for {
-		line, readErr := reader.ReadBytes('\n')
-		if len(line) > 0 && line[len(line)-1] == '\n' {
-			var value Message
-			if err := json.Unmarshal(line, &value); err != nil {
-				return nil, err
-			}
-			result[value.MessageID] = value
+		if result.Messages == nil {
+			result.Messages = map[string]Message{}
 		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return nil, readErr
-		}
+		return result, err
 	}
 	return result, nil
+}
+
+// Replay is a compatibility wrapper around ReplayDetailed.
+func Replay(path string) (map[string]Message, error) {
+	result, err := ReplayDetailed(path)
+	if result.Messages == nil {
+		result.Messages = map[string]Message{}
+	}
+	return result.Messages, err
 }
 
 func Sorted(values map[string]Message, includeResolved bool) []Message {

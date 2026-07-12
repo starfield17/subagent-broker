@@ -6,6 +6,34 @@ import (
 	"testing"
 )
 
+func TestStatusMachineHelpers(t *testing.T) {
+	cases := []struct {
+		from, to Status
+		ok       bool
+	}{
+		{Created, Validated, true},
+		{Validated, Queued, true},
+		{Queued, Delivered, true},
+		{Delivered, Answered, true},
+		{Answered, Queued, false},
+		{Failed, Delivered, false},
+		{Expired, Failed, false},
+		{Queued, Queued, true},
+	}
+	for _, tc := range cases {
+		err := ValidateTransition(tc.from, tc.to)
+		if tc.ok && err != nil {
+			t.Fatalf("%s -> %s: %v", tc.from, tc.to, err)
+		}
+		if !tc.ok && err == nil {
+			t.Fatalf("%s -> %s should fail", tc.from, tc.to)
+		}
+	}
+	if !IsTerminal(Expired) || IsPending(Failed) || !IsPending(Acknowledged) {
+		t.Fatal("IsTerminal/IsPending mismatch")
+	}
+}
+
 func TestQuestionPublicationIsValidated(t *testing.T) {
 	dir := t.TempDir()
 	invalid := QuestionEnvelope{SchemaVersion: "v1alpha1"}

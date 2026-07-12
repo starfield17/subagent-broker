@@ -280,6 +280,9 @@ func (s *Service) commitTaskDimensions(runtime *TaskState, eventType string, fro
 // appendEvent records a pure telemetry event without mutating Snapshot.
 // Persistence failures fail-close the supervisor.
 func (s *Service) appendEvent(input event.Input) error {
+	if s.events == nil {
+		return nil
+	}
 	if !s.AcceptingWork() {
 		return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
 	}

@@ -79,6 +79,7 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	if mode == workerpkg.AttemptRecoveryResume {
 		resumeSessionID = attempt.Worker.NativeSessionID
 	}
+	// Resume-mode outbox will flush after session is active.
 
 	// Persist new attempt without dropping history.
 	if err := s.commitMutate(parent, event.Input{
@@ -216,6 +217,10 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	s.refreshTaskRuntime(runtime)
 	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.SessionStarted, Severity: "info"}); err != nil {
 		return err
+	}
+	// After resume/start, flush resume-queued instructions into the active session.
+	if mode == workerpkg.AttemptRecoveryResume {
+		_ = s.FlushInstructionOutbox(workerCtx, string(runtime.Task.TaskID), "session_resume")
 	}
 
 	resultSeen, timedOut, exit, drainErr := s.runWorkerSession(workerCtx, runtime, harness, session, workerID, identity)

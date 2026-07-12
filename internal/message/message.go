@@ -3,6 +3,7 @@ package message
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -39,6 +40,56 @@ const (
 	Failed       Status = "failed"
 )
 
+// DeliveryMode is the Broker-owned delivery semantic for a message.
+// JSON values match the adapter delivery vocabulary.
+type DeliveryMode string
+
+const (
+	DeliveryImmediate   DeliveryMode = "immediate"
+	DeliveryNextTurn    DeliveryMode = "next_turn"
+	DeliveryResume      DeliveryMode = "resume"
+	DeliveryUnsupported DeliveryMode = "unsupported"
+)
+
+// SchemaVersion is the message journal / envelope schema.
+const SchemaVersion = "v1alpha1"
+
+var statusTransitions = map[Status]map[Status]bool{
+	Created:      {Validated: true, Failed: true},
+	Validated:    {Queued: true, Failed: true},
+	Queued:       {Delivered: true, Answered: true, Expired: true, Failed: true},
+	Delivered:    {Acknowledged: true, Answered: true, Expired: true, Failed: true},
+	Acknowledged: {Answered: true, Expired: true, Failed: true},
+	Answered:     {},
+	Expired:      {},
+	Failed:       {},
+}
+
+// ValidateTransition checks whether a message may move from -> to.
+// Same-status transitions are idempotent no-ops.
+func ValidateTransition(from, to Status) error {
+	if from == to {
+		return nil
+	}
+	if IsTerminal(from) {
+		return fmt.Errorf("cannot transition from terminal status %s to %s", from, to)
+	}
+	if statusTransitions[from][to] {
+		return nil
+	}
+	return fmt.Errorf("invalid message status transition %s -> %s", from, to)
+}
+
+// IsTerminal reports whether status is a terminal message state.
+func IsTerminal(status Status) bool {
+	return status == Answered || status == Expired || status == Failed
+}
+
+// IsPending reports whether status is non-terminal.
+func IsPending(status Status) bool {
+	return !IsTerminal(status)
+}
+
 type Category string
 
 const (
@@ -52,21 +103,23 @@ const (
 )
 
 type Message struct {
-	SchemaVersion string          `json:"schema_version"`
-	MessageID     string          `json:"message_id"`
-	RunID         string          `json:"run_id"`
-	TaskID        string          `json:"task_id,omitempty"`
-	WorkerID      string          `json:"worker_id,omitempty"`
-	Type          Type            `json:"type"`
-	Category      Category        `json:"category,omitempty"`
-	Status        Status          `json:"status"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
-	InReplyTo     string          `json:"in_reply_to,omitempty"`
-	DeliveryMode  string          `json:"delivery_mode,omitempty"`
-	Error         string          `json:"error,omitempty"`
-	Payload       json.RawMessage `json:"payload"`
-	Resolution    json.RawMessage `json:"resolution,omitempty"`
+	SchemaVersion    string          `json:"schema_version"`
+	MessageID        string          `json:"message_id"`
+	RunID            string          `json:"run_id"`
+	TaskID           string          `json:"task_id,omitempty"`
+	WorkerID         string          `json:"worker_id,omitempty"`
+	AttemptNumber    int             `json:"attempt_number,omitempty"`
+	Type             Type            `json:"type"`
+	Category         Category        `json:"category,omitempty"`
+	Status           Status          `json:"status"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+	InReplyTo        string          `json:"in_reply_to,omitempty"`
+	DeliveryMode     DeliveryMode    `json:"delivery_mode,omitempty"`
+	DeliveryAttempts int             `json:"delivery_attempts,omitempty"`
+	Error            string          `json:"error,omitempty"`
+	Payload          json.RawMessage `json:"payload"`
+	Resolution       json.RawMessage `json:"resolution,omitempty"`
 }
 
 type InstructionPayload struct {
@@ -130,17 +183,55 @@ func PublishQuestion(taskDir string, q QuestionEnvelope) error {
 	return PublishQuestionID(taskDir, "", q)
 }
 
+// QuestionMeta is the durable projection metadata for a question artifact.
+type QuestionMeta struct {
+	QuestionEnvelope
+	MessageID string `json:"message_id,omitempty"`
+	TaskID    string `json:"task_id,omitempty"`
+}
+
 func PublishQuestionID(taskDir, messageID string, q QuestionEnvelope) error {
+	return PublishQuestionProjection(taskDir, messageID, "", q, true)
+}
+
+// PublishQuestionProjection writes the archive (always when messageID set) and
+// optionally the top-level current-question projection.
+func PublishQuestionProjection(taskDir, messageID, taskID string, q QuestionEnvelope, updateTopLevel bool) error {
 	if err := ValidateQuestion(q); err != nil {
 		return err
 	}
-	meta, err := json.MarshalIndent(q, "", "  ")
+	metaValue := QuestionMeta{QuestionEnvelope: q, MessageID: messageID, TaskID: taskID}
+	meta, err := json.MarshalIndent(metaValue, "", "  ")
 	if err != nil {
 		return err
+	}
+	markdown := renderQuestionMarkdown(q)
+	if messageID != "" {
+		archive := filepath.Join(taskDir, "questions", messageID)
+		if err := storage.AtomicWriteFile(filepath.Join(archive, "question.meta.json"), append(meta, '\n'), 0o600); err != nil {
+			return err
+		}
+		if err := storage.AtomicWriteFile(filepath.Join(archive, "question.md"), markdown, 0o600); err != nil {
+			return err
+		}
+	}
+	if !updateTopLevel {
+		return nil
 	}
 	if err := storage.AtomicWriteFile(filepath.Join(taskDir, "question.meta.json"), append(meta, '\n'), 0o600); err != nil {
 		return err
 	}
+	return storage.AtomicWriteFile(filepath.Join(taskDir, "question.md"), markdown, 0o600)
+}
+
+// ClearTopLevelQuestion removes only the current-question projection files.
+func ClearTopLevelQuestion(taskDir string) error {
+	_ = os.Remove(filepath.Join(taskDir, "question.md"))
+	_ = os.Remove(filepath.Join(taskDir, "question.meta.json"))
+	return nil
+}
+
+func renderQuestionMarkdown(q QuestionEnvelope) []byte {
 	var b strings.Builder
 	b.WriteString("# Main Agent Decision Required\n\n## Question\n\n" + q.Question + "\n\n## Reason\n\n" + q.Reason + "\n\n## Current Task Scope\n\n")
 	for _, item := range q.CurrentScope {
@@ -168,15 +259,5 @@ func PublishQuestionID(taskDir, messageID string, q QuestionEnvelope) error {
 	} else {
 		b.WriteString(q.Suggestion + "\n")
 	}
-	markdown := []byte(b.String())
-	if messageID != "" {
-		archive := filepath.Join(taskDir, "questions", messageID)
-		if err := storage.AtomicWriteFile(filepath.Join(archive, "question.meta.json"), append(meta, '\n'), 0o600); err != nil {
-			return err
-		}
-		if err := storage.AtomicWriteFile(filepath.Join(archive, "question.md"), markdown, 0o600); err != nil {
-			return err
-		}
-	}
-	return storage.AtomicWriteFile(filepath.Join(taskDir, "question.md"), markdown, 0o600)
+	return []byte(b.String())
 }
