@@ -21,6 +21,7 @@ import (
 	"github.com/vnai/subagent-broker/internal/message"
 	"github.com/vnai/subagent-broker/internal/process"
 	"github.com/vnai/subagent-broker/internal/report"
+	"github.com/vnai/subagent-broker/internal/stall"
 	"github.com/vnai/subagent-broker/internal/state"
 	"github.com/vnai/subagent-broker/internal/storage"
 	"github.com/vnai/subagent-broker/internal/task"
@@ -30,6 +31,10 @@ import (
 )
 
 const SchemaVersion = "v1alpha1"
+
+// errAwaitingDecision keeps the Supervisor alive and IPC-accessible while a
+// Barrier or pending Main Agent decision pauses progression.
+var errAwaitingDecision = errors.New("supervisor is awaiting a decision")
 
 type Config struct {
 	BrokerHome        string        `json:"broker_home"`
@@ -104,16 +109,24 @@ const (
 )
 
 type TaskState struct {
-	Task          domain.Task           `json:"task"`
-	Worker        *domain.WorkerSession `json:"worker,omitempty"` // current/active attempt projection (compat)
-	Attempts      []workerpkg.Attempt   `json:"attempts,omitempty"`
-	ActiveAttempt int                   `json:"active_attempt,omitempty"` // attempt number; 0 = none
-	BlockKind     BlockKind             `json:"block_kind,omitempty"`
-	Dimensions    state.Dimensions      `json:"status_dimensions"`
-	ReportPath    string                `json:"report_path,omitempty"`
-	Validation    []ValidationResult    `json:"validation,omitempty"`
-	LastError     string                `json:"last_error,omitempty"`
-	LastProgress  time.Time             `json:"last_progress_at,omitempty"`
+	Task                domain.Task           `json:"task"`
+	Worker              *domain.WorkerSession `json:"worker,omitempty"` // current/active attempt projection (compat)
+	Attempts            []workerpkg.Attempt   `json:"attempts,omitempty"`
+	ActiveAttempt       int                   `json:"active_attempt,omitempty"` // attempt number; 0 = none
+	BlockKind           BlockKind             `json:"block_kind,omitempty"`
+	Dimensions          state.Dimensions      `json:"status_dimensions"`
+	ReportPath          string                `json:"report_path,omitempty"`
+	Validation          []ValidationResult    `json:"validation,omitempty"`
+	LastError           string                `json:"last_error,omitempty"`
+	LastProgress        time.Time             `json:"last_progress_at,omitempty"`
+	Stall               *stall.Assessment     `json:"stall_assessment,omitempty"`
+	LastStdout          time.Time             `json:"last_stdout_at,omitempty"`
+	LastStderr          time.Time             `json:"last_stderr_at,omitempty"`
+	LastProtocolEventAt time.Time             `json:"last_protocol_event_at,omitempty"`
+	LastToolStart       time.Time             `json:"last_tool_start_at,omitempty"`
+	LastToolFinish      time.Time             `json:"last_tool_finish_at,omitempty"`
+	TurnStartedAt       time.Time             `json:"turn_started_at,omitempty"`
+	TurnEndedAt         time.Time             `json:"turn_ended_at,omitempty"`
 	// Deprecated: PendingInstruction is retained only for JSON compatibility with
 	// older snapshots. It is not an outbox; durable instructions use message.Router.
 	PendingInstruction string `json:"pending_instruction,omitempty"`
@@ -161,6 +174,7 @@ type Service struct {
 	// Commit fail-closed control plane.
 	fatalPersistence chan error
 	acceptingWork    bool
+	advance          chan struct{}
 
 	// persistSnapshotFn overrides disk persistence for tests. When nil,
 	// persistSnapshotLocked writes the multi-file Snapshot projection.
@@ -333,7 +347,7 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 		snapshot: snapshot, events: event.NewStore(paths.Events, string(run.RunID), lastSeq),
 		terminal: make(chan struct{}), recovering: recovering, plan: plan,
 		messages: messageStore, messageIndex: messageIndex, router: router, pending: map[string]chan message.Resolution{}, active: map[string]activeWorker{}, cancelledTasks: map[string]bool{}, runBaseline: runBaseline,
-		fatalPersistence: make(chan error, 1), acceptingWork: true,
+		fatalPersistence: make(chan error, 1), acceptingWork: true, advance: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -361,7 +375,22 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 	go s.serveIPC(ctx)
-	err := s.execute(ctx)
+	var err error
+	for {
+		err = s.execute(ctx)
+		if !errors.Is(err, errAwaitingDecision) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-s.advanceSignal():
+		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			break
+		}
+	}
 	if err == nil && !s.AcceptingWork() {
 		err = fmt.Errorf("supervisor stopped after a fatal persistence failure")
 	}
@@ -377,6 +406,23 @@ func (s *Service) Start(ctx context.Context) error {
 	_ = s.writeSupervisorIdentity(shutdownReason(err, status))
 	close(s.terminal)
 	return err
+}
+
+func (s *Service) advanceSignal() <-chan struct{} {
+	if s.advance == nil {
+		return nil
+	}
+	return s.advance
+}
+
+func (s *Service) signalAdvance() {
+	if s.advance == nil {
+		return
+	}
+	select {
+	case s.advance <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Service) watchPersistenceFailures(cancel context.CancelFunc) {
@@ -440,6 +486,7 @@ func (s *Service) RequestCancel(ctx context.Context) error {
 	if degraded {
 		_ = s.setRunStatus(domain.RunDegraded, "cancel completed with residual worker processes")
 	}
+	s.signalAdvance()
 	return firstErr
 }
 
@@ -469,6 +516,7 @@ func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 	if err == nil && !result.TreeExited && !result.PIDReused {
 		_ = s.setRunStatus(domain.RunDegraded, "task cancel left residual processes")
 	}
+	s.signalAdvance()
 	return err
 }
 
@@ -549,11 +597,19 @@ func (s *Service) execute(ctx context.Context) error {
 		case domain.BarrierFailed:
 			return s.finishRun(domain.RunFailed, "Wave barrier failed")
 		case domain.BarrierBlocked:
-			// Blocked is not a hard Run failure; stop progression until Main Agent unblocks.
-			return s.finishRun(domain.RunDegraded, "Wave barrier blocked: pending decisions or final-blocked tasks")
+			// Keep the Supervisor alive so a pending decision can be answered
+			// through IPC. The next execute pass re-runs this Barrier.
+			if err := s.setRunStatus(domain.RunBarrier, "Wave barrier blocked: pending decisions or final-blocked tasks"); err != nil {
+				return err
+			}
+			return errAwaitingDecision
 		case domain.BarrierPassedWithWarnings:
-			// Do not auto-continue; require AcceptBarrierWarnings before next Wave.
-			return s.finishRun(domain.RunDegraded, "Wave barrier passed_with_warnings; acceptance required before continuing")
+			// Keep the Supervisor alive; barrier.accept will signal the next
+			// execute pass and the following Wave will start automatically.
+			if err := s.setRunStatus(domain.RunBarrier, "Wave barrier passed_with_warnings; acceptance required before continuing"); err != nil {
+				return err
+			}
+			return errAwaitingDecision
 		case domain.BarrierPassed:
 			// Wave already marked verified inside runBarrier.
 			if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.WaveVerified, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID}}); err != nil {
@@ -649,15 +705,24 @@ func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, nati
 	worker.LastEventAt = now
 	worker.LastProgressAt = now
 	runtime.LastProgress = now
+	runtime.LastStdout = now
+	runtime.LastProtocolEventAt = now
+	if !native.Timestamp.IsZero() {
+		runtime.LastProtocolEventAt = native.Timestamp
+	}
 	worker.StatusDimensions.Progress = state.ProgressActive
 	switch native.Kind {
 	case event.TurnStarted:
+		runtime.TurnStartedAt = now
+		runtime.TurnEndedAt = time.Time{}
 		worker.StatusDimensions.Protocol = state.ProtocolThinking
 	case event.ModelOutputDelta, event.ModelMessageCompleted:
 		worker.StatusDimensions.Protocol = state.ProtocolStreaming
 	case event.ToolStarted:
+		runtime.LastToolStart = now
 		worker.StatusDimensions.Protocol = state.ProtocolToolRunning
 	case event.ToolCompleted, event.ToolOutput:
+		runtime.LastToolFinish = now
 		worker.StatusDimensions.Protocol = state.ProtocolThinking
 	case event.PermissionRequested:
 		worker.StatusDimensions.Protocol = state.ProtocolWaitingPermission
@@ -675,10 +740,22 @@ func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, nati
 	case event.TurnFailed, "protocol.error":
 		worker.StatusDimensions.Protocol = state.ProtocolError
 	case event.TurnCompleted:
+		runtime.TurnEndedAt = now
 		worker.StatusDimensions.Protocol = state.ProtocolIdleBetweenTurns
 	}
 	runtime.Dimensions = worker.StatusDimensions
+	clearedStall := runtime.Stall != nil && (runtime.Stall.State == string(state.ProgressSuspectedStall) || runtime.Stall.State == string(state.ProgressStalled))
+	if clearedStall {
+		runtime.Stall = nil
+	}
 	_ = s.saveRuntime(*runtime)
+	if clearedStall {
+		_ = s.appendEvent(event.Input{
+			TaskID: string(runtime.Task.TaskID), WorkerID: string(worker.WorkerID), Source: "supervisor",
+			Type: event.WorkerStallCleared, Severity: "info",
+			Payload: map[string]any{"reason": "protocol or output progress resumed", "evidence": []string{"new protocol/output event"}},
+		})
+	}
 	if native.Kind == event.TurnCompleted || native.Kind == event.ResultSubmitted ||
 		worker.StatusDimensions.Protocol == state.ProtocolIdleBetweenTurns {
 		_ = s.FlushInstructionOutbox(context.Background(), string(runtime.Task.TaskID), "turn_boundary")
@@ -687,32 +764,85 @@ func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, nati
 
 func (s *Service) updateProgress(runtime *TaskState, now time.Time) {
 	worker := runtime.Worker
-	if worker == nil || s.taskHasPendingMessage(string(runtime.Task.TaskID)) || state.IsWaiting(worker.StatusDimensions.Protocol) || worker.LastProgressAt.IsZero() {
+	if worker == nil || worker.LastProgressAt.IsZero() {
 		return
 	}
-	elapsed := now.Sub(worker.LastProgressAt)
+	assessment := stall.Assess(stall.Input{
+		Protocol:            worker.StatusDimensions.Protocol,
+		Progress:            worker.StatusDimensions.Progress,
+		Process:             worker.StatusDimensions.Process,
+		LastProgressAt:      worker.LastProgressAt,
+		LastEventAt:         worker.LastEventAt,
+		LastProtocolEventAt: runtime.LastProtocolEventAt,
+		LastStdoutAt:        runtime.LastStdout,
+		LastStderrAt:        runtime.LastStderr,
+		LastToolStartAt:     runtime.LastToolStart,
+		LastToolFinishAt:    runtime.LastToolFinish,
+		TurnStartedAt:       runtime.TurnStartedAt,
+		TurnEndedAt:         runtime.TurnEndedAt,
+		HasPendingMessage:   s.taskHasPendingMessage(string(runtime.Task.TaskID)),
+		QuietAfter:          s.config.QuietAfter,
+		StallAfter:          s.config.StallAfter,
+		Now:                 now,
+	})
+	previousState, previousConfidence := "", ""
+	if runtime.Stall != nil {
+		previousState, previousConfidence = runtime.Stall.State, runtime.Stall.Confidence
+	}
+	wasSuspected := previousState == string(state.ProgressSuspectedStall) || previousState == string(state.ProgressStalled)
+	isSuspected := assessment.State == string(state.ProgressSuspectedStall) || assessment.State == string(state.ProgressStalled)
+	assessmentChanged := previousState != assessment.State || previousConfidence != assessment.Confidence
 	desired := worker.StatusDimensions.Progress
-	switch {
-	case elapsed >= 2*s.config.StallAfter:
+	switch assessment.State {
+	case string(state.ProgressStalled):
 		desired = state.ProgressStalled
-	case elapsed >= s.config.StallAfter:
+	case string(state.ProgressSuspectedStall):
 		desired = state.ProgressSuspectedStall
-	case elapsed >= s.config.QuietAfter:
+	case string(state.ProgressQuiet):
 		desired = state.ProgressQuiet
+	case string(state.ProgressActive), "none":
+		desired = state.ProgressActive
 	default:
 		return
 	}
-	if desired == worker.StatusDimensions.Progress {
+	if desired == worker.StatusDimensions.Progress && !assessmentChanged {
 		return
 	}
 	from := worker.StatusDimensions.Progress
-	if err := state.ValidateProgressTransition(from, desired); err != nil {
-		return
+	if desired != from {
+		if err := state.ValidateProgressTransition(from, desired); err != nil {
+			return
+		}
 	}
 	worker.StatusDimensions.Progress = desired
 	runtime.Dimensions = worker.StatusDimensions
+	if isSuspected {
+		assessmentCopy := assessment
+		runtime.Stall = &assessmentCopy
+	} else {
+		runtime.Stall = nil
+	}
 	_ = s.saveRuntime(*runtime)
-	_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: string(worker.WorkerID), Source: "supervisor", Type: event.ProgressStateChanged, Severity: "warning", Payload: map[string]any{"from": string(from), "to": string(desired), "quiet_for": elapsed.String(), "reason": "stall_watch"}})
+	if desired != from {
+		_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: string(worker.WorkerID), Source: "supervisor", Type: event.ProgressStateChanged, Severity: "warning", Payload: map[string]any{"from": string(from), "to": string(desired), "reason": "stall_watch"}})
+	}
+	if wasSuspected && !isSuspected {
+		_ = s.appendEvent(event.Input{
+			TaskID: string(runtime.Task.TaskID), WorkerID: string(worker.WorkerID), Source: "supervisor",
+			Type: event.WorkerStallCleared, Severity: "info",
+			Payload: map[string]any{"reason": "stall assessment cleared", "evidence": assessment.Evidence},
+		})
+	} else if isSuspected && assessmentChanged {
+		_ = s.appendEvent(event.Input{
+			TaskID: string(runtime.Task.TaskID), WorkerID: string(worker.WorkerID), Source: "supervisor",
+			Type: event.WorkerStallAssessed, Severity: "warning",
+			Payload: map[string]any{
+				"from": string(from), "to": string(desired), "quiet_for": assessment.QuietFor.String(),
+				"state": assessment.State, "reason": assessment.Reason,
+				"confidence": assessment.Confidence, "evidence": assessment.Evidence,
+			},
+		})
+	}
 }
 
 func (s *Service) runValidation(ctx context.Context, runtime *TaskState) bool {
@@ -874,6 +1004,13 @@ func (s *Service) AcceptBarrierWarnings(waveID, actor, reason string) error {
 	if strings.TrimSpace(actor) == "" || strings.TrimSpace(reason) == "" {
 		return fmt.Errorf("actor and reason are required to accept barrier warnings")
 	}
+	current, found := s.waveSnapshot(domain.WaveID(waveID))
+	if !found {
+		return fmt.Errorf("wave %s was not found", waveID)
+	}
+	if current.Status != domain.WaveWaiting || current.BarrierResult != domain.BarrierPassedWithWarnings || current.BarrierAccepted {
+		return fmt.Errorf("wave %s is not awaiting warning acceptance", waveID)
+	}
 	paths := s.wavePaths(domain.WaveID(waveID))
 	data, err := os.ReadFile(paths.Verification)
 	if err != nil {
@@ -883,7 +1020,7 @@ func (s *Service) AcceptBarrierWarnings(waveID, actor, reason string) error {
 	if err := json.Unmarshal(data, &verification); err != nil {
 		return err
 	}
-	if verification.Result != domain.BarrierPassedWithWarnings {
+	if verification.Result != domain.BarrierPassedWithWarnings || verification.Rejected {
 		return fmt.Errorf("wave %s barrier result is %s, not passed_with_warnings", waveID, verification.Result)
 	}
 	// Recompute current input hash; acceptance binds to the stored verification input_hash.
@@ -909,8 +1046,8 @@ func (s *Service) AcceptBarrierWarnings(waveID, actor, reason string) error {
 	if err := storage.AtomicWriteJSON(paths.Verification, verification, 0o600); err != nil {
 		return err
 	}
-	return s.commitMutate(context.Background(), event.Input{
-		Source: "supervisor", Type: "barrier.warnings_accepted", Severity: "info",
+	if err := s.commitMutate(context.Background(), event.Input{
+		Source: "supervisor", Type: event.BarrierWarningsAccepted, Severity: "info",
 		Payload: map[string]any{
 			"wave_id": waveID, "actor": actor, "reason": reason, "input_hash": verification.InputHash,
 			"from": string(domain.WaveWaiting), "to": string(domain.WaveVerified),
@@ -930,16 +1067,61 @@ func (s *Service) AcceptBarrierWarnings(waveID, actor, reason string) error {
 		}
 		candidate.UpdatedAt = now
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	s.signalAdvance()
+	return nil
 }
 
 // RejectBarrierWarnings records rejection of warnings and fails the Wave.
 func (s *Service) RejectBarrierWarnings(waveID, actor, reason string) error {
-	if strings.TrimSpace(reason) == "" {
-		return fmt.Errorf("reason is required to reject barrier warnings")
+	if strings.TrimSpace(actor) == "" || strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("actor and reason are required to reject barrier warnings")
 	}
-	return s.commitMutate(context.Background(), event.Input{
-		Source: "supervisor", Type: "barrier.warnings_rejected", Severity: "error",
+	current, found := s.waveSnapshot(domain.WaveID(waveID))
+	if !found {
+		return fmt.Errorf("wave %s was not found", waveID)
+	}
+	if current.Status != domain.WaveWaiting || current.BarrierResult != domain.BarrierPassedWithWarnings || current.BarrierAccepted {
+		return fmt.Errorf("wave %s is not awaiting warning acceptance", waveID)
+	}
+	paths := s.wavePaths(domain.WaveID(waveID))
+	data, err := os.ReadFile(paths.Verification)
+	if err != nil {
+		return fmt.Errorf("read verification for %s: %w", waveID, err)
+	}
+	var verification wave.Verification
+	if err := json.Unmarshal(data, &verification); err != nil {
+		return err
+	}
+	if verification.Result != domain.BarrierPassedWithWarnings || verification.InputHash == "" {
+		return fmt.Errorf("wave %s verification is stale; re-run barrier", waveID)
+	}
+	inputData, err := os.ReadFile(filepath.Join(paths.Root, "barrier-input.json"))
+	if err != nil {
+		return fmt.Errorf("barrier input missing for %s; re-run barrier", waveID)
+	}
+	var input wave.BarrierInputs
+	if err := json.Unmarshal(inputData, &input); err != nil {
+		return err
+	}
+	if hashBarrierInputs(input) != verification.InputHash {
+		return fmt.Errorf("barrier input changed since evaluation; rejection rejected (re-run barrier)")
+	}
+	now := time.Now().UTC()
+	verification.Rejected = true
+	verification.RejectReason = reason
+	verification.RejectedBy = actor
+	verification.RejectedAt = &now
+	if err := storage.AtomicWriteJSON(paths.Verification, verification, 0o600); err != nil {
+		return err
+	}
+	if err := storage.AtomicWriteFile(paths.Barrier, []byte(wave.RenderBarrier(verification)), 0o600); err != nil {
+		return err
+	}
+	if err := s.commitMutate(context.Background(), event.Input{
+		Source: "supervisor", Type: event.BarrierWarningsRejected, Severity: "error",
 		Payload: map[string]any{"wave_id": waveID, "actor": actor, "reason": reason, "from": string(domain.WaveWaiting), "to": string(domain.WaveFailed)},
 	}, func(candidate *Snapshot) error {
 		for index := range candidate.Waves {
@@ -947,7 +1129,6 @@ func (s *Service) RejectBarrierWarnings(waveID, actor, reason string) error {
 				candidate.Waves[index].Status = domain.WaveFailed
 				candidate.Waves[index].BarrierAccepted = false
 				candidate.Waves[index].BarrierReason = reason
-				now := time.Now().UTC()
 				candidate.Waves[index].EndedAt = &now
 				if candidate.Wave.WaveID == candidate.Waves[index].WaveID {
 					candidate.Wave = candidate.Waves[index]
@@ -957,7 +1138,31 @@ func (s *Service) RejectBarrierWarnings(waveID, actor, reason string) error {
 		}
 		candidate.UpdatedAt = time.Now().UTC()
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	if err := s.setRunStatus(domain.RunFailed, fmt.Sprintf("Wave %s barrier warnings rejected by %s: %s", waveID, actor, reason)); err != nil {
+		return err
+	}
+	if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.RunFailed, Severity: "error", Payload: map[string]string{"reason": fmt.Sprintf("barrier warnings rejected for %s", waveID)}}); err != nil {
+		return err
+	}
+	s.signalAdvance()
+	return nil
+}
+
+func (s *Service) waveSnapshot(id domain.WaveID) (domain.Wave, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, value := range s.snapshot.Waves {
+		if value.WaveID == id {
+			return value, true
+		}
+	}
+	if s.snapshot.Wave.WaveID == id {
+		return s.snapshot.Wave, true
+	}
+	return domain.Wave{}, false
 }
 
 func (s *Service) runCheck(ctx context.Context, check domain.ValidationCommand, logPath string) wave.CheckResult {

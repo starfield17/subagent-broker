@@ -339,6 +339,15 @@ func (s *Service) runWorkerSession(
 				continue
 			}
 			_ = appendFile(filepath.Join(s.taskDir(runtime.Task), "stderr.log"), chunk.Data)
+			at := chunk.Timestamp
+			if at.IsZero() {
+				at = time.Now().UTC()
+			}
+			runtime.LastStderr = at
+			runtime.LastProgress = at
+			if runtime.Worker != nil {
+				runtime.Worker.LastProgressAt = at
+			}
 		}
 	}
 

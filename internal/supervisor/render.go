@@ -24,6 +24,12 @@ func renderStatus(snapshot Snapshot) string {
 			if !runtime.LastProgress.IsZero() {
 				fmt.Fprintf(&b, "  last progress: %s\n", runtime.LastProgress.UTC().Format(time.RFC3339))
 			}
+			if runtime.Stall != nil {
+				fmt.Fprintf(&b, "  progress assessment: %s\n  stall confidence: %s\n  stall reason: %s\n", runtime.Stall.State, runtime.Stall.Confidence, runtime.Stall.Reason)
+				for _, evidence := range runtime.Stall.Evidence {
+					fmt.Fprintf(&b, "  stall evidence: %s\n", evidence)
+				}
+			}
 		}
 		if runtime.ReportPath != "" {
 			fmt.Fprintf(&b, "  report: %s\n", runtime.ReportPath)
@@ -36,6 +42,10 @@ func renderStatus(snapshot Snapshot) string {
 	}
 	return b.String()
 }
+
+// RenderStatus exposes the same projection used for status.md so IPC-first CLI
+// reads can render the live Snapshot without trusting a stale markdown file.
+func RenderStatus(snapshot Snapshot) string { return renderStatus(snapshot) }
 
 func renderRunSummary(snapshot Snapshot) string {
 	var b strings.Builder

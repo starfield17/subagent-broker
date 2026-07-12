@@ -54,6 +54,9 @@ type ProbeRequest struct {
 	Executable string `json:"executable,omitempty"`
 }
 
+// ProbeResult is returned by Adapter.Probe for environment preflight.
+// Compatibility values used by Wave preflight include:
+// verified, compatibility_unverified, incompatible, probe_failed, unavailable.
 type ProbeResult struct {
 	Installed     bool         `json:"installed"`
 	Version       string       `json:"version,omitempty"`

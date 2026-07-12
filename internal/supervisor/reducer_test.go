@@ -53,6 +53,26 @@ func TestApplyEventRejectsRunIDMismatchAndSeqGap(t *testing.T) {
 	}
 }
 
+func TestApplyEventStallAssessmentAndClear(t *testing.T) {
+	snapshot := Snapshot{
+		Run:             domain.Run{RunID: "run-1"},
+		Tasks:           []TaskState{{Task: domain.Task{TaskID: "task-a", Status: state.TaskRunning}}},
+		AppliedEventSeq: 1,
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"state": "suspected_stall", "confidence": "medium", "reason": "no protocol or output progress",
+		"quiet_for": "95s", "evidence": []string{"process still alive"},
+	})
+	next, err := ApplyEvent(snapshot, event.Event{Seq: 2, RunID: "run-1", TaskID: "task-a", Type: event.WorkerStallAssessed, Payload: payload, Timestamp: time.Now().UTC()})
+	if err != nil || next.Tasks[0].Stall == nil || next.Tasks[0].Stall.Confidence != "medium" {
+		t.Fatalf("assessment=%+v err=%v", next.Tasks[0].Stall, err)
+	}
+	next, err = ApplyEvent(next, event.Event{Seq: 3, RunID: "run-1", TaskID: "task-a", Type: event.WorkerStallCleared, Payload: json.RawMessage(`{"reason":"progress resumed"}`)})
+	if err != nil || next.Tasks[0].Stall != nil {
+		t.Fatalf("clear assessment=%+v err=%v", next.Tasks[0].Stall, err)
+	}
+}
+
 func TestReplayEventsCatchesUpAfterSnapshotFailure(t *testing.T) {
 	// Snapshot never received the last event (seq=2) after event append succeeded.
 	snap := Snapshot{

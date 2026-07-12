@@ -1,17 +1,14 @@
 package event
 
 import (
-	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/vnai/subagent-broker/internal/storage"
 )
 
 const SchemaVersion = "v1alpha1"
@@ -76,22 +73,7 @@ func (s *Store) Append(input Input) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return Event{}, err
-	}
-	file, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return Event{}, err
-	}
-	if _, err := file.Write(append(line, '\n')); err != nil {
-		_ = file.Close()
-		return Event{}, err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return Event{}, err
-	}
-	if err := file.Close(); err != nil {
+	if err := storage.AppendJSONL(s.path, line, 0o600); err != nil {
 		return Event{}, err
 	}
 	s.nextSeq++
@@ -101,43 +83,51 @@ func (s *Store) Append(input Input) (Event, error) {
 type ReplayResult struct {
 	Events         []Event
 	IncompleteTail bool
+	TailRepaired   bool
+	QuarantinePath string
 }
 
 func Replay(path string) (ReplayResult, error) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return ReplayResult{}, nil
+	var events []Event
+	var lastSeq uint64
+	var runID string
+	repair, err := storage.ReplayJSONL(path, storage.JSONLReplayOptions{RepairIncompleteTail: true}, func(line []byte, _ int) error {
+		var e Event
+		if err := json.Unmarshal(line, &e); err != nil {
+			return fmt.Errorf("decode event: %w", err)
+		}
+		if e.SchemaVersion == "" || e.EventID == "" || e.RunID == "" {
+			return fmt.Errorf("schema_version, event_id, and run_id are required")
+		}
+		if e.Seq == 0 {
+			return fmt.Errorf("event seq must be greater than 0")
+		}
+		if e.Seq <= lastSeq {
+			return fmt.Errorf("non-monotonic event sequence: %d after %d", e.Seq, lastSeq)
+		}
+		if runID == "" {
+			runID = e.RunID
+		} else if e.RunID != runID {
+			return fmt.Errorf("event run_id changed from %q to %q", runID, e.RunID)
+		}
+		lastSeq = e.Seq
+		return nil
+	}, func(line []byte, _ int) error {
+		var e Event
+		if err := json.Unmarshal(line, &e); err != nil {
+			return fmt.Errorf("decode event: %w", err)
+		}
+		events = append(events, e)
+		return nil
+	})
+	result := ReplayResult{
+		Events:         events,
+		IncompleteTail: repair.IncompleteTail,
+		TailRepaired:   repair.Repaired,
+		QuarantinePath: repair.QuarantinePath,
 	}
 	if err != nil {
-		return ReplayResult{}, err
-	}
-	defer file.Close()
-	reader := bufio.NewReader(file)
-	var result ReplayResult
-	var lastSeq uint64
-	for {
-		line, readErr := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			if line[len(line)-1] != '\n' {
-				result.IncompleteTail = true
-				break
-			}
-			var e Event
-			if err := json.Unmarshal(line, &e); err != nil {
-				return result, fmt.Errorf("decode complete event line: %w", err)
-			}
-			if e.Seq <= lastSeq {
-				return result, fmt.Errorf("non-monotonic event sequence: %d after %d", e.Seq, lastSeq)
-			}
-			lastSeq = e.Seq
-			result.Events = append(result.Events, e)
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return result, readErr
-		}
+		return result, err
 	}
 	return result, nil
 }

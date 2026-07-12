@@ -151,6 +151,11 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 		eventType = event.PermissionResolved
 	}
 	_ = s.appendEvent(event.Input{TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router", Type: eventType, Severity: "info", Payload: map[string]any{"message_id": id, "status": string(message.Answered)}})
+	// A resolved decision may remove the Barrier's blocking input. Wake the
+	// long-lived Supervisor so it re-evaluates the Barrier automatically.
+	if !s.router.HasPendingDecisions(value.TaskID) {
+		s.signalAdvance()
+	}
 	return nil
 }
 

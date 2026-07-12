@@ -34,6 +34,10 @@ type Verification struct {
 	AcceptReason    string               `json:"acceptance_reason,omitempty"`
 	AcceptedAt      *time.Time           `json:"accepted_at,omitempty"`
 	AcceptedBy      string               `json:"accepted_by,omitempty"`
+	Rejected        bool                 `json:"rejected,omitempty"`
+	RejectReason    string               `json:"rejection_reason,omitempty"`
+	RejectedAt      *time.Time           `json:"rejected_at,omitempty"`
+	RejectedBy      string               `json:"rejected_by,omitempty"`
 }
 
 func RenderBarrier(value Verification) string {
@@ -60,6 +64,12 @@ func RenderBarrier(value Verification) string {
 	writeBarrierList(&b, value.Warnings, "None.")
 	b.WriteString("\n## Errors\n\n")
 	writeBarrierList(&b, value.Errors, "None.")
+	if value.Accepted {
+		fmt.Fprintf(&b, "\n## Warning Acceptance\n\n- Actor: `%s`\n- Reason: %s\n", value.AcceptedBy, value.AcceptReason)
+	}
+	if value.Rejected {
+		fmt.Fprintf(&b, "\n## Warning Rejection\n\n- Actor: `%s`\n- Reason: %s\n", value.RejectedBy, value.RejectReason)
+	}
 	return b.String()
 }
 

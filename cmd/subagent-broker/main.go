@@ -10,12 +10,15 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
 	"github.com/vnai/subagent-broker/internal/adapter/claude"
+	"github.com/vnai/subagent-broker/internal/clioutcome"
+	"github.com/vnai/subagent-broker/internal/cliread"
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/event"
 	"github.com/vnai/subagent-broker/internal/interaction"
@@ -32,52 +35,96 @@ import (
 )
 
 func main() {
-	if err := execute(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	os.Exit(runMain(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// runMain executes a CLI invocation and returns a stable process exit code.
+// Tests call this instead of os.Exit.
+func runMain(args []string, stdout, stderr io.Writer) int {
+	_ = stdout // command bodies still write to os.Stdout; error path is testable.
+	err := execute(args)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 	}
+	return int(clioutcome.CodeOf(err))
 }
 
 func execute(args []string) error {
 	if len(args) == 0 {
 		return usageError()
 	}
+	var err error
 	switch args[0] {
 	case "dispatch":
-		return dispatch(args[1:])
+		err = dispatch(args[1:])
 	case "supervisor":
-		return runSupervisor(args[1:])
+		err = runSupervisor(args[1:])
 	case "mcp-worker":
-		return runMCPWorker(args[1:])
+		err = runMCPWorker(args[1:])
 	case "claude-hook":
-		return runClaudeHook(args[1:])
+		err = runClaudeHook(args[1:])
 	case "status":
-		return statusCommand(args[1:])
+		err = statusCommand(args[1:])
 	case "events":
-		return eventsCommand(args[1:])
+		err = eventsCommand(args[1:])
 	case "wait":
-		return waitCommand(args[1:])
+		err = waitCommand(args[1:])
+	case "barrier":
+		err = barrierCommand(args[1:])
 	case "collect":
-		return collectCommand(args[1:])
+		err = collectCommand(args[1:])
 	case "inbox":
-		return inboxCommand(args[1:])
+		err = inboxCommand(args[1:])
 	case "send":
-		return sendCommand(args[1:])
+		err = sendCommand(args[1:])
 	case "cancel":
-		return cancelCommand(args[1:])
+		err = cancelCommand(args[1:])
 	case "recover":
-		return recoverCommand(args[1:])
+		err = recoverCommand(args[1:])
 	case "doctor":
-		return doctorCommand(args[1:])
+		err = doctorCommand(args[1:])
 	case "help", "-h", "--help":
 		return usageError()
 	default:
-		return fmt.Errorf("unknown command %q", args[0])
+		return clioutcome.New(clioutcome.ExitUsage, "execute", fmt.Sprintf("unknown command %q", args[0]), nil)
 	}
+	return normalizeCommandError(args[0], err)
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: subagent-broker <dispatch|status|events|wait|collect|inbox|send|cancel|recover|doctor>")
+	return clioutcome.New(clioutcome.ExitUsage, "usage", "usage: subagent-broker <dispatch|status|events|wait|barrier|collect|inbox|send|cancel|recover|doctor>", nil)
+}
+
+func usageWrap(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *clioutcome.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	return clioutcome.New(clioutcome.ExitUsage, op, err.Error(), err)
+}
+
+func normalizeCommandError(command string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *clioutcome.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "requires") || strings.Contains(lower, "required") || strings.Contains(lower, "flag provided") || strings.Contains(lower, "invalid value") {
+		return clioutcome.New(clioutcome.ExitUsage, command, err.Error(), err)
+	}
+	if errors.Is(err, os.ErrNotExist) || strings.Contains(lower, "not found") || strings.Contains(lower, "no active run") {
+		return clioutcome.New(clioutcome.ExitNotFound, command, err.Error(), err)
+	}
+	if strings.Contains(lower, "socket") || strings.Contains(lower, "supervisor") || strings.Contains(lower, "connection refused") || strings.Contains(lower, "broken pipe") {
+		return clioutcome.New(clioutcome.ExitCommunication, command, err.Error(), err)
+	}
+	return clioutcome.New(clioutcome.ExitInternal, command, err.Error(), err)
 }
 
 func registry(executable string) *adapter.Registry {
@@ -105,13 +152,13 @@ func dispatch(args []string) error {
 	validationTimeout := flags.Duration("validation-timeout", 5*time.Minute, "validation command timeout")
 	maxConcurrency := flags.Int("max-concurrency", 4, "maximum concurrent Workers in a Wave")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageWrap("dispatch", err)
 	}
 	if strings.TrimSpace(*goal) == "" || strings.TrimSpace(*tasksFile) == "" {
-		return fmt.Errorf("dispatch requires --goal and --tasks")
+		return clioutcome.New(clioutcome.ExitUsage, "dispatch", "dispatch requires --goal and --tasks", nil)
 	}
 	if *harness != string(adapter.HarnessClaudeCode) {
-		return fmt.Errorf("Phase 3 only implements harness %q", adapter.HarnessClaudeCode)
+		return clioutcome.New(clioutcome.ExitCompatibility, "dispatch", fmt.Sprintf("Phase 3 only implements harness %q", adapter.HarnessClaudeCode), nil)
 	}
 	home, err := resolveBrokerHome(*brokerHome)
 	if err != nil {
@@ -160,7 +207,10 @@ func dispatch(args []string) error {
 		}
 	}
 	if err := run.ValidatePlan(plan); err != nil {
-		return err
+		if strings.Contains(err.Error(), "preflight") {
+			return clioutcome.New(clioutcome.ExitPreflight, "dispatch", err.Error(), err)
+		}
+		return clioutcome.New(clioutcome.ExitUsage, "dispatch", err.Error(), err)
 	}
 	config := supervisor.Config{BrokerHome: home, Harness: *harness, Executable: *executable, Model: *model, SafeMode: *safeMode, PermissionMode: *permissionMode, MaxTurns: *maxTurns, QuietAfter: *quietAfter, StallAfter: *stallAfter, HardTimeout: *hardTimeout, ValidationTimeout: *validationTimeout, MaxConcurrency: *maxConcurrency}
 	config.Normalize()
@@ -269,7 +319,7 @@ func dispatch(args []string) error {
 		return err
 	}
 	if err := waitForSocket(runDir, 10*time.Second); err != nil {
-		return err
+		return clioutcome.New(clioutcome.ExitCommunication, "dispatch", err.Error(), err)
 	}
 	fmt.Printf("run_id=%s\nrun_dir=%s\nstatus=%s\n", runID, runDir, filepath.Join(runDir, "status.md"))
 	return nil
@@ -336,17 +386,39 @@ func runClaudeHook(args []string) error {
 }
 
 func statusCommand(args []string) error {
-	flags, runDir, err := resolveFlags("status", args)
-	if err != nil {
-		return err
+	flags := flag.NewFlagSet("status", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	projectPath := flags.String("project", "", "project root")
+	brokerHome := flags.String("broker-home", "", "Broker Home override")
+	runID := flags.String("run", "", "Run ID")
+	jsonOutput := flags.Bool("json", false, "print JSON")
+	if err := flags.Parse(args); err != nil {
+		return usageWrap("status", err)
 	}
-	_ = flags
-	data, err := os.ReadFile(filepath.Join(runDir, "status.md"))
+	runDir, err := resolveRunDir(*projectPath, *brokerHome, *runID)
 	if err != nil {
-		return err
+		return notFoundWrap("status", err)
 	}
-	_, err = os.Stdout.Write(data)
-	return err
+	view, err := cliread.LoadSnapshot(runDir)
+	if err != nil {
+		return notFoundWrap("status", err)
+	}
+	outcome := clioutcome.FromRunDetailed(view.Snapshot.Run.Status, view.Snapshot.LastError)
+	outcome.ID = string(view.Snapshot.Run.RunID)
+	output := clioutcome.OutputFor(outcome, string(view.Meta.Source), view.Meta.Reason, view.Meta.Degraded, view.Meta.SupervisorAlive, string(view.Meta.SupervisorIdentity), view.Meta.SnapshotTime)
+	if *jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			clioutcome.CLIOutput
+			Snapshot supervisor.Snapshot  `json:"snapshot"`
+			Meta     cliread.ReadMetadata `json:"meta"`
+		}{CLIOutput: output, Snapshot: view.Snapshot, Meta: view.Meta})
+	}
+	printReadMetadata(view.Meta)
+	_, _ = os.Stdout.Write([]byte(supervisor.RenderStatus(view.Snapshot)))
+	if outcome.Terminal && outcome.Code != clioutcome.ExitOK {
+		return outcome.Err("status")
+	}
+	return nil
 }
 
 func eventsCommand(args []string) error {
@@ -356,42 +428,55 @@ func eventsCommand(args []string) error {
 	brokerHome := flags.String("broker-home", "", "Broker Home override")
 	runID := flags.String("run", "", "Run ID")
 	since := flags.Uint64("since-seq", 0, "return events after this sequence")
+	jsonOutput := flags.Bool("json", false, "print JSON")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageWrap("events", err)
 	}
 	runDir, err := resolveRunDir(*projectPath, *brokerHome, *runID)
 	if err != nil {
-		return err
+		return notFoundWrap("events", err)
 	}
-	layout, err := storage.NewLayout(mustHome(*brokerHome))
+	view, err := cliread.LoadEvents(runDir, *since)
 	if err != nil {
-		return err
+		return clioutcome.New(clioutcome.ExitCommunication, "events", "read event stream failed", err)
 	}
-	var runValue domain.Run
-	data, err := os.ReadFile(filepath.Join(runDir, "run.json"))
-	if err != nil {
-		return err
+	outcome := clioutcome.Outcome{Kind: clioutcome.KindEvent, Status: "read", Terminal: true, Successful: true, Code: clioutcome.ExitOK}
+	output := clioutcome.OutputFor(outcome, string(view.Meta.Source), view.Meta.Reason, view.Meta.Degraded, view.Meta.SupervisorAlive, string(view.Meta.SupervisorIdentity), view.Meta.SnapshotTime)
+	if *jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			clioutcome.CLIOutput
+			Events []event.Event        `json:"events"`
+			Meta   cliread.ReadMetadata `json:"meta"`
+		}{CLIOutput: output, Events: view.Events, Meta: view.Meta})
 	}
-	if err := json.Unmarshal(data, &runValue); err != nil {
-		return err
-	}
-	paths, err := layout.RunPaths(string(runValue.ProjectID), string(runValue.RunID))
-	if err != nil {
-		return err
-	}
-	replay, err := event.Replay(paths.Events)
-	if err != nil {
-		return err
-	}
+	printReadMetadata(view.Meta)
 	encoder := json.NewEncoder(os.Stdout)
-	for _, item := range replay.Events {
-		if item.Seq > *since {
-			if err := encoder.Encode(item); err != nil {
-				return err
-			}
+	for _, item := range view.Events {
+		if err := encoder.Encode(item); err != nil {
+			return clioutcome.New(clioutcome.ExitInternal, "events", "encode event", err)
 		}
 	}
 	return nil
+}
+
+func printReadMetadata(meta cliread.ReadMetadata) {
+	fmt.Printf("Data source: %s\nMode: %s\nReason: %s\nSnapshot/checkpoint time: %s\nSupervisor identity: %s\n", meta.Source, meta.Mode, meta.Reason, formatTime(meta.SnapshotTime), meta.SupervisorIdentity)
+	if meta.TailRepaired {
+		fmt.Printf("Journal tail: repaired\nQuarantine: %s\n", meta.QuarantinePath)
+	}
+}
+
+func formatTime(value time.Time) string {
+	if value.IsZero() {
+		return "unknown"
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+// WaitMatch is the result of evaluating one wait poll against a Snapshot.
+type WaitMatch struct {
+	Matched bool
+	Outcome clioutcome.Outcome
 }
 
 func waitCommand(args []string) error {
@@ -405,94 +490,400 @@ func waitCommand(args []string) error {
 	taskID := flags.String("task", "", "Task ID for --for task")
 	waveID := flags.String("wave", "", "Wave ID for --for wave")
 	sinceSeq := flags.Uint64("since-seq", 0, "event cursor for --for event")
+	jsonOutput := flags.Bool("json", false, "print JSON")
+	returnOnBlocked := flags.Bool("return-on-blocked", false, "return 21 for a blocked task instead of waiting")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageWrap("wait", err)
 	}
 	runDir, err := resolveRunDir(*projectPath, *brokerHome, *runID)
 	if err != nil {
-		return err
+		return notFoundWrap("wait", err)
 	}
+	return waitOnRunDirOptions(runDir, *timeout, *waitFor, *taskID, *waveID, *sinceSeq, *returnOnBlocked, *jsonOutput)
+}
+
+func waitOnRunDir(runDir string, timeout time.Duration, waitFor, taskID, waveID string, sinceSeq uint64) error {
+	return waitOnRunDirOptions(runDir, timeout, waitFor, taskID, waveID, sinceSeq, false, false)
+}
+
+func waitOnRunDirOptions(runDir string, timeout time.Duration, waitFor, taskID, waveID string, sinceSeq uint64, returnOnBlocked, jsonOutput bool) error {
 	deadline := time.Time{}
-	if *timeout > 0 {
-		deadline = time.Now().Add(*timeout)
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
 	}
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	params := supervisor.WaitParams{For: waitFor, TaskID: taskID, WaveID: waveID, SinceSeq: sinceSeq, ReturnOnBlocked: returnOnBlocked}
+	reconnectUntil := time.Now().Add(2 * time.Second)
 	for {
-		snapshot, readErr := readSnapshot(runDir)
-		if readErr != nil {
-			return readErr
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return emitWaitFailure(clioutcome.Outcome{Kind: waitKind(waitFor), ID: waitID(taskID, waveID), Status: "timeout", Code: clioutcome.ExitTimeout, Reason: "wait timed out"}, cliread.ReadMetadata{Source: cliread.ReadSourceDisk, Mode: "degraded", Degraded: true, Reason: "wait timed out"}, jsonOutput)
+			}
+			params.Timeout = remaining
+		} else {
+			params.Timeout = 0
 		}
-		matched, matchErr := waitCondition(runDir, snapshot, *waitFor, *taskID, *waveID, *sinceSeq)
+
+		view, readErr := cliread.Wait(runDir, params)
+		if readErr == nil && view.Matched && (waitFor == "event" || waitFor == "inbox") {
+			status := "event"
+			kind := clioutcome.KindEvent
+			if waitFor == "inbox" {
+				status = "pending"
+				kind = clioutcome.KindInbox
+			}
+			return emitWaitOutcome(clioutcome.Outcome{Kind: kind, ID: waitID(taskID, waveID), Status: status, Terminal: true, Successful: true, Code: clioutcome.ExitOK}, view.Meta, jsonOutput)
+		}
+		match, matchErr := waitMatchWithBlocked(runDir, view.Snapshot, waitFor, taskID, waveID, sinceSeq, returnOnBlocked)
 		if matchErr != nil {
 			return matchErr
 		}
-		if matched {
-			if *waitFor != "run" {
-				fmt.Println(*waitFor)
-				return nil
+		if match.Matched {
+			return emitWaitOutcome(match.Outcome, view.Meta, jsonOutput)
+		}
+		if errors.Is(readErr, cliread.ErrWaitTimeout) {
+			return emitWaitFailure(clioutcome.Outcome{Kind: waitKind(waitFor), ID: waitID(taskID, waveID), Status: "timeout", Code: clioutcome.ExitTimeout, Reason: "wait timed out"}, view.Meta, jsonOutput)
+		}
+		if errors.Is(readErr, cliread.ErrSupervisorUnavailable) {
+			if !cliread.HasRunIdentity(runDir) {
+				if !deadline.IsZero() && time.Now().After(deadline) {
+					return emitWaitFailure(clioutcome.Outcome{Kind: waitKind(waitFor), ID: waitID(taskID, waveID), Status: "timeout", Code: clioutcome.ExitTimeout, Reason: "wait timed out"}, view.Meta, jsonOutput)
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
 			}
-			fmt.Printf("%s\n", snapshot.Run.Status)
-			if snapshot.Run.Status != domain.RunCompleted {
-				return fmt.Errorf("run ended with status %s", snapshot.Run.Status)
+			if view.Meta.SupervisorAlive && time.Now().Before(reconnectUntil) {
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
-			return nil
+			outcome := clioutcome.Outcome{Kind: waitKind(waitFor), ID: waitID(taskID, waveID), Status: string(view.Snapshot.Run.Status), Code: clioutcome.ExitCommunication, Reason: view.Meta.Reason}
+			if waitFor == "task" {
+				for _, runtime := range view.Snapshot.Tasks {
+					if string(runtime.Task.TaskID) == taskID {
+						outcome.Status = string(runtime.Task.Status)
+						break
+					}
+				}
+			}
+			return emitWaitFailure(outcome, view.Meta, jsonOutput)
+		}
+		if readErr != nil {
+			return classifyReadError("wait", readErr)
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
-			return fmt.Errorf("wait timed out")
+			return emitWaitFailure(clioutcome.Outcome{Kind: waitKind(waitFor), ID: waitID(taskID, waveID), Status: "timeout", Code: clioutcome.ExitTimeout, Reason: "wait timed out"}, view.Meta, jsonOutput)
 		}
-		<-ticker.C
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
-func waitCondition(runDir string, snapshot supervisor.Snapshot, condition, taskID, waveID string, sinceSeq uint64) (bool, error) {
+func waitMatch(runDir string, snapshot supervisor.Snapshot, condition, taskID, waveID string, sinceSeq uint64) (WaitMatch, error) {
+	return waitMatchWithBlocked(runDir, snapshot, condition, taskID, waveID, sinceSeq, false)
+}
+
+func waitMatchWithBlocked(runDir string, snapshot supervisor.Snapshot, condition, taskID, waveID string, sinceSeq uint64, returnOnBlocked bool) (WaitMatch, error) {
 	switch condition {
 	case "run":
-		return isTerminal(snapshot.Run.Status), nil
+		outcome := clioutcome.FromRunDetailed(snapshot.Run.Status, snapshot.LastError)
+		outcome.ID = string(snapshot.Run.RunID)
+		return WaitMatch{Matched: outcome.Terminal, Outcome: outcome}, nil
 	case "wave":
 		if waveID == "" {
 			waveID = string(snapshot.Run.CurrentWave)
 		}
 		for _, item := range snapshot.Waves {
 			if string(item.WaveID) == waveID {
-				return item.Status == domain.WaveVerified || item.Status == domain.WaveBlocked || item.Status == domain.WaveFailed || item.Status == domain.WaveCancelled, nil
+				outcome := clioutcome.FromWave(item)
+				return WaitMatch{Matched: outcome.Terminal, Outcome: outcome}, nil
 			}
 		}
-		return false, fmt.Errorf("Wave %q was not found", waveID)
+		if string(snapshot.Wave.WaveID) == waveID {
+			outcome := clioutcome.FromWave(snapshot.Wave)
+			return WaitMatch{Matched: outcome.Terminal, Outcome: outcome}, nil
+		}
+		return WaitMatch{}, clioutcome.New(clioutcome.ExitNotFound, "wait", fmt.Sprintf("Wave %q was not found", waveID), nil)
 	case "task":
 		if taskID == "" {
-			return false, fmt.Errorf("--for task requires --task")
+			return WaitMatch{}, clioutcome.New(clioutcome.ExitUsage, "wait", "--for task requires --task", nil)
 		}
 		for _, runtime := range snapshot.Tasks {
 			if string(runtime.Task.TaskID) == taskID {
-				switch runtime.Task.Status {
-				case state.TaskVerifiedSuccess, state.TaskVerifiedPartial, state.TaskVerificationFailed, state.TaskFailed, state.TaskCancelled:
-					return true, nil
-				}
-				return false, nil
+				outcome := clioutcome.FromTask(taskID, runtime.Task.Status, returnOnBlocked || runtime.BlockKind == supervisor.BlockKindFinal)
+				return WaitMatch{Matched: outcome.Terminal, Outcome: outcome}, nil
 			}
 		}
-		return false, fmt.Errorf("task %q was not found", taskID)
+		return WaitMatch{}, clioutcome.New(clioutcome.ExitNotFound, "wait", fmt.Sprintf("task %q was not found", taskID), nil)
 	case "inbox":
 		index, err := message.Replay(filepath.Join(runDir, "messages.jsonl"))
 		if err != nil {
-			return false, err
+			return WaitMatch{}, err
 		}
-		return len(message.Sorted(index, false)) > 0, nil
+		if len(message.Sorted(index, false)) == 0 {
+			return WaitMatch{}, nil
+		}
+		return WaitMatch{Matched: true, Outcome: clioutcome.Outcome{Kind: clioutcome.KindInbox, Status: "pending", Terminal: true, Successful: true, Code: clioutcome.ExitOK}}, nil
 	case "event":
 		replayed, err := event.Replay(filepath.Join(runDir, "events.jsonl"))
 		if err != nil {
-			return false, err
+			return WaitMatch{}, err
 		}
 		for _, item := range replayed.Events {
 			if item.Seq > sinceSeq {
-				return true, nil
+				return WaitMatch{Matched: true, Outcome: clioutcome.Outcome{Kind: clioutcome.KindEvent, Status: "event", Terminal: true, Successful: true, Code: clioutcome.ExitOK, ID: fmt.Sprintf("%d", item.Seq)}}, nil
 			}
 		}
-		return false, nil
+		return WaitMatch{}, nil
 	default:
-		return false, fmt.Errorf("unsupported wait condition %q", condition)
+		return WaitMatch{}, clioutcome.New(clioutcome.ExitUsage, "wait", fmt.Sprintf("unsupported wait condition %q", condition), nil)
 	}
+}
+
+func waitKind(condition string) clioutcome.Kind {
+	switch condition {
+	case "task":
+		return clioutcome.KindTask
+	case "wave":
+		return clioutcome.KindWave
+	case "event":
+		return clioutcome.KindEvent
+	case "inbox":
+		return clioutcome.KindInbox
+	default:
+		return clioutcome.KindRun
+	}
+}
+
+func waitID(taskID, waveID string) string {
+	if taskID != "" {
+		return taskID
+	}
+	return waveID
+}
+
+func emitWaitOutcome(outcome clioutcome.Outcome, meta cliread.ReadMetadata, jsonOutput bool) error {
+	output := clioutcome.OutputFor(outcome, string(meta.Source), meta.Reason, meta.Degraded, meta.SupervisorAlive, string(meta.SupervisorIdentity), meta.SnapshotTime)
+	if jsonOutput {
+		if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
+			return clioutcome.New(clioutcome.ExitInternal, "wait", "encode wait result", err)
+		}
+	} else {
+		fmt.Printf("outcome: %s\nexit_code: %d\ntarget_type: %s\ntarget_id: %s\nterminal: %t\nstatus: %s\nreason: %s\ndata_source: %s\nmode: %s\ndegraded: %t\nsnapshot_time: %s\nsupervisor_alive: %t\nsupervisor_identity: %s\n", output.Outcome, output.ExitCode, output.TargetType, output.TargetID, output.Terminal, output.Status, output.Reason, output.DataSource, output.Mode, output.Degraded, formatTime(output.SnapshotTime), output.SupervisorAlive, output.SupervisorIdentity)
+	}
+	return outcome.Err("wait")
+}
+
+func emitWaitFailure(outcome clioutcome.Outcome, meta cliread.ReadMetadata, jsonOutput bool) error {
+	return emitWaitOutcome(outcome, meta, jsonOutput)
+}
+
+func classifyReadError(op string, err error) error {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "not found") || strings.Contains(message, "requires --") {
+		code := clioutcome.ExitNotFound
+		if strings.Contains(message, "requires --") {
+			code = clioutcome.ExitUsage
+		}
+		return clioutcome.New(code, op, err.Error(), err)
+	}
+	return clioutcome.New(clioutcome.ExitCommunication, op, err.Error(), err)
+}
+
+func barrierCommand(args []string) error {
+	if len(args) == 0 {
+		return clioutcome.New(clioutcome.ExitUsage, "barrier", "usage: subagent-broker barrier <show|accept|reject>", nil)
+	}
+	switch args[0] {
+	case "show":
+		return barrierShow(args[1:])
+	case "accept":
+		return barrierDecision(args[1:], true)
+	case "reject":
+		return barrierDecision(args[1:], false)
+	default:
+		return clioutcome.New(clioutcome.ExitUsage, "barrier", fmt.Sprintf("unsupported barrier operation %q", args[0]), nil)
+	}
+}
+
+func barrierShow(args []string) error {
+	flags := flag.NewFlagSet("barrier show", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	projectPath := flags.String("project", "", "project root")
+	brokerHome := flags.String("broker-home", "", "Broker Home override")
+	runID := flags.String("run", "", "Run ID")
+	waveID := flags.String("wave", "", "Wave ID")
+	jsonOutput := flags.Bool("json", false, "print JSON")
+	if err := flags.Parse(args); err != nil {
+		return usageWrap("barrier show", err)
+	}
+	if strings.TrimSpace(*waveID) == "" {
+		return clioutcome.New(clioutcome.ExitUsage, "barrier show", "barrier show requires --wave", nil)
+	}
+	runDir, err := resolveRunDir(*projectPath, *brokerHome, *runID)
+	if err != nil {
+		return notFoundWrap("barrier show", err)
+	}
+	view, err := cliread.LoadSnapshot(runDir)
+	if err != nil {
+		return notFoundWrap("barrier show", err)
+	}
+	value, found := findWave(view.Snapshot, *waveID)
+	if !found {
+		return clioutcome.New(clioutcome.ExitNotFound, "barrier show", fmt.Sprintf("Wave %q was not found", *waveID), nil)
+	}
+	verification, verificationErr := readWaveVerification(runDir, *brokerHome, view.Snapshot.Run, *waveID)
+	outcome := clioutcome.FromWave(value)
+	outcome.ID = *waveID
+	output := clioutcome.OutputFor(outcome, string(view.Meta.Source), view.Meta.Reason, view.Meta.Degraded, view.Meta.SupervisorAlive, string(view.Meta.SupervisorIdentity), view.Meta.SnapshotTime)
+	if *jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			clioutcome.CLIOutput
+			Wave         domain.Wave          `json:"wave"`
+			Verification *wave.Verification   `json:"verification,omitempty"`
+			Meta         cliread.ReadMetadata `json:"meta"`
+		}{CLIOutput: output, Wave: value, Verification: verification, Meta: view.Meta})
+	}
+	printReadMetadata(view.Meta)
+	fmt.Printf("Wave: %s\nStatus: %s\nBarrier result: %s\nAccepted: %t\n", value.WaveID, value.Status, value.BarrierResult, value.BarrierAccepted)
+	if verificationErr == nil && verification != nil {
+		fmt.Printf("Input hash: %s\nWarnings: %s\nErrors: %s\n", verification.InputHash, strings.Join(verification.Warnings, "; "), strings.Join(verification.Errors, "; "))
+	} else if verificationErr != nil {
+		fmt.Printf("Verification: unavailable (%v)\n", verificationErr)
+	}
+	if outcome.Terminal && outcome.Code != clioutcome.ExitOK {
+		return outcome.Err("barrier show")
+	}
+	return nil
+}
+
+func barrierDecision(args []string, accept bool) error {
+	name := "barrier reject"
+	method := "barrier.reject"
+	if accept {
+		name = "barrier accept"
+		method = "barrier.accept"
+	}
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	projectPath := flags.String("project", "", "project root")
+	brokerHome := flags.String("broker-home", "", "Broker Home override")
+	runID := flags.String("run", "", "Run ID")
+	waveID := flags.String("wave", "", "Wave ID")
+	actor := flags.String("actor", "", "decision actor; defaults to the current CLI identity")
+	reason := flags.String("reason", "", "non-empty decision reason")
+	jsonOutput := flags.Bool("json", false, "print JSON")
+	if err := flags.Parse(args); err != nil {
+		return usageWrap(name, err)
+	}
+	if strings.TrimSpace(*waveID) == "" || strings.TrimSpace(*reason) == "" {
+		return clioutcome.New(clioutcome.ExitUsage, name, "barrier decision requires --wave and non-empty --reason", nil)
+	}
+	if strings.TrimSpace(*actor) == "" {
+		*actor = currentCLIActor()
+	}
+	if strings.TrimSpace(*actor) == "" {
+		return clioutcome.New(clioutcome.ExitUsage, name, "barrier decision requires a non-empty actor", nil)
+	}
+	runDir, err := resolveRunDir(*projectPath, *brokerHome, *runID)
+	if err != nil {
+		return notFoundWrap(name, err)
+	}
+	response, err := cliread.CallIPC(runDir, method, map[string]string{"wave_id": *waveID, "actor": *actor, "reason": *reason})
+	if err != nil {
+		return clioutcome.New(clioutcome.ExitCommunication, name, "Supervisor IPC unavailable; Barrier decision was not written by the CLI", err)
+	}
+	if !response.OK {
+		code := clioutcome.ExitFailed
+		lower := strings.ToLower(response.Error)
+		if strings.Contains(lower, "required") || strings.Contains(lower, "requires") {
+			code = clioutcome.ExitUsage
+		}
+		return clioutcome.New(code, name, response.Error, nil)
+	}
+	var snapshot supervisor.Snapshot
+	raw, marshalErr := json.Marshal(response.Result)
+	if marshalErr != nil || json.Unmarshal(raw, &snapshot) != nil {
+		if marshalErr == nil {
+			marshalErr = fmt.Errorf("decode Supervisor snapshot")
+		}
+		return clioutcome.New(clioutcome.ExitInternal, name, "invalid Barrier IPC response", marshalErr)
+	}
+	value, found := findWave(snapshot, *waveID)
+	if !found {
+		return clioutcome.New(clioutcome.ExitInternal, name, fmt.Sprintf("Wave %q missing from Barrier IPC response", *waveID), nil)
+	}
+	outcome := clioutcome.FromWave(value)
+	outcome.ID = *waveID
+	output := clioutcome.OutputFor(outcome, string(cliread.ReadSourceIPC), "Supervisor accepted Barrier operation", false, true, "valid", snapshot.UpdatedAt)
+	if *jsonOutput {
+		if err := json.NewEncoder(os.Stdout).Encode(struct {
+			clioutcome.CLIOutput
+			Snapshot supervisor.Snapshot `json:"snapshot"`
+		}{CLIOutput: output, Snapshot: snapshot}); err != nil {
+			return clioutcome.New(clioutcome.ExitInternal, name, "encode Barrier result", err)
+		}
+	} else {
+		fmt.Printf("outcome: %s\nexit_code: %d\ntarget_type: wave\ntarget_id: %s\nstatus: %s\ndata_source: ipc\ndegraded: false\n", output.Outcome, output.ExitCode, *waveID, value.Status)
+	}
+	return outcome.Err(name)
+}
+
+func currentCLIActor() string {
+	if value, err := user.Current(); err == nil && strings.TrimSpace(value.Username) != "" {
+		return "user:" + value.Username
+	}
+	if value := strings.TrimSpace(os.Getenv("USER")); value != "" {
+		return "user:" + value
+	}
+	return "user:unknown"
+}
+
+func findWave(snapshot supervisor.Snapshot, waveID string) (domain.Wave, bool) {
+	for _, value := range snapshot.Waves {
+		if string(value.WaveID) == waveID {
+			return value, true
+		}
+	}
+	if string(snapshot.Wave.WaveID) == waveID {
+		return snapshot.Wave, true
+	}
+	return domain.Wave{}, false
+}
+
+func readWaveVerification(runDir, brokerHome string, runValue domain.Run, waveID string) (*wave.Verification, error) {
+	layout, err := storage.NewLayout(mustHome(brokerHome))
+	if err != nil {
+		return nil, err
+	}
+	paths, err := layout.WavePaths(string(runValue.ProjectID), string(runValue.RunID), waveID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(paths.Verification)
+	if err != nil {
+		return nil, err
+	}
+	var verification wave.Verification
+	if err := json.Unmarshal(data, &verification); err != nil {
+		return nil, err
+	}
+	return &verification, nil
+}
+
+// waitCondition remains as a thin compatibility wrapper for older call sites/tests.
+func waitCondition(runDir string, snapshot supervisor.Snapshot, condition, taskID, waveID string, sinceSeq uint64) (bool, error) {
+	match, err := waitMatch(runDir, snapshot, condition, taskID, waveID, sinceSeq)
+	return match.Matched, err
+}
+
+func notFoundWrap(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *clioutcome.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	return clioutcome.New(clioutcome.ExitNotFound, op, err.Error(), err)
 }
 
 func collectCommand(args []string) error {
@@ -634,7 +1025,7 @@ func sendCommand(args []string) error {
 			return err
 		}
 		if !response.OK {
-			return errors.New(response.Error)
+			return clioutcome.New(clioutcome.ExitFailed, "send", response.Error, nil)
 		}
 		data, _ := json.Marshal(response.Result)
 		fmt.Println(string(data))
@@ -668,7 +1059,7 @@ func sendCommand(args []string) error {
 		return err
 	}
 	if !response.OK {
-		return errors.New(response.Error)
+		return clioutcome.New(clioutcome.ExitFailed, "send", response.Error, nil)
 	}
 	fmt.Println("message resolved")
 	return nil
@@ -704,7 +1095,7 @@ func cancelCommand(args []string) error {
 		return err
 	}
 	if !response.OK {
-		return errors.New(response.Error)
+		return clioutcome.New(clioutcome.ExitFailed, "cancel", response.Error, nil)
 	}
 	fmt.Println("cancel requested")
 	return nil
@@ -742,14 +1133,14 @@ func doctorCommand(args []string) error {
 	harness := flags.String("harness", string(adapter.HarnessClaudeCode), "harness name")
 	executable := flags.String("executable", "", "harness executable override")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageWrap("doctor", err)
 	}
 	if *harness != string(adapter.HarnessClaudeCode) {
-		return fmt.Errorf("Phase 3 doctor only probes harness %q", adapter.HarnessClaudeCode)
+		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", fmt.Sprintf("Phase 3 doctor only probes harness %q", adapter.HarnessClaudeCode), nil)
 	}
 	result, err := claude.New(*executable).Probe(context.Background(), adapter.ProbeRequest{Executable: *executable})
 	if err != nil {
-		return err
+		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", "harness probe failed", err)
 	}
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
@@ -757,7 +1148,11 @@ func doctorCommand(args []string) error {
 		return err
 	}
 	if !result.Installed {
-		return fmt.Errorf("Claude Code is not installed")
+		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", "Claude Code is not installed", nil)
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Compatibility)) {
+	case "incompatible", "probe_failed", "unavailable":
+		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", fmt.Sprintf("harness compatibility %q", result.Compatibility), nil)
 	}
 	return nil
 }
@@ -889,12 +1284,12 @@ func callSupervisor(runDir, method string, params any) (supervisor.Response, err
 	path := supervisor.SocketPath(runDir)
 	conn, err := net.DialTimeout("unix", path, 2*time.Second)
 	if err != nil {
-		return supervisor.Response{}, err
+		return supervisor.Response{}, clioutcome.New(clioutcome.ExitCommunication, "ipc", "supervisor socket dial failed", err)
 	}
 	defer conn.Close()
 	runValue, err := readRun(runDir)
 	if err != nil {
-		return supervisor.Response{}, err
+		return supervisor.Response{}, clioutcome.New(clioutcome.ExitNotFound, "ipc", "run metadata not found", err)
 	}
 	request := supervisor.Request{SchemaVersion: supervisor.SchemaVersion, RequestID: fmt.Sprintf("request-%d", time.Now().UnixNano()), RunID: string(runValue.RunID), Method: method}
 	if params != nil {
@@ -904,11 +1299,11 @@ func callSupervisor(runDir, method string, params any) (supervisor.Response, err
 		}
 	}
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
-		return supervisor.Response{}, err
+		return supervisor.Response{}, clioutcome.New(clioutcome.ExitCommunication, "ipc", "supervisor request encode failed", err)
 	}
 	var response supervisor.Response
 	if err := json.NewDecoder(conn).Decode(&response); err != nil {
-		return supervisor.Response{}, err
+		return supervisor.Response{}, clioutcome.New(clioutcome.ExitCommunication, "ipc", "supervisor response decode failed", err)
 	}
 	return response, nil
 }

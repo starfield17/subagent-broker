@@ -74,4 +74,10 @@ const (
 	MessageFailed         = "message.failed"
 	TaskWaitingRecomputed = "task.waiting_recomputed"
 	InstructionFlushed    = "instruction.flushed"
+
+	// PR6 observability and Barrier operation events.
+	BarrierWarningsAccepted = "barrier.warnings_accepted"
+	BarrierWarningsRejected = "barrier.warnings_rejected"
+	WorkerStallAssessed     = "worker.stall_assessed"
+	WorkerStallCleared      = "worker.stall_cleared"
 )

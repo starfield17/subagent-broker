@@ -10,6 +10,7 @@ import (
 
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/message"
+	"github.com/vnai/subagent-broker/internal/stall"
 	"github.com/vnai/subagent-broker/internal/storage"
 	"github.com/vnai/subagent-broker/internal/verify"
 	"github.com/vnai/subagent-broker/internal/wave"
@@ -43,13 +44,14 @@ type WaveSummaryEntry struct {
 }
 
 type TaskSummaryEntry struct {
-	TaskID     string   `json:"task_id"`
-	Status     string   `json:"status"`
-	BlockKind  string   `json:"block_kind,omitempty"`
-	ReportPath string   `json:"report_path,omitempty"`
-	Attempts   int      `json:"attempts"`
-	LastError  string   `json:"last_error,omitempty"`
-	WriteScope []string `json:"write_scope,omitempty"`
+	TaskID     string            `json:"task_id"`
+	Status     string            `json:"status"`
+	BlockKind  string            `json:"block_kind,omitempty"`
+	ReportPath string            `json:"report_path,omitempty"`
+	Attempts   int               `json:"attempts"`
+	LastError  string            `json:"last_error,omitempty"`
+	WriteScope []string          `json:"write_scope,omitempty"`
+	Stall      *stall.Assessment `json:"stall_assessment,omitempty"`
 }
 
 type MessageSummaryEntry struct {
@@ -123,6 +125,7 @@ func (s *Service) buildRunSummary(baseline verify.WorkspaceSnapshot) (RunSummary
 			BlockKind: string(runtime.BlockKind), ReportPath: runtime.ReportPath,
 			Attempts: len(runtime.Attempts), LastError: runtime.LastError,
 			WriteScope: append([]string(nil), runtime.Task.WriteScope...),
+			Stall:      runtime.Stall,
 		})
 	}
 
@@ -186,6 +189,12 @@ func renderAggregatedSummary(summary RunSummary) string {
 		}
 		if t.LastError != "" {
 			fmt.Fprintf(&b, "- Error: %s\n", t.LastError)
+		}
+		if t.Stall != nil {
+			fmt.Fprintf(&b, "- Progress assessment: `%s`\n- Stall confidence: `%s`\n- Stall reason: %s\n", t.Stall.State, t.Stall.Confidence, t.Stall.Reason)
+			for _, evidence := range t.Stall.Evidence {
+				fmt.Fprintf(&b, "  - Evidence: %s\n", evidence)
+			}
 		}
 		b.WriteString("\n")
 	}

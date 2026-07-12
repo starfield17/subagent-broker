@@ -7,6 +7,7 @@ import (
 
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/event"
+	"github.com/vnai/subagent-broker/internal/stall"
 	"github.com/vnai/subagent-broker/internal/state"
 	workerpkg "github.com/vnai/subagent-broker/internal/worker"
 )
@@ -284,6 +285,39 @@ func ApplyEvent(snapshot Snapshot, ev event.Event) (Snapshot, error) {
 						next.Tasks[index].Worker.StatusDimensions.Protocol = state.Protocol(to)
 					}
 				}
+			}
+		}
+
+	case event.WorkerStallAssessed:
+		if ev.TaskID != "" {
+			index, err := findTaskIndex(&next, domain.TaskID(ev.TaskID))
+			if err == nil {
+				payload, _ := decodeMap(ev.Payload)
+				assessment := stall.StallAssessment{EvaluatedAt: ev.Timestamp}
+				assessment.State, _ = payload["state"].(string)
+				if assessment.State == "" {
+					assessment.State, _ = payload["to"].(string)
+				}
+				assessment.Confidence, _ = payload["confidence"].(string)
+				assessment.Reason, _ = payload["reason"].(string)
+				if quiet, ok := payload["quiet_for"].(string); ok {
+					assessment.QuietFor, _ = time.ParseDuration(quiet)
+				}
+				if raw, ok := payload["evidence"].([]any); ok {
+					for _, item := range raw {
+						if value, ok := item.(string); ok {
+							assessment.Evidence = append(assessment.Evidence, value)
+						}
+					}
+				}
+				next.Tasks[index].Stall = &assessment
+			}
+		}
+
+	case event.WorkerStallCleared:
+		if ev.TaskID != "" {
+			if index, err := findTaskIndex(&next, domain.TaskID(ev.TaskID)); err == nil {
+				next.Tasks[index].Stall = nil
 			}
 		}
 
