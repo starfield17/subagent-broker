@@ -54,4 +54,13 @@ const (
 	ProgressStateChanged = "progress.state_changed"
 	TaskRuntimeUpdated   = "task.runtime_updated"
 	SupervisorHeartbeat  = "supervisor.heartbeat"
+
+	// PR2 worker lifecycle / recovery / cancel.
+	WorkerAttemptStarted  = "worker.attempt_started"
+	WorkerAttemptFinished = "worker.attempt_finished"
+	RecoveryClassified    = "recovery.classified"
+	RecoveryResumed       = "recovery.resumed"
+	CancelTreeRequested   = "cancel.tree_requested"
+	CancelTreeCompleted   = "cancel.tree_completed"
+	TaskBlockKindChanged  = "task.block_kind_changed"
 )

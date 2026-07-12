@@ -26,6 +26,7 @@ import (
 	"github.com/vnai/subagent-broker/internal/task"
 	"github.com/vnai/subagent-broker/internal/verify"
 	"github.com/vnai/subagent-broker/internal/wave"
+	workerpkg "github.com/vnai/subagent-broker/internal/worker"
 )
 
 const SchemaVersion = "v1alpha1"
@@ -93,14 +94,26 @@ type ValidationResult struct {
 	Details string `json:"details,omitempty"`
 }
 
+// BlockKind distinguishes temporary waiting from a final blocked result.
+type BlockKind string
+
+const (
+	BlockKindNone           BlockKind = ""
+	BlockKindWaitingMessage BlockKind = "waiting_message"
+	BlockKindFinal          BlockKind = "final"
+)
+
 type TaskState struct {
-	Task         domain.Task           `json:"task"`
-	Worker       *domain.WorkerSession `json:"worker,omitempty"`
-	Dimensions   state.Dimensions      `json:"status_dimensions"`
-	ReportPath   string                `json:"report_path,omitempty"`
-	Validation   []ValidationResult    `json:"validation,omitempty"`
-	LastError    string                `json:"last_error,omitempty"`
-	LastProgress time.Time             `json:"last_progress_at,omitempty"`
+	Task          domain.Task           `json:"task"`
+	Worker        *domain.WorkerSession `json:"worker,omitempty"` // current/active attempt projection (compat)
+	Attempts      []workerpkg.Attempt   `json:"attempts,omitempty"`
+	ActiveAttempt int                   `json:"active_attempt,omitempty"` // attempt number; 0 = none
+	BlockKind     BlockKind             `json:"block_kind,omitempty"`
+	Dimensions    state.Dimensions      `json:"status_dimensions"`
+	ReportPath    string                `json:"report_path,omitempty"`
+	Validation    []ValidationResult    `json:"validation,omitempty"`
+	LastError     string                `json:"last_error,omitempty"`
+	LastProgress  time.Time             `json:"last_progress_at,omitempty"`
 	// Deprecated: PendingInstruction is retained only for JSON compatibility with
 	// older snapshots. It is not an outbox; durable instructions use message.Router.
 	PendingInstruction string `json:"pending_instruction,omitempty"`
@@ -158,6 +171,10 @@ type activeWorker struct {
 	adapter   adapter.Adapter
 	sessionID string
 	cancel    context.CancelFunc
+	identity  process.Identity
+	taskID    string
+	workerID  string
+	attempt   int
 }
 
 func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service, error) {
@@ -278,6 +295,10 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 	snapshot, err := ReplayEvents(checkpoint, replay.Events)
 	if err != nil {
 		return nil, fmt.Errorf("reduce events onto snapshot: %w", err)
+	}
+	// Migrate legacy single-Worker history into Attempts.
+	for i := range snapshot.Tasks {
+		migrateAttempts(&snapshot.Tasks[i])
 	}
 	// 5) Persist caught-up checkpoint when events advanced the state.
 	if snapshot.AppliedEventSeq != checkpoint.AppliedEventSeq || !hasCheckpoint {
@@ -403,20 +424,36 @@ func (s *Service) RequestCancel(ctx context.Context) error {
 		active = append(active, worker)
 	}
 	s.mu.Unlock()
+	_ = s.appendEvent(event.Input{Source: "supervisor", Type: event.CancelTreeRequested, Severity: "warning", Payload: map[string]any{"scope": "run"}})
+	var firstErr error
+	degraded := false
 	for _, worker := range active {
-		_ = worker.adapter.InterruptTurn(ctx, worker.sessionID)
-		worker := worker
-		time.AfterFunc(s.config.CancelGrace, func() {
-			_ = worker.adapter.TerminateSession(context.Background(), worker.sessionID)
-			worker.cancel()
-		})
+		result, err := s.terminateActiveWorker(ctx, worker)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if !result.TreeExited && !result.PIDReused {
+			degraded = true
+		}
 	}
-	s.appendEvent(event.Input{Source: "supervisor", Type: "run.cancel_requested", Severity: "warning"})
-	return nil
+	_ = s.appendEvent(event.Input{Source: "supervisor", Type: event.CancelTreeCompleted, Severity: "warning", Payload: map[string]any{"scope": "run", "degraded": degraded}})
+	if degraded {
+		_ = s.setRunStatus(domain.RunDegraded, "cancel completed with residual worker processes")
+	}
+	return firstErr
 }
 
 func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 	s.mu.Lock()
+	if s.cancelledTasks[taskID] {
+		worker, ok := s.active[taskID]
+		s.mu.Unlock()
+		if !ok {
+			return nil // idempotent: already cancelled and inactive
+		}
+		_, err := s.terminateActiveWorker(ctx, worker)
+		return err
+	}
 	worker, ok := s.active[taskID]
 	if !ok {
 		s.mu.Unlock()
@@ -424,13 +461,35 @@ func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 	}
 	s.cancelledTasks[taskID] = true
 	s.mu.Unlock()
+	_ = s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: event.CancelTreeRequested, Severity: "warning", Payload: map[string]any{"scope": "task"}})
+	result, err := s.terminateActiveWorker(ctx, worker)
+	_ = s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: event.CancelTreeCompleted, Severity: "warning", Payload: map[string]any{
+		"tree_exited": result.TreeExited, "pid_reused": result.PIDReused, "remaining": result.RemainingPIDs,
+	}})
+	if err == nil && !result.TreeExited && !result.PIDReused {
+		_ = s.setRunStatus(domain.RunDegraded, "task cancel left residual processes")
+	}
+	return err
+}
+
+func (s *Service) terminateActiveWorker(ctx context.Context, worker activeWorker) (process.TerminationResult, error) {
+	// Protocol interrupt first (best effort).
 	_ = worker.adapter.InterruptTurn(ctx, worker.sessionID)
-	time.AfterFunc(s.config.CancelGrace, func() {
+	policy := defaultCancelPolicy(s.config.CancelGrace)
+	var result process.TerminationResult
+	var err error
+	if worker.identity.Complete() {
+		result, err = process.Controller{Manager: process.PlatformManager{}}.TerminateTree(ctx, worker.identity, policy)
+	} else {
+		// Fall back to adapter terminate when OS identity is incomplete.
 		_ = worker.adapter.TerminateSession(context.Background(), worker.sessionID)
+		result.TermSent = true
+		result.TreeExited = true
+	}
+	if worker.cancel != nil {
 		worker.cancel()
-	})
-	s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: "task.cancel_requested", Severity: "warning"})
-	return nil
+	}
+	return result, err
 }
 
 func (s *Service) execute(ctx context.Context) error {
@@ -517,7 +576,8 @@ func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) erro
 	var firstErr error
 	for _, taskID := range taskIDs(planned.Tasks) {
 		runtime, ok := s.taskState(taskID)
-		if !ok || runtime.Task.Status == state.TaskVerifiedSuccess {
+		// Never re-run terminal tasks or orphaned workers (no second concurrent Worker).
+		if !ok || recoveryTaskTerminal(runtime) || runtime.Dimensions.Process == state.ProcessOrphaned {
 			continue
 		}
 		if !s.AcceptingWork() {
@@ -550,221 +610,6 @@ func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) erro
 		return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
 	}
 	return nil
-}
-
-func (s *Service) executeTask(parent context.Context, runtime *TaskState) error {
-	if err := task.ValidateContract(runtime.Task); err != nil {
-		return err
-	}
-	harness, ok := s.registry.Get(adapter.HarnessName(s.config.Harness))
-	if !ok {
-		return fmt.Errorf("adapter %q is not registered", s.config.Harness)
-	}
-	workerID := fmt.Sprintf("worker-%d", time.Now().UTC().UnixNano())
-	capabilities := harness.Descriptor().Capabilities
-	if s.config.SafeMode {
-		capabilities.PermissionEvents = false
-		capabilities.Hooks = false
-	}
-	worker := &domain.WorkerSession{WorkerID: domain.WorkerID(workerID), TaskID: runtime.Task.TaskID, Harness: s.config.Harness, AdapterVersion: harness.Descriptor().AdapterVersion, StartedAt: time.Now().UTC(), LastEventAt: time.Now().UTC(), LastProgressAt: time.Now().UTC(), Capabilities: capabilityMap(capabilities), Attempt: 1, StatusDimensions: state.Dimensions{Process: state.ProcessStarting, Protocol: state.ProtocolInitializing, Progress: state.ProgressActive, Task: state.TaskRunning}}
-	resumeSessionID := ""
-	if runtime.Worker != nil && runtime.Worker.NativeSessionID != "" && runtime.Dimensions.Process == state.ProcessExited {
-		resumeSessionID = runtime.Worker.NativeSessionID
-		worker.Attempt = runtime.Worker.Attempt + 1
-	}
-	runtime.Worker = worker
-	runtime.Dimensions = worker.StatusDimensions
-	runtime.LastProgress = worker.LastProgressAt
-	if err := s.setRunStatus(domain.RunRunning, ""); err != nil {
-		return err
-	}
-	// Persist worker + dimensions first, then transition task status via Commit.
-	if err := s.saveRuntime(*runtime); err != nil {
-		return err
-	}
-	if runtime.Task.Status != state.TaskRunning {
-		if err := s.transitionTask(runtime, state.TaskRunning); err != nil {
-			return err
-		}
-	}
-	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.SessionStarting, Severity: "info"}); err != nil {
-		return err
-	}
-
-	options := map[string]string{"permission_mode": s.config.PermissionMode, "max_turns": fmt.Sprintf("%d", s.config.MaxTurns), "scenario": s.config.Scenario}
-	if s.config.SafeMode {
-		options["safe_mode"] = "true"
-	}
-	workerCtx, cancel := context.WithCancel(parent)
-	if s.config.HardTimeout > 0 {
-		workerCtx, cancel = context.WithTimeout(parent, s.config.HardTimeout)
-	}
-	model := s.config.Model
-	if runtime.Task.ModelPreference != "" {
-		model = runtime.Task.ModelPreference
-	}
-	runID := s.Snapshot().Run.RunID
-	prompt := buildWorkerPrompt(runtime.Task, runID, workerID)
-	// Deprecated PendingInstruction is read only for old snapshots; never written as an outbox.
-	if runtime.PendingInstruction != "" {
-		prompt += "\n\nMain Agent follow-up instruction:\n" + runtime.PendingInstruction
-		runtime.PendingInstruction = ""
-	}
-	executable, _ := os.Executable()
-	interaction := adapter.InteractionConfig{Enabled: !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode), BrokerExecutable: executable, RunDir: s.runDir}
-	request := adapter.StartRequest{RunID: string(runID), TaskID: string(runtime.Task.TaskID), WorkerID: workerID, ProjectRoot: runtime.Task.ProjectRoot, Contract: prompt, Model: model, Scenario: s.config.Scenario, Options: options, Interaction: interaction}
-	var session adapter.Session
-	var err error
-	if resumeSessionID != "" {
-		worker.NativeSessionID = resumeSessionID
-		session, err = harness.ResumeSession(workerCtx, adapter.ResumeRequest{NativeSessionID: resumeSessionID, RunID: request.RunID, TaskID: request.TaskID, WorkerID: request.WorkerID, ProjectRoot: request.ProjectRoot, Contract: request.Contract, Model: request.Model, Options: options, Interaction: interaction})
-	} else {
-		session, err = harness.StartSession(workerCtx, request)
-	}
-	if err != nil {
-		cancel()
-		runtime.LastError = err.Error()
-		if s.isCancelled() {
-			return s.cancelTask(runtime, "cancelled before the Worker session started")
-		}
-		return s.failTask(runtime, "start_session", err)
-	}
-	s.mu.Lock()
-	s.active[string(runtime.Task.TaskID)] = activeWorker{adapter: harness, sessionID: session.NativeSessionID, cancel: cancel}
-	s.mu.Unlock()
-	worker.NativeSessionID = session.NativeSessionID
-	worker.NativeTurnID = session.NativeTurnID
-	worker.PID = session.PID
-	worker.ProcessStartToken = session.ProcessStartToken
-	worker.StatusDimensions.Process = state.ProcessAlive
-	runtime.Dimensions = worker.StatusDimensions
-	if err := s.saveRuntime(*runtime); err != nil {
-		return err
-	}
-	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ProcessSpawned, Severity: "info", Payload: map[string]any{"pid": session.PID, "from": string(state.ProcessStarting), "to": string(state.ProcessAlive), "reason": "spawned"}}); err != nil {
-		return err
-	}
-	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.SessionStarted, Severity: "info"}); err != nil {
-		return err
-	}
-
-	events := session.Events
-	stderr := session.Stderr
-	resultSeen := false
-	contextDone := workerCtx.Done()
-	progressTicker := time.NewTicker(250 * time.Millisecond)
-	defer progressTicker.Stop()
-eventLoop:
-	for events != nil || stderr != nil {
-		select {
-		case <-contextDone:
-			contextDone = nil
-			if !resultSeen {
-				_ = harness.TerminateSession(context.Background(), session.NativeSessionID)
-			}
-		case now := <-progressTicker.C:
-			s.updateProgress(runtime, now.UTC())
-		case native, ok := <-events:
-			if !ok {
-				events = nil
-				continue
-			}
-			s.handleNative(runtime, harness, native, workerID)
-			if native.Kind == event.ResultSubmitted || native.Kind == event.TurnFailed {
-				resultSeen = native.Kind == event.ResultSubmitted
-				_ = harness.TerminateSession(context.Background(), session.NativeSessionID)
-				break eventLoop
-			}
-		case chunk, ok := <-stderr:
-			if !ok {
-				stderr = nil
-				continue
-			}
-			_ = appendFile(filepath.Join(s.taskDir(runtime.Task), "stderr.log"), chunk.Data)
-		}
-	}
-	timedOut := errors.Is(workerCtx.Err(), context.DeadlineExceeded)
-	exit := adapter.ExitStatus{Code: -1}
-	if session.Exited != nil {
-		if value, ok := <-session.Exited; ok {
-			exit = value
-		}
-	}
-	worker.ExitCode = &exit.Code
-	worker.EndedAt = timePtr(time.Now().UTC())
-	worker.StatusDimensions.Process = state.ProcessExited
-	runtime.Dimensions = worker.StatusDimensions
-	if err := s.saveRuntime(*runtime); err != nil {
-		cancel()
-		return err
-	}
-	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ProcessExited, Severity: severityForExit(exit.Code), Payload: map[string]any{"from": string(state.ProcessAlive), "to": string(state.ProcessExited), "exit": exit}}); err != nil {
-		cancel()
-		return err
-	}
-	cancel()
-	s.mu.Lock()
-	delete(s.active, string(runtime.Task.TaskID))
-	s.mu.Unlock()
-
-	s.mu.Lock()
-	cancelled := s.cancelled
-	s.mu.Unlock()
-	if cancelled {
-		return s.cancelTask(runtime, "cancelled by main agent")
-	}
-	if s.isTaskCancelled(string(runtime.Task.TaskID)) {
-		return s.cancelTask(runtime, "Task cancelled by main agent")
-	}
-	if timedOut {
-		return s.failTask(runtime, "hard_timeout", fmt.Errorf("Worker exceeded the hard timeout"))
-	}
-	if exit.Code != 0 && !resultSeen {
-		return s.failTask(runtime, "process", fmt.Errorf("Claude exited with code %d: %s", exit.Code, exit.Error))
-	}
-	result, err := harness.CollectFinalResult(context.Background(), session.NativeSessionID)
-	if err != nil {
-		return s.failTask(runtime, "result", err)
-	}
-	if result.TaskID != string(runtime.Task.TaskID) || result.WorkerID != workerID {
-		return s.failTask(runtime, "result", fmt.Errorf("result identity mismatch: task=%q worker=%q", result.TaskID, result.WorkerID))
-	}
-	if latest, ok := s.taskState(runtime.Task.TaskID); ok {
-		runtime.Task.WriteScope = append([]string(nil), latest.Task.WriteScope...)
-		runtime.Task.AllowPublicInterfaceChange = latest.Task.AllowPublicInterfaceChange
-	}
-	taskDir := s.taskDir(runtime.Task)
-	if err := report.Publish(taskDir, result, time.Now().UTC()); err != nil {
-		return s.failTask(runtime, "result_validation", err)
-	}
-	runtime.ReportPath = filepath.Join(taskDir, "report.md")
-	if err := s.saveRuntime(*runtime); err != nil {
-		return err
-	}
-	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ReportPublished, Severity: "info"}); err != nil {
-		return err
-	}
-	if err := s.transitionTask(runtime, state.TaskReportedComplete); err != nil {
-		return err
-	}
-	if result.Status != report.StatusSucceeded {
-		return s.markPartial(runtime, result.Status)
-	}
-	if err := s.transitionTask(runtime, state.TaskVerifying); err != nil {
-		return err
-	}
-	passed := s.runValidation(parent, runtime)
-	if !passed {
-		if err := s.transitionTask(runtime, state.TaskVerificationFailed); err != nil {
-			return err
-		}
-		_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"})
-		return fmt.Errorf("task validation failed")
-	}
-	if err := s.transitionTask(runtime, state.TaskVerifiedSuccess); err != nil {
-		return err
-	}
-	return s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerifiedSuccess, Severity: "info"})
 }
 
 func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, native adapter.NativeEvent, workerID string) {
@@ -867,39 +712,6 @@ func (s *Service) runValidation(ctx context.Context, runtime *TaskState) bool {
 	}
 	_ = s.saveRuntime(*runtime)
 	return allPassed
-}
-
-func (s *Service) reconcileRecovery(ctx context.Context) error {
-	if err := s.setRunStatus(domain.RunRecovering, ""); err != nil {
-		return err
-	}
-	if err := s.appendEvent(event.Input{Source: "recovery", Type: "run.recovering", Severity: "warning"}); err != nil {
-		return err
-	}
-	snapshot := s.Snapshot()
-	for _, runtime := range snapshot.Tasks {
-		if runtime.Worker == nil || runtime.Task.Status != state.TaskRunning {
-			continue
-		}
-		if runtime.Worker.PID > 0 && runtime.Worker.ProcessStartToken != "" {
-			identity, err := process.Inspect(ctx, runtime.Worker.PID)
-			if err == nil && runtime.Worker.ProcessStartToken == identity.StartToken {
-				taskCopy := runtime
-				taskCopy.Dimensions.Process = state.ProcessOrphaned
-				if taskCopy.Worker != nil {
-					taskCopy.Worker.StatusDimensions.Process = state.ProcessOrphaned
-				}
-				if err := s.saveRuntime(taskCopy); err != nil {
-					return err
-				}
-				if err := s.setRunStatus(domain.RunDegraded, "worker process is alive but cannot be reattached safely"); err != nil {
-					return err
-				}
-				return s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: string(runtime.Worker.WorkerID), Source: "recovery", Type: event.ProcessOrphaned, Severity: "error"})
-			}
-		}
-	}
-	return nil
 }
 
 func (s *Service) preflightWave(ctx context.Context, planned domain.WavePlan) error {

@@ -8,6 +8,7 @@ import (
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/event"
 	"github.com/vnai/subagent-broker/internal/state"
+	workerpkg "github.com/vnai/subagent-broker/internal/worker"
 )
 
 // ApplyEvent applies one durable event to a Snapshot checkpoint.
@@ -169,6 +170,65 @@ func ApplyEvent(snapshot Snapshot, ev event.Event) (Snapshot, error) {
 			next.Tasks[index].Worker.StatusDimensions.Task = state.Task(to)
 		}
 
+	case event.WorkerAttemptStarted:
+		payload, err := decodeMap(ev.Payload)
+		if err != nil {
+			return snapshot, err
+		}
+		raw, ok := payload["worker"]
+		if !ok {
+			return snapshot, fmt.Errorf("worker.attempt_started requires worker payload")
+		}
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return snapshot, err
+		}
+		var w domain.WorkerSession
+		if err := json.Unmarshal(encoded, &w); err != nil {
+			return snapshot, err
+		}
+		taskID := ev.TaskID
+		if taskID == "" {
+			taskID = string(w.TaskID)
+		}
+		index, err := findTaskIndex(&next, domain.TaskID(taskID))
+		if err != nil {
+			return snapshot, err
+		}
+		migrateAttempts(&next.Tasks[index])
+		number := w.Attempt
+		if number <= 0 {
+			if v, ok := payload["attempt"].(float64); ok {
+				number = int(v)
+			}
+		}
+		mode := workerpkg.AttemptFresh
+		if v, ok := payload["mode"].(string); ok && v != "" {
+			mode = workerpkg.AttemptMode(v)
+		}
+		next.Tasks[index].Attempts = append(next.Tasks[index].Attempts, workerpkg.Attempt{
+			Number: number, Mode: mode, Worker: w, Outcome: workerpkg.AttemptRunning, StartedAt: w.StartedAt,
+		})
+		next.Tasks[index].ActiveAttempt = number
+		next.Tasks[index].Worker = &w
+		next.Tasks[index].Dimensions = w.StatusDimensions
+
+	case event.WorkerAttemptFinished:
+		if ev.TaskID != "" {
+			index, err := findTaskIndex(&next, domain.TaskID(ev.TaskID))
+			if err == nil {
+				payload, _ := decodeMap(ev.Payload)
+				to, _ := payload["to"].(string)
+				reason, _ := payload["reason"].(string)
+				if to != "" {
+					finishActiveAttempt(&next.Tasks[index], workerpkg.AttemptOutcome(to), reason, ev.Timestamp)
+				}
+			}
+		}
+
+	case event.RecoveryClassified, event.RecoveryResumed, event.CancelTreeRequested, event.CancelTreeCompleted:
+		// Classification / cancel telemetry; state already applied by companion events.
+
 	case event.TaskRuntimeUpdated:
 		payload, err := decodeMap(ev.Payload)
 		if err != nil {
@@ -317,7 +377,8 @@ func isTelemetry(typeName string) bool {
 	case event.RunStateChanged, event.WaveStateChanged, event.TaskStateChanged,
 		event.TaskReportedComplete, event.TaskVerifiedSuccess, event.TaskVerificationFailed,
 		event.TaskRuntimeUpdated, event.ProcessStateChanged, event.ProtocolStateChanged,
-		event.ProgressStateChanged, event.SupervisorHeartbeat:
+		event.ProgressStateChanged, event.SupervisorHeartbeat,
+		event.WorkerAttemptStarted, event.WorkerAttemptFinished:
 		return false
 	default:
 		return true
