@@ -12,3 +12,4 @@ coverage.out
 # Broker runtime state belongs outside the repository
 .subagent-broker/
 .subagent/
+summary.json
