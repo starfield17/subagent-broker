@@ -8,7 +8,7 @@ import (
 )
 
 // EventSink is the only path through which adapters and workers may propose
-// Run facts. A future Run-scoped Supervisor owns the concrete single-writer
+// Run facts. The Run-scoped Supervisor owns the concrete single-writer
 // implementation and state transitions.
 type EventSink interface {
 	Append(event.Input) (event.Event, error)
@@ -21,9 +21,8 @@ type SnapshotStore interface {
 	LoadRun(context.Context, domain.RunID) (domain.Run, error)
 }
 
-// Controller is the Phase 0 boundary for the future Run-scoped Supervisor.
-// It intentionally omits a production implementation until Phase 1 proves a
-// complete single-Harness lifecycle.
+// Controller is the minimal lifecycle boundary implemented by the Run-scoped
+// Supervisor.
 type Controller interface {
 	Start(context.Context, domain.Run) error
 	Cancel(context.Context, domain.RunID) error

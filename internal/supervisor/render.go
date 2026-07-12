@@ -8,7 +8,7 @@ import (
 
 func renderStatus(snapshot Snapshot) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Run: %s\nStatus: %s\nWave: %s / %s\nUpdated: %s\n", snapshot.Run.RunID, snapshot.Run.Status, snapshot.Wave.WaveID, snapshot.Wave.Status, snapshot.UpdatedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, "Run: %s\nStatus: %s\nWave: %d/%d %s / %s\nPending decisions: %d\nUpdated: %s\n", snapshot.Run.RunID, snapshot.Run.Status, snapshot.Wave.Ordinal, len(snapshot.Waves), snapshot.Wave.WaveID, snapshot.Wave.Status, len(snapshot.Messages), snapshot.UpdatedAt.UTC().Format(time.RFC3339))
 	if snapshot.LastError != "" {
 		fmt.Fprintf(&b, "Last error: %s\n", snapshot.LastError)
 	}
@@ -31,6 +31,7 @@ func renderStatus(snapshot Snapshot) string {
 		if runtime.LastError != "" {
 			fmt.Fprintf(&b, "  error: %s\n", runtime.LastError)
 		}
+		fmt.Fprintf(&b, "  scope: %s\n", strings.Join(runtime.Task.WriteScope, ", "))
 		b.WriteString("\n")
 	}
 	return b.String()
@@ -40,7 +41,15 @@ func renderRunSummary(snapshot Snapshot) string {
 	var b strings.Builder
 	b.WriteString("# Run Summary\n\n")
 	fmt.Fprintf(&b, "## Overall Status\n\n%s\n\n", snapshot.Run.Status)
-	fmt.Fprintf(&b, "## Wave Status\n\n- `%s`: %s\n\n", snapshot.Wave.WaveID, snapshot.Wave.Status)
+	b.WriteString("## Wave Status\n\n")
+	for _, item := range snapshot.Waves {
+		fmt.Fprintf(&b, "- `%s`: %s", item.WaveID, item.Status)
+		if item.BarrierResult != "" {
+			fmt.Fprintf(&b, " (%s)", item.BarrierResult)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 	b.WriteString("## Task Summary\n\n")
 	for _, runtime := range snapshot.Tasks {
 		fmt.Fprintf(&b, "### %s\n\n- Status: `%s`\n", runtime.Task.TaskID, runtime.Task.Status)
@@ -52,7 +61,15 @@ func renderRunSummary(snapshot Snapshot) string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("## Pending Decisions\n\n- None.\n\n## Scope Audit\n\n- Phase 1 runs one Task; complete Wave scope auditing is scheduled for Phase 2.\n\n## Integration Verification\n\n")
+	b.WriteString("## Pending Decisions\n\n")
+	if len(snapshot.Messages) == 0 {
+		b.WriteString("- None.\n")
+	} else {
+		for _, item := range snapshot.Messages {
+			fmt.Fprintf(&b, "- `%s` / task `%s` / %s\n", item.MessageID, item.TaskID, item.Type)
+		}
+	}
+	b.WriteString("\n## Scope Audit\n\n- See each Wave `barrier.md` and `verification.json`.\n\n## Integration Verification\n\n")
 	for _, runtime := range snapshot.Tasks {
 		for _, result := range runtime.Validation {
 			status := "failed"

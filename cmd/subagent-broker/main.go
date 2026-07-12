@@ -18,6 +18,8 @@ import (
 	"github.com/vnai/subagent-broker/internal/adapter/claude"
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/event"
+	"github.com/vnai/subagent-broker/internal/interaction"
+	"github.com/vnai/subagent-broker/internal/message"
 	"github.com/vnai/subagent-broker/internal/process"
 	"github.com/vnai/subagent-broker/internal/project"
 	"github.com/vnai/subagent-broker/internal/run"
@@ -25,6 +27,7 @@ import (
 	"github.com/vnai/subagent-broker/internal/storage"
 	"github.com/vnai/subagent-broker/internal/supervisor"
 	"github.com/vnai/subagent-broker/internal/task"
+	"github.com/vnai/subagent-broker/internal/verify"
 	"github.com/vnai/subagent-broker/internal/wave"
 )
 
@@ -44,6 +47,10 @@ func execute(args []string) error {
 		return dispatch(args[1:])
 	case "supervisor":
 		return runSupervisor(args[1:])
+	case "mcp-worker":
+		return runMCPWorker(args[1:])
+	case "claude-hook":
+		return runClaudeHook(args[1:])
 	case "status":
 		return statusCommand(args[1:])
 	case "events":
@@ -52,6 +59,10 @@ func execute(args []string) error {
 		return waitCommand(args[1:])
 	case "collect":
 		return collectCommand(args[1:])
+	case "inbox":
+		return inboxCommand(args[1:])
+	case "send":
+		return sendCommand(args[1:])
 	case "cancel":
 		return cancelCommand(args[1:])
 	case "recover":
@@ -66,7 +77,7 @@ func execute(args []string) error {
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: subagent-broker <dispatch|status|events|wait|collect|cancel|recover|doctor>")
+	return fmt.Errorf("usage: subagent-broker <dispatch|status|events|wait|collect|inbox|send|cancel|recover|doctor>")
 }
 
 func registry(executable string) *adapter.Registry {
@@ -92,6 +103,7 @@ func dispatch(args []string) error {
 	stallAfter := flags.Duration("stall-after", 2*time.Minute, "suspected stall threshold")
 	hardTimeout := flags.Duration("hard-timeout", 30*time.Minute, "hard run timeout")
 	validationTimeout := flags.Duration("validation-timeout", 5*time.Minute, "validation command timeout")
+	maxConcurrency := flags.Int("max-concurrency", 4, "maximum concurrent Workers in a Wave")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -99,7 +111,7 @@ func dispatch(args []string) error {
 		return fmt.Errorf("dispatch requires --goal and --tasks")
 	}
 	if *harness != string(adapter.HarnessClaudeCode) {
-		return fmt.Errorf("Phase 1 only implements harness %q", adapter.HarnessClaudeCode)
+		return fmt.Errorf("Phase 3 only implements harness %q", adapter.HarnessClaudeCode)
 	}
 	home, err := resolveBrokerHome(*brokerHome)
 	if err != nil {
@@ -110,46 +122,64 @@ func dispatch(args []string) error {
 	if err != nil {
 		return err
 	}
-	tasks, err := readTasks(*tasksFile)
+	planData, err := os.ReadFile(*tasksFile)
 	if err != nil {
 		return err
 	}
-	if len(tasks) != 1 {
-		return fmt.Errorf("Phase 1 dispatch requires exactly one task")
+	plan, err := run.DecodePlan(planData)
+	if err != nil {
+		return err
 	}
-	for i := range tasks {
-		if tasks[i].ProjectRoot == "" {
-			tasks[i].ProjectRoot = projectValue.CanonicalPath
-		}
-		if tasks[i].WaveID == "" {
-			tasks[i].WaveID = "wave-1"
-		}
-		if tasks[i].HarnessPreference == "" {
-			tasks[i].HarnessPreference = *harness
-		}
-		if tasks[i].Status == "" {
-			tasks[i].Status = state.TaskPlanned
-		}
-		if err := task.ValidateContract(tasks[i]); err != nil {
-			return fmt.Errorf("task %s: %w", tasks[i].TaskID, err)
+	var tasks []domain.Task
+	for waveIndex := range plan.Waves {
+		planned := &plan.Waves[waveIndex]
+		for taskIndex := range planned.Tasks {
+			item := &planned.Tasks[taskIndex]
+			if item.ProjectRoot == "" {
+				item.ProjectRoot = projectValue.CanonicalPath
+			} else if filepath.Clean(item.ProjectRoot) != filepath.Clean(projectValue.CanonicalPath) {
+				return fmt.Errorf("task %s project_root does not match the resolved project", item.TaskID)
+			}
+			if item.WaveID == "" {
+				item.WaveID = planned.WaveID
+			} else if item.WaveID != planned.WaveID {
+				return fmt.Errorf("task %s wave_id does not match its containing Wave", item.TaskID)
+			}
+			if item.HarnessPreference == "" {
+				item.HarnessPreference = *harness
+			} else if item.HarnessPreference != *harness {
+				return fmt.Errorf("task %s requests unsupported harness %q", item.TaskID, item.HarnessPreference)
+			}
+			if item.Status == "" {
+				item.Status = state.TaskPlanned
+			}
+			if err := task.ValidateContract(*item); err != nil {
+				return fmt.Errorf("task %s: %w", item.TaskID, err)
+			}
+			tasks = append(tasks, *item)
 		}
 	}
-	preflight := wave.Preflight(tasks)
-	if !preflight.Allowed {
-		return fmt.Errorf("preflight rejected: %s", formatIssues(preflight.Issues))
+	if err := run.ValidatePlan(plan); err != nil {
+		return err
 	}
-	config := supervisor.Config{BrokerHome: home, Harness: *harness, Executable: *executable, Model: *model, SafeMode: *safeMode, PermissionMode: *permissionMode, MaxTurns: *maxTurns, QuietAfter: *quietAfter, StallAfter: *stallAfter, HardTimeout: *hardTimeout, ValidationTimeout: *validationTimeout}
+	config := supervisor.Config{BrokerHome: home, Harness: *harness, Executable: *executable, Model: *model, SafeMode: *safeMode, PermissionMode: *permissionMode, MaxTurns: *maxTurns, QuietAfter: *quietAfter, StallAfter: *stallAfter, HardTimeout: *hardTimeout, ValidationTimeout: *validationTimeout, MaxConcurrency: *maxConcurrency}
 	config.Normalize()
 	runID, err := project.NewRunID(now)
 	if err != nil {
 		return err
 	}
-	taskIDs := []domain.TaskID{tasks[0].TaskID}
+	taskIDs := make([]domain.TaskID, 0, len(tasks))
+	for _, item := range tasks {
+		taskIDs = append(taskIDs, item.TaskID)
+	}
 	runValue, err := run.New(runID, projectValue.ProjectID, *goal, taskIDs, config, now)
 	if err != nil {
 		return err
 	}
-	runValue.CurrentWave = domain.WaveID("wave-1")
+	runValue.CurrentWave = plan.Waves[0].WaveID
+	for _, planned := range plan.Waves {
+		runValue.WaveIDs = append(runValue.WaveIDs, planned.WaveID)
+	}
 	runValue.BaseRevision = gitRevision(projectValue.CanonicalPath)
 	runValue.BaseWorktreeSnapshot = domain.WorktreeSnapshot{Revision: runValue.BaseRevision}
 	layout, err := storage.NewLayout(home)
@@ -164,41 +194,69 @@ func dispatch(args []string) error {
 	if err != nil {
 		return err
 	}
-	wavePaths, err := layout.WavePaths(string(projectValue.ProjectID), string(runID), "wave-1")
+	runPaths, err := layout.RunPaths(string(projectValue.ProjectID), string(runID))
 	if err != nil {
 		return err
 	}
-	taskPaths, err := layout.TaskPaths(string(projectValue.ProjectID), string(runID), string(tasks[0].TaskID))
+	baseline, err := verify.CaptureWorkspace(projectValue.CanonicalPath, home)
 	if err != nil {
 		return err
 	}
-	for _, dir := range []string{wavePaths.Root, taskPaths.Root, taskPaths.ValidationDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-	}
-	waveValue := domain.Wave{WaveID: "wave-1", Ordinal: 1, TaskIDs: taskIDs, Status: domain.WavePlanned}
 	if err := storage.AtomicWriteJSON(projectPaths.Project, projectValue, 0o600); err != nil {
 		return err
 	}
 	if err := storage.AtomicWriteJSON(projectPaths.ActiveRun, map[string]string{"run_id": string(runID)}, 0o600); err != nil {
 		return err
 	}
-	if err := storage.AtomicWriteJSON(filepath.Join(runDir, "run.json"), runValue, 0o600); err != nil {
+	if err := storage.AtomicWriteJSON(runPaths.Run, runValue, 0o600); err != nil {
 		return err
 	}
-	if err := storage.AtomicWriteJSON(filepath.Join(wavePaths.Root, "wave.json"), waveValue, 0o600); err != nil {
+	if err := storage.AtomicWriteJSON(runPaths.Plan, plan, 0o600); err != nil {
 		return err
 	}
-	if err := storage.AtomicWriteJSON(taskPaths.Task, tasks[0], 0o600); err != nil {
+	if err := storage.AtomicWriteJSON(runPaths.Baseline, baseline, 0o600); err != nil {
 		return err
 	}
-	contract, err := task.RenderContract(tasks[0], runID)
-	if err != nil {
-		return err
+	for ordinal, planned := range plan.Waves {
+		wavePaths, pathErr := layout.WavePaths(string(projectValue.ProjectID), string(runID), string(planned.WaveID))
+		if pathErr != nil {
+			return pathErr
+		}
+		if err := os.MkdirAll(wavePaths.Root, 0o700); err != nil {
+			return err
+		}
+		ids := make([]domain.TaskID, 0, len(planned.Tasks))
+		for _, item := range planned.Tasks {
+			ids = append(ids, item.TaskID)
+		}
+		waveValue := domain.Wave{WaveID: planned.WaveID, Ordinal: ordinal + 1, TaskIDs: ids, Status: domain.WavePlanned, IntegrationChecks: planned.IntegrationChecks}
+		if err := storage.AtomicWriteJSON(wavePaths.Wave, waveValue, 0o600); err != nil {
+			return err
+		}
+		if err := storage.AtomicWriteJSON(wavePaths.Preflight, wave.Preflight(planned.Tasks), 0o600); err != nil {
+			return err
+		}
 	}
-	if err := storage.AtomicWriteFile(taskPaths.Contract, []byte(contract), 0o600); err != nil {
-		return err
+	for _, item := range tasks {
+		taskPaths, pathErr := layout.TaskPaths(string(projectValue.ProjectID), string(runID), string(item.TaskID))
+		if pathErr != nil {
+			return pathErr
+		}
+		for _, dir := range []string{taskPaths.Root, taskPaths.ValidationDir, taskPaths.QuestionsDir} {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return err
+			}
+		}
+		if err := storage.AtomicWriteJSON(taskPaths.Task, item, 0o600); err != nil {
+			return err
+		}
+		contract, renderErr := task.RenderContract(item, runID)
+		if renderErr != nil {
+			return renderErr
+		}
+		if err := storage.AtomicWriteFile(taskPaths.Contract, []byte(contract), 0o600); err != nil {
+			return err
+		}
 	}
 	service, err := supervisor.Load(runDir, registry(*executable), false)
 	if err != nil {
@@ -237,6 +295,44 @@ func runSupervisor(args []string) error {
 		return err
 	}
 	return service.Start(context.Background())
+}
+
+func runMCPWorker(args []string) error {
+	flags := flag.NewFlagSet("mcp-worker", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	runDir := flags.String("run-dir", "", "run directory")
+	taskID := flags.String("task", "", "Task ID")
+	workerID := flags.String("worker", "", "Worker ID")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *runDir == "" || *taskID == "" || *workerID == "" {
+		return fmt.Errorf("mcp-worker requires --run-dir, --task, and --worker")
+	}
+	runID, err := interaction.LoadRunID(*runDir)
+	if err != nil {
+		return err
+	}
+	return (interaction.WorkerServer{RunDir: *runDir, RunID: runID, TaskID: *taskID, WorkerID: *workerID}).Run(context.Background())
+}
+
+func runClaudeHook(args []string) error {
+	flags := flag.NewFlagSet("claude-hook", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	runDir := flags.String("run-dir", "", "run directory")
+	taskID := flags.String("task", "", "Task ID")
+	workerID := flags.String("worker", "", "Worker ID")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *runDir == "" || *taskID == "" || *workerID == "" {
+		return fmt.Errorf("claude-hook requires --run-dir, --task, and --worker")
+	}
+	runID, err := interaction.LoadRunID(*runDir)
+	if err != nil {
+		return err
+	}
+	return interaction.RunPermissionHook(context.Background(), *runDir, runID, *taskID, *workerID, os.Stdin, os.Stdout)
 }
 
 func statusCommand(args []string) error {
@@ -305,6 +401,10 @@ func waitCommand(args []string) error {
 	brokerHome := flags.String("broker-home", "", "Broker Home override")
 	runID := flags.String("run", "", "Run ID")
 	timeout := flags.Duration("timeout", 0, "timeout; zero waits without a deadline")
+	waitFor := flags.String("for", "run", "condition: run, wave, task, inbox, or event")
+	taskID := flags.String("task", "", "Task ID for --for task")
+	waveID := flags.String("wave", "", "Wave ID for --for wave")
+	sinceSeq := flags.Uint64("since-seq", 0, "event cursor for --for event")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -323,7 +423,15 @@ func waitCommand(args []string) error {
 		if readErr != nil {
 			return readErr
 		}
-		if isTerminal(snapshot.Run.Status) {
+		matched, matchErr := waitCondition(runDir, snapshot, *waitFor, *taskID, *waveID, *sinceSeq)
+		if matchErr != nil {
+			return matchErr
+		}
+		if matched {
+			if *waitFor != "run" {
+				fmt.Println(*waitFor)
+				return nil
+			}
 			fmt.Printf("%s\n", snapshot.Run.Status)
 			if snapshot.Run.Status != domain.RunCompleted {
 				return fmt.Errorf("run ended with status %s", snapshot.Run.Status)
@@ -334,6 +442,56 @@ func waitCommand(args []string) error {
 			return fmt.Errorf("wait timed out")
 		}
 		<-ticker.C
+	}
+}
+
+func waitCondition(runDir string, snapshot supervisor.Snapshot, condition, taskID, waveID string, sinceSeq uint64) (bool, error) {
+	switch condition {
+	case "run":
+		return isTerminal(snapshot.Run.Status), nil
+	case "wave":
+		if waveID == "" {
+			waveID = string(snapshot.Run.CurrentWave)
+		}
+		for _, item := range snapshot.Waves {
+			if string(item.WaveID) == waveID {
+				return item.Status == domain.WaveVerified || item.Status == domain.WaveBlocked || item.Status == domain.WaveFailed || item.Status == domain.WaveCancelled, nil
+			}
+		}
+		return false, fmt.Errorf("Wave %q was not found", waveID)
+	case "task":
+		if taskID == "" {
+			return false, fmt.Errorf("--for task requires --task")
+		}
+		for _, runtime := range snapshot.Tasks {
+			if string(runtime.Task.TaskID) == taskID {
+				switch runtime.Task.Status {
+				case state.TaskVerifiedSuccess, state.TaskVerifiedPartial, state.TaskVerificationFailed, state.TaskFailed, state.TaskCancelled:
+					return true, nil
+				}
+				return false, nil
+			}
+		}
+		return false, fmt.Errorf("task %q was not found", taskID)
+	case "inbox":
+		index, err := message.Replay(filepath.Join(runDir, "messages.jsonl"))
+		if err != nil {
+			return false, err
+		}
+		return len(message.Sorted(index, false)) > 0, nil
+	case "event":
+		replayed, err := event.Replay(filepath.Join(runDir, "events.jsonl"))
+		if err != nil {
+			return false, err
+		}
+		for _, item := range replayed.Events {
+			if item.Seq > sinceSeq {
+				return true, nil
+			}
+		}
+		return false, nil
+	default:
+		return false, fmt.Errorf("unsupported wait condition %q", condition)
 	}
 }
 
@@ -369,6 +527,150 @@ func collectCommand(args []string) error {
 		}
 		fmt.Printf("\n--- report: %s ---\n%s", runtime.Task.TaskID, reportData)
 	}
+	runValue, err := readRun(runDir)
+	if err != nil {
+		return err
+	}
+	layout, err := storage.NewLayout(mustHome(*brokerHome))
+	if err != nil {
+		return err
+	}
+	runPaths, err := layout.RunPaths(string(runValue.ProjectID), string(runValue.RunID))
+	if err != nil {
+		return err
+	}
+	index, err := message.Replay(runPaths.Messages)
+	if err != nil {
+		return err
+	}
+	for _, item := range message.Sorted(index, false) {
+		questionPath := filepath.Join(runPaths.Tasks, item.TaskID, "questions", item.MessageID, "question.md")
+		question, readErr := os.ReadFile(questionPath)
+		if readErr == nil {
+			fmt.Printf("\n--- pending: %s ---\n%s", item.MessageID, question)
+		}
+	}
+	return nil
+}
+
+func inboxCommand(args []string) error {
+	flags := flag.NewFlagSet("inbox", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	projectPath := flags.String("project", "", "project root")
+	brokerHome := flags.String("broker-home", "", "Broker Home override")
+	runID := flags.String("run", "", "Run ID")
+	taskID := flags.String("task", "", "Task ID filter")
+	includeResolved := flags.Bool("all", false, "include resolved messages")
+	jsonOutput := flags.Bool("json", false, "print JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	runDir, err := resolveRunDir(*projectPath, *brokerHome, *runID)
+	if err != nil {
+		return err
+	}
+	runValue, err := readRun(runDir)
+	if err != nil {
+		return err
+	}
+	paths, err := storage.NewLayout(mustHome(*brokerHome))
+	if err != nil {
+		return err
+	}
+	runPaths, err := paths.RunPaths(string(runValue.ProjectID), string(runValue.RunID))
+	if err != nil {
+		return err
+	}
+	index, err := message.Replay(runPaths.Messages)
+	if err != nil {
+		return err
+	}
+	items := message.Sorted(index, *includeResolved)
+	filtered := items[:0]
+	for _, item := range items {
+		if *taskID == "" || item.TaskID == *taskID {
+			filtered = append(filtered, item)
+		}
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(filtered)
+	}
+	if len(filtered) == 0 {
+		fmt.Println("Inbox is empty.")
+		return nil
+	}
+	for _, item := range filtered {
+		fmt.Printf("%s / task=%s / type=%s / category=%s / status=%s\n", item.MessageID, item.TaskID, item.Type, item.Category, item.Status)
+	}
+	return nil
+}
+
+func sendCommand(args []string) error {
+	flags := flag.NewFlagSet("send", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	projectPath := flags.String("project", "", "project root")
+	brokerHome := flags.String("broker-home", "", "Broker Home override")
+	runID := flags.String("run", "", "Run ID")
+	taskID := flags.String("task", "", "Task ID")
+	messageID := flags.String("message", "", "Message ID")
+	textValue := flags.String("text", "", "instruction text")
+	answer := flags.String("answer", "", "question answer")
+	approve := flags.Bool("approve", false, "approve a scope or permission request")
+	deny := flags.Bool("deny", false, "deny a scope or permission request")
+	reason := flags.String("reason", "", "decision reason")
+	allowInterface := flags.Bool("allow-public-interface-change", false, "approve a requested public-interface change")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	runDir, err := resolveRunDir(*projectPath, *brokerHome, *runID)
+	if err != nil {
+		return err
+	}
+	if *taskID != "" && *textValue != "" && *messageID == "" {
+		response, err := callSupervisor(runDir, "send", map[string]any{"task_id": *taskID, "text": *textValue})
+		if err != nil {
+			return err
+		}
+		if !response.OK {
+			return errors.New(response.Error)
+		}
+		data, _ := json.Marshal(response.Result)
+		fmt.Println(string(data))
+		return nil
+	}
+	if *messageID == "" {
+		return fmt.Errorf("send requires either --task with --text or --message with a resolution")
+	}
+	actions := 0
+	if *answer != "" {
+		actions++
+	}
+	if *approve {
+		actions++
+	}
+	if *deny {
+		actions++
+	}
+	if actions != 1 {
+		return fmt.Errorf("message resolution requires exactly one of --answer, --approve, or --deny")
+	}
+	resolution := message.Resolution{Answer: *answer}
+	if *approve || *deny {
+		resolution.Decision = message.DecisionPayload{Allowed: *approve, Reason: *reason, AllowPublicInterfaceChange: *allowInterface}
+		if *deny && strings.TrimSpace(*reason) == "" {
+			return fmt.Errorf("--deny requires --reason")
+		}
+	}
+	response, err := callSupervisor(runDir, "resolve_message", map[string]any{"message_id": *messageID, "resolution": resolution})
+	if err != nil {
+		return err
+	}
+	if !response.OK {
+		return errors.New(response.Error)
+	}
+	fmt.Println("message resolved")
 	return nil
 }
 
@@ -378,6 +680,9 @@ func cancelCommand(args []string) error {
 	projectPath := flags.String("project", "", "project root")
 	brokerHome := flags.String("broker-home", "", "Broker Home override")
 	runID := flags.String("run", "", "Run ID")
+	taskID := flags.String("task", "", "cancel one Task")
+	workerID := flags.String("worker", "", "cancel one Worker")
+	waveID := flags.String("wave", "", "cancel one Wave")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -385,7 +690,16 @@ func cancelCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	response, err := callSupervisor(runDir, "cancel", nil)
+	targets := 0
+	for _, value := range []string{*taskID, *workerID, *waveID} {
+		if value != "" {
+			targets++
+		}
+	}
+	if targets > 1 {
+		return fmt.Errorf("cancel accepts at most one of --task, --worker, or --wave")
+	}
+	response, err := callSupervisor(runDir, "cancel", map[string]string{"task_id": *taskID, "worker_id": *workerID, "wave_id": *waveID})
 	if err != nil {
 		return err
 	}
@@ -431,7 +745,7 @@ func doctorCommand(args []string) error {
 		return err
 	}
 	if *harness != string(adapter.HarnessClaudeCode) {
-		return fmt.Errorf("Phase 1 doctor only probes harness %q", adapter.HarnessClaudeCode)
+		return fmt.Errorf("Phase 3 doctor only probes harness %q", adapter.HarnessClaudeCode)
 	}
 	result, err := claude.New(*executable).Probe(context.Background(), adapter.ProbeRequest{Executable: *executable})
 	if err != nil {
@@ -446,27 +760,6 @@ func doctorCommand(args []string) error {
 		return fmt.Errorf("Claude Code is not installed")
 	}
 	return nil
-}
-
-func readTasks(path string) ([]domain.Task, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var tasks []domain.Task
-	if len(strings.TrimSpace(string(data))) > 0 && strings.TrimSpace(string(data))[0] == '[' {
-		if err := json.Unmarshal(data, &tasks); err != nil {
-			return nil, err
-		}
-		return tasks, nil
-	}
-	var wrapper struct {
-		Tasks []domain.Task `json:"tasks"`
-	}
-	if err := json.Unmarshal(data, &wrapper); err != nil {
-		return nil, err
-	}
-	return wrapper.Tasks, nil
 }
 
 func resolveBrokerHome(override string) (string, error) {
@@ -650,14 +943,6 @@ func gitRevision(root string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(output))
-}
-
-func formatIssues(issues []wave.Issue) string {
-	parts := make([]string, 0, len(issues))
-	for _, issue := range issues {
-		parts = append(parts, string(issue.Kind)+": "+issue.Details)
-	}
-	return strings.Join(parts, "; ")
 }
 
 func isTerminal(status domain.RunStatus) bool {

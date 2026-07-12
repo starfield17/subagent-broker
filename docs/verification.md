@@ -11,4 +11,13 @@ go build ./cmd/subagent-broker
 
 All packages compiled; unit and contract tests passed; `go vet` reported no findings; race-enabled tests passed.
 
-The Phase 1 real smoke used `examples/phase1-smoke-tasks.json` with the installed Claude Code CLI. It completed with a verified Task and Wave, published a structured report, emitted normalized lifecycle events, and created `smoke-output.txt` containing `phase1-ok`. The smoke is an installed-environment check, not a compatibility claim for every Claude Code release or provider configuration.
+The Phase 1 real smoke used `examples/phase1-smoke-tasks.json` with the installed Claude Code CLI. It completed with a verified Task and Wave, published a structured report, emitted normalized lifecycle events, and created `smoke-output.txt` containing `phase1-ok`.
+
+Phase 2 and Phase 3 were verified against Claude Code 2.1.197:
+
+- `examples/phase2-parallel-plan.json` started two disjoint Workers concurrently, verified both reports, audited both changed files, passed the Wave Barrier, and passed final checks.
+- `examples/phase3-question-plan.json` published a persistent question, accepted an answer through `send`, resumed the same turn, and completed successfully.
+- `examples/phase3-scope-plan.json` blocked before an out-of-scope edit, updated the Task Contract after approval, and passed the Barrier with the expanded lease.
+- `examples/phase3-permission-plan.json` routed two Bash tool calls through persistent permission requests, continued after approval, and completed successfully.
+
+These smokes are installed-environment checks, not compatibility claims for every Claude Code release or provider configuration.

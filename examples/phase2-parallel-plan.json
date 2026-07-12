@@ -1,0 +1,50 @@
+{
+  "schema_version": "v1alpha1",
+  "waves": [
+    {
+      "wave_id": "wave-1",
+      "integration_checks": [
+        {
+          "command": "test -f marker-a.txt && test -f marker-b.txt",
+          "scope": "wave"
+        }
+      ],
+      "tasks": [
+        {
+          "task_id": "marker-a",
+          "title": "Create marker A",
+          "objective": "Create marker-a.txt containing the single line marker-a.",
+          "completion_criteria": ["marker-a.txt contains marker-a"],
+          "write_scope": ["marker-a.txt"],
+          "forbidden_scope": [],
+          "known_read_dependencies": [],
+          "parallel_responsibilities": {"marker-b": "Creates marker-b.txt only."},
+          "validation_commands": [{"command": "grep -Fxq marker-a marker-a.txt", "scope": "local"}],
+          "depends_on": [],
+          "allow_nested_agents": false,
+          "allow_public_interface_change": false
+        },
+        {
+          "task_id": "marker-b",
+          "title": "Create marker B",
+          "objective": "Create marker-b.txt containing the single line marker-b.",
+          "completion_criteria": ["marker-b.txt contains marker-b"],
+          "write_scope": ["marker-b.txt"],
+          "forbidden_scope": [],
+          "known_read_dependencies": [],
+          "parallel_responsibilities": {"marker-a": "Creates marker-a.txt only."},
+          "validation_commands": [{"command": "grep -Fxq marker-b marker-b.txt", "scope": "local"}],
+          "depends_on": [],
+          "allow_nested_agents": false,
+          "allow_public_interface_change": false
+        }
+      ]
+    }
+  ],
+  "final_checks": [
+    {
+      "command": "grep -Fxq marker-a marker-a.txt && grep -Fxq marker-b marker-b.txt",
+      "scope": "run"
+    }
+  ]
+}

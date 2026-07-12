@@ -63,7 +63,7 @@ func New(executable string) *Adapter {
 		capabilities: adapter.Capabilities{
 			StructuredStream: true, BidirectionalStream: true, ResumeSession: true,
 			SteerActiveTurn: true, InterruptTurn: true, StructuredFinalOutput: true,
-			NativeSubagents: true, Hooks: true, SessionHistory: true, UsageEvents: true,
+			NativeSubagents: true, Hooks: true, SessionHistory: true, UsageEvents: true, PermissionEvents: true,
 		},
 		sessions: map[string]*sessionState{},
 	}
@@ -158,6 +158,23 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	if strings.EqualFold(req.Options["safe_mode"], "true") {
 		args = append(args, "--safe-mode")
 	}
+	if req.Interaction.Enabled {
+		config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"subagent-broker": map[string]any{"type": "stdio", "command": req.Interaction.BrokerExecutable, "args": []string{"mcp-worker", "--run-dir", req.Interaction.RunDir, "--task", req.TaskID, "--worker", req.WorkerID}}}})
+		if err != nil {
+			return adapter.Session{}, err
+		}
+		hookCommand := strings.Join([]string{shellQuote(req.Interaction.BrokerExecutable), "claude-hook", "--run-dir", shellQuote(req.Interaction.RunDir), "--task", shellQuote(req.TaskID), "--worker", shellQuote(req.WorkerID)}, " ")
+		settingsValue := map[string]any{}
+		if req.Options["permission_mode"] == "default" {
+			settingsValue["permissions"] = map[string]any{"allow": []string{"Bash", "Write", "Edit"}}
+			settingsValue["hooks"] = map[string]any{"PreToolUse": []any{map[string]any{"matcher": "Bash|Write|Edit", "hooks": []any{map[string]any{"type": "command", "command": hookCommand}}}}}
+		}
+		settings, err := json.Marshal(settingsValue)
+		if err != nil {
+			return adapter.Session{}, err
+		}
+		args = append(args, "--mcp-config", string(config), "--settings", string(settings), "--include-hook-events", "--allowedTools", "mcp__subagent-broker__ask_main_agent,mcp__subagent-broker__request_scope_expansion", "--disallowedTools", "Agent,Task,AskUserQuestion")
+	}
 
 	cmd := exec.CommandContext(ctx, a.executable, args...)
 	cmd.Dir = req.ProjectRoot
@@ -229,6 +246,7 @@ func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) 
 	return a.StartSession(ctx, adapter.StartRequest{
 		RunID: req.RunID, TaskID: req.TaskID, WorkerID: req.WorkerID,
 		ProjectRoot: req.ProjectRoot, Contract: req.Contract, Model: req.Model, Options: options,
+		Interaction: req.Interaction,
 	})
 }
 
@@ -549,4 +567,8 @@ func cloneOptions(options map[string]string) map[string]string {
 		result[key] = value
 	}
 	return result
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

@@ -1,0 +1,25 @@
+{
+  "schema_version": "v1alpha1",
+  "waves": [
+    {
+      "wave_id": "wave-1",
+      "tasks": [
+        {
+          "task_id": "question-smoke",
+          "title": "Ask before writing",
+          "objective": "Before editing, call the subagent-broker ask_main_agent MCP tool and ask which exact line to write. After receiving the answer, create question-answer.txt containing exactly that answer.",
+          "completion_criteria": ["The Broker question is answered", "question-answer.txt contains the answer"],
+          "write_scope": ["question-answer.txt"],
+          "forbidden_scope": [],
+          "known_read_dependencies": [],
+          "parallel_responsibilities": {},
+          "validation_commands": [{"command": "test -s question-answer.txt", "scope": "local"}],
+          "depends_on": [],
+          "allow_nested_agents": false,
+          "allow_public_interface_change": false
+        }
+      ]
+    }
+  ],
+  "final_checks": [{"command": "grep -Fxq phase3-answer question-answer.txt", "scope": "run"}]
+}

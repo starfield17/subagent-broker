@@ -1,0 +1,24 @@
+{
+  "schema_version": "v1alpha1",
+  "waves": [
+    {
+      "wave_id": "wave-1",
+      "tasks": [
+        {
+          "task_id": "permission-smoke",
+          "title": "Request Bash permission",
+          "objective": "Use the Bash tool, not Write or Edit, to run exactly: printf 'permission-approved\\n' > permission.txt. If permission is required, wait for the Main Agent decision.",
+          "completion_criteria": ["permission.txt contains permission-approved"],
+          "write_scope": ["permission.txt"],
+          "forbidden_scope": [],
+          "known_read_dependencies": [],
+          "parallel_responsibilities": {},
+          "validation_commands": [{"command": "grep -Fxq permission-approved permission.txt", "scope": "local"}],
+          "depends_on": [],
+          "allow_nested_agents": false,
+          "allow_public_interface_change": false
+        }
+      ]
+    }
+  ]
+}

@@ -72,6 +72,13 @@ type StartRequest struct {
 	Model       string            `json:"model,omitempty"`
 	Scenario    string            `json:"scenario,omitempty"`
 	Options     map[string]string `json:"options,omitempty"`
+	Interaction InteractionConfig `json:"interaction,omitempty"`
+}
+
+type InteractionConfig struct {
+	Enabled          bool   `json:"enabled"`
+	BrokerExecutable string `json:"broker_executable,omitempty"`
+	RunDir           string `json:"run_dir,omitempty"`
 }
 
 type ResumeRequest struct {
@@ -83,6 +90,7 @@ type ResumeRequest struct {
 	Contract        string            `json:"contract"`
 	Model           string            `json:"model,omitempty"`
 	Options         map[string]string `json:"options,omitempty"`
+	Interaction     InteractionConfig `json:"interaction,omitempty"`
 }
 
 type OutputChunk struct {

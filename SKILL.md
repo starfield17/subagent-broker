@@ -2,7 +2,7 @@
 
 ## Status
 
-This repository is a **Phase 1 runtime** built on the Phase 0 architecture skeleton. It exposes a one-task Claude Code dispatch path and keeps the remaining Harness runtimes and Wave execution behind explicit phase boundaries.
+This repository is a **Phase 3 runtime**. It executes ordered Waves of same-checkout Tasks through Claude Code and provides Barrier verification plus a persistent Main Agent/Worker message path.
 
 ## Main Agent responsibilities
 
@@ -50,7 +50,7 @@ Workers may read the project, but may only write within the approved scope. When
 - V1 does not create worktrees and does not allow nested agents by default.
 - Adapter capability declarations must be truthful.
 
-## Phase 1 operator workflow
+## Operator workflow
 
 Build and probe the Claude adapter before dispatching:
 
@@ -59,7 +59,7 @@ go build -o /tmp/subagent-broker ./cmd/subagent-broker
 /tmp/subagent-broker doctor
 ```
 
-Dispatch accepts one Task JSON file. The file may contain a JSON array or an object with a `tasks` array. Each Task must include a project root, a local validation command, an allowed write scope, and a complete final-report contract.
+Dispatch accepts the legacy Task array as one Wave or an ordered plan containing `waves`, per-Wave `integration_checks`, and optional `final_checks`.
 
 ```bash
 /tmp/subagent-broker dispatch \
@@ -78,8 +78,10 @@ The command starts a detached Supervisor and prints the Run ID. The Supervisor i
 /tmp/subagent-broker collect --project /path/to/project --run <run-id>
 /tmp/subagent-broker events --project /path/to/project --run <run-id>
 /tmp/subagent-broker cancel --project /path/to/project --run <run-id>
+/tmp/subagent-broker inbox --project /path/to/project --run <run-id>
+/tmp/subagent-broker send --project /path/to/project --run <run-id> --message <message-id> --answer "answer"
 ```
 
 If the Supervisor itself stops before the Run is terminal, start reconciliation with `recover`. Recovery never treats a reused PID as the original Worker without a matching process start token.
 
-Phase 1 supports `claude-code` only and intentionally limits dispatch to one Task. The Fake Harness remains the deterministic lifecycle test adapter for unit and race tests.
+Phase 3 supports the `claude-code` runtime only. Questions and scope requests use Broker-provided MCP tools; permission requests use a run-local Claude PreToolUse gate. The Fake Harness remains the deterministic lifecycle test adapter for unit and race tests.

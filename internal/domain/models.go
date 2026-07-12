@@ -65,10 +65,23 @@ type Run struct {
 	BaseWorktreeSnapshot WorktreeSnapshot    `json:"base_worktree_snapshot"`
 	Status               RunStatus           `json:"status"`
 	CurrentWave          WaveID              `json:"current_wave,omitempty"`
+	WaveIDs              []WaveID            `json:"wave_ids,omitempty"`
 	TaskIDs              []TaskID            `json:"task_ids"`
 	SupervisorIdentity   *SupervisorIdentity `json:"supervisor_identity,omitempty"`
 	ConfigSnapshot       json.RawMessage     `json:"config_snapshot"`
 	SchemaVersion        string              `json:"schema_version"`
+}
+
+type RunPlan struct {
+	SchemaVersion string              `json:"schema_version"`
+	Waves         []WavePlan          `json:"waves"`
+	FinalChecks   []ValidationCommand `json:"final_checks,omitempty"`
+}
+
+type WavePlan struct {
+	WaveID            WaveID              `json:"wave_id"`
+	IntegrationChecks []ValidationCommand `json:"integration_checks,omitempty"`
+	Tasks             []Task              `json:"tasks"`
 }
 
 type WaveStatus string
@@ -110,6 +123,8 @@ type Wave struct {
 	EndedAt           *time.Time          `json:"ended_at,omitempty"`
 	IntegrationChecks []ValidationCommand `json:"integration_checks"`
 	BarrierResult     BarrierResult       `json:"barrier_result,omitempty"`
+	BarrierAccepted   bool                `json:"barrier_accepted,omitempty"`
+	BarrierReason     string              `json:"barrier_acceptance_reason,omitempty"`
 }
 
 type Task struct {

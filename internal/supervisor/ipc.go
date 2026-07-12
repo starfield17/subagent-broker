@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/vnai/subagent-broker/internal/message"
 )
 
 type Request struct {
@@ -58,12 +60,116 @@ func (s *Service) handleRequest(ctx context.Context, request Request) Response {
 		response.OK = true
 		response.Result = s.Snapshot()
 	case "cancel":
-		if err := s.RequestCancel(ctx); err != nil {
+		var params struct {
+			TaskID   string `json:"task_id"`
+			WorkerID string `json:"worker_id"`
+			WaveID   string `json:"wave_id"`
+		}
+		_ = json.Unmarshal(request.Params, &params)
+		var err error
+		if params.TaskID != "" {
+			err = s.RequestCancelTask(ctx, params.TaskID)
+		} else if params.WorkerID != "" {
+			taskID := ""
+			for _, runtime := range s.Snapshot().Tasks {
+				if runtime.Worker != nil && string(runtime.Worker.WorkerID) == params.WorkerID {
+					taskID = string(runtime.Task.TaskID)
+					break
+				}
+			}
+			if taskID == "" {
+				err = fmt.Errorf("worker %q was not found", params.WorkerID)
+			} else {
+				err = s.RequestCancelTask(ctx, taskID)
+			}
+		} else if params.WaveID != "" {
+			found := false
+			for _, runtime := range s.Snapshot().Tasks {
+				if string(runtime.Task.WaveID) == params.WaveID {
+					found = true
+					if runtime.Worker != nil && runtime.Worker.ExitCode == nil {
+						if cancelErr := s.RequestCancelTask(ctx, string(runtime.Task.TaskID)); cancelErr != nil {
+							err = cancelErr
+						}
+					}
+				}
+			}
+			if !found {
+				err = fmt.Errorf("Wave %q was not found", params.WaveID)
+			}
+		} else {
+			err = s.RequestCancel(ctx)
+		}
+		if err != nil {
 			response.Error = err.Error()
 			return response
 		}
 		response.OK = true
 		response.Result = s.Snapshot()
+	case "inbox":
+		var params struct {
+			IncludeResolved bool `json:"include_resolved"`
+		}
+		_ = json.Unmarshal(request.Params, &params)
+		response.OK = true
+		response.Result = s.Inbox(params.IncludeResolved)
+	case "send":
+		var params struct {
+			TaskID string `json:"task_id"`
+			Text   string `json:"text"`
+		}
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		result, err := s.SendInstruction(ctx, params.TaskID, params.Text)
+		if err != nil {
+			response.Error = err.Error()
+			response.Result = result
+			return response
+		}
+		response.OK = true
+		response.Result = result
+	case "resolve_message":
+		var params struct {
+			MessageID  string             `json:"message_id"`
+			Resolution message.Resolution `json:"resolution"`
+		}
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		if err := s.ResolveMessage(params.MessageID, params.Resolution); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		response.OK = true
+		response.Result = s.Snapshot()
+	case "worker_request":
+		var params struct {
+			TaskID   string           `json:"task_id"`
+			WorkerID string           `json:"worker_id"`
+			Type     message.Type     `json:"type"`
+			Category message.Category `json:"category"`
+			Payload  json.RawMessage  `json:"payload"`
+		}
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		var payload any
+		if err := json.Unmarshal(params.Payload, &payload); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		resolution, id, err := s.RequestMessage(ctx, params.TaskID, params.WorkerID, params.Type, params.Category, payload)
+		if err != nil {
+			response.Error = err.Error()
+			response.Result = map[string]any{"message_id": id}
+			return response
+		}
+		response.OK = true
+		response.Result = map[string]any{"message_id": id, "resolution": resolution}
 	case "wait":
 		var params struct {
 			Timeout time.Duration `json:"timeout"`

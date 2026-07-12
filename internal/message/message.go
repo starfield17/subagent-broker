@@ -61,7 +61,46 @@ type Message struct {
 	Category      Category        `json:"category,omitempty"`
 	Status        Status          `json:"status"`
 	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+	InReplyTo     string          `json:"in_reply_to,omitempty"`
+	DeliveryMode  string          `json:"delivery_mode,omitempty"`
+	Error         string          `json:"error,omitempty"`
 	Payload       json.RawMessage `json:"payload"`
+	Resolution    json.RawMessage `json:"resolution,omitempty"`
+}
+
+type InstructionPayload struct {
+	Text string `json:"text"`
+}
+
+type AnswerPayload struct {
+	Text string `json:"text"`
+}
+
+type ScopeRequestPayload struct {
+	RequestedScope                []string `json:"requested_scope"`
+	Reason                        string   `json:"reason"`
+	Consequence                   string   `json:"consequence"`
+	PartialModifications          string   `json:"partial_modifications"`
+	RelatedTasks                  []string `json:"related_tasks,omitempty"`
+	Recommendation                string   `json:"recommendation,omitempty"`
+	RequiresPublicInterfaceChange bool     `json:"requires_public_interface_change,omitempty"`
+}
+
+type PermissionRequestPayload struct {
+	ToolName string          `json:"tool_name"`
+	Input    json.RawMessage `json:"input"`
+}
+
+type DecisionPayload struct {
+	Allowed                    bool   `json:"allowed"`
+	Reason                     string `json:"reason,omitempty"`
+	AllowPublicInterfaceChange bool   `json:"allow_public_interface_change,omitempty"`
+}
+
+type Resolution struct {
+	Answer   string          `json:"answer,omitempty"`
+	Decision DecisionPayload `json:"decision,omitempty"`
 }
 
 type QuestionEnvelope struct {
@@ -88,6 +127,10 @@ func ValidateQuestion(q QuestionEnvelope) error {
 }
 
 func PublishQuestion(taskDir string, q QuestionEnvelope) error {
+	return PublishQuestionID(taskDir, "", q)
+}
+
+func PublishQuestionID(taskDir, messageID string, q QuestionEnvelope) error {
 	if err := ValidateQuestion(q); err != nil {
 		return err
 	}
@@ -125,5 +168,15 @@ func PublishQuestion(taskDir string, q QuestionEnvelope) error {
 	} else {
 		b.WriteString(q.Suggestion + "\n")
 	}
-	return storage.AtomicWriteFile(filepath.Join(taskDir, "question.md"), []byte(b.String()), 0o600)
+	markdown := []byte(b.String())
+	if messageID != "" {
+		archive := filepath.Join(taskDir, "questions", messageID)
+		if err := storage.AtomicWriteFile(filepath.Join(archive, "question.meta.json"), append(meta, '\n'), 0o600); err != nil {
+			return err
+		}
+		if err := storage.AtomicWriteFile(filepath.Join(archive, "question.md"), markdown, 0o600); err != nil {
+			return err
+		}
+	}
+	return storage.AtomicWriteFile(filepath.Join(taskDir, "question.md"), markdown, 0o600)
 }

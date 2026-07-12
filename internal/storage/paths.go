@@ -18,16 +18,20 @@ type ProjectPaths struct {
 }
 
 type RunPaths struct {
-	Root       string
-	Run        string
-	State      string
-	Status     string
-	Events     string
-	RunSummary string
-	Supervisor string
-	Control    string
-	Waves      string
-	Tasks      string
+	Root         string
+	Run          string
+	State        string
+	Status       string
+	Events       string
+	RunSummary   string
+	Supervisor   string
+	Control      string
+	Waves        string
+	Tasks        string
+	Plan         string
+	Baseline     string
+	Messages     string
+	Verification string
 }
 
 type WavePaths struct {
@@ -35,6 +39,8 @@ type WavePaths struct {
 	Wave         string
 	Barrier      string
 	Verification string
+	Preflight    string
+	Baseline     string
 }
 
 type TaskPaths struct {
@@ -50,6 +56,7 @@ type TaskPaths struct {
 	Report        string
 	ReportMeta    string
 	ValidationDir string
+	QuestionsDir  string
 }
 
 func (l Layout) HomePaths() HomePaths {
@@ -77,6 +84,8 @@ func (l Layout) RunPaths(projectKey, runID string) (RunPaths, error) {
 		Root: root, Run: filepath.Join(root, "run.json"), State: filepath.Join(root, "state.json"), Status: filepath.Join(root, "status.md"),
 		Events: filepath.Join(root, "events.jsonl"), RunSummary: filepath.Join(root, "run-summary.md"), Supervisor: filepath.Join(root, "supervisor.json"),
 		Control: filepath.Join(root, "control"), Waves: filepath.Join(root, "waves"), Tasks: filepath.Join(root, "tasks"),
+		Plan: filepath.Join(root, "plan.json"), Baseline: filepath.Join(root, "baseline.json"), Messages: filepath.Join(root, "messages.jsonl"),
+		Verification: filepath.Join(root, "verification.json"),
 	}, nil
 }
 
@@ -85,7 +94,7 @@ func (l Layout) WavePaths(projectKey, runID, waveID string) (WavePaths, error) {
 	if err != nil {
 		return WavePaths{}, err
 	}
-	return WavePaths{Root: root, Wave: filepath.Join(root, "wave.json"), Barrier: filepath.Join(root, "barrier.md"), Verification: filepath.Join(root, "verification.json")}, nil
+	return WavePaths{Root: root, Wave: filepath.Join(root, "wave.json"), Barrier: filepath.Join(root, "barrier.md"), Verification: filepath.Join(root, "verification.json"), Preflight: filepath.Join(root, "preflight.json"), Baseline: filepath.Join(root, "baseline.json")}, nil
 }
 
 func (l Layout) TaskPaths(projectKey, runID, taskID string) (TaskPaths, error) {
@@ -97,6 +106,6 @@ func (l Layout) TaskPaths(projectKey, runID, taskID string) (TaskPaths, error) {
 		Root: root, Task: filepath.Join(root, "task.json"), Contract: filepath.Join(root, "contract.md"), ContractMeta: filepath.Join(root, "contract.meta.json"),
 		Events: filepath.Join(root, "events.jsonl"), Stdout: filepath.Join(root, "stdout.log"), Stderr: filepath.Join(root, "stderr.log"),
 		Question: filepath.Join(root, "question.md"), QuestionMeta: filepath.Join(root, "question.meta.json"), Report: filepath.Join(root, "report.md"),
-		ReportMeta: filepath.Join(root, "report.meta.json"), ValidationDir: filepath.Join(root, "validation"),
+		ReportMeta: filepath.Join(root, "report.meta.json"), ValidationDir: filepath.Join(root, "validation"), QuestionsDir: filepath.Join(root, "questions"),
 	}, nil
 }

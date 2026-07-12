@@ -1,0 +1,25 @@
+{
+  "schema_version": "v1alpha1",
+  "waves": [
+    {
+      "wave_id": "wave-1",
+      "tasks": [
+        {
+          "task_id": "scope-smoke",
+          "title": "Request scope before writing",
+          "objective": "Call the subagent-broker request_scope_expansion MCP tool to request write access to expanded.txt. Do not create it until approved. After approval, create expanded.txt containing the single line scope-approved.",
+          "completion_criteria": ["Scope expansion is approved", "expanded.txt contains scope-approved"],
+          "write_scope": ["initial-placeholder.txt"],
+          "forbidden_scope": [],
+          "known_read_dependencies": [],
+          "parallel_responsibilities": {},
+          "validation_commands": [{"command": "grep -Fxq scope-approved expanded.txt", "scope": "local"}],
+          "depends_on": [],
+          "allow_nested_agents": false,
+          "allow_public_interface_change": false
+        }
+      ]
+    }
+  ],
+  "final_checks": [{"command": "grep -Fxq scope-approved expanded.txt", "scope": "run"}]
+}
