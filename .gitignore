@@ -1,0 +1,13 @@
+# Go build/test artifacts
+bin/
+coverage.out
+*.test
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Broker runtime state belongs outside the repository
+.subagent-broker/
+.subagent/
