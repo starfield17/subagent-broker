@@ -80,3 +80,37 @@ func TerminateGracefully(ctx context.Context, identity Identity) error {
 func KillTree(ctx context.Context, identity Identity) error {
 	return Signal(ctx, identity, syscall.SIGKILL)
 }
+
+// GroupMembers returns processes that currently share identity's process group.
+// Processes that disappear mid-scan are skipped rather than failing the call.
+func GroupMembers(ctx context.Context, identity Identity) ([]Identity, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if identity.ProcessGroupToken == "" {
+		return nil, fmt.Errorf("incomplete process group identity")
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	var members []Identity
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		member, err := Inspect(ctx, pid)
+		if err != nil {
+			// Tolerate races where a process exits during the scan.
+			continue
+		}
+		if member.ProcessGroupToken == identity.ProcessGroupToken {
+			members = append(members, member)
+		}
+	}
+	return members, nil
+}

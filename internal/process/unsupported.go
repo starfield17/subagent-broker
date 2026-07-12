@@ -27,3 +27,7 @@ func TerminateGracefully(_ context.Context, _ Identity) error {
 func KillTree(_ context.Context, _ Identity) error {
 	return fmt.Errorf("process-tree termination is not implemented on this platform")
 }
+
+func GroupMembers(_ context.Context, _ Identity) ([]Identity, error) {
+	return nil, fmt.Errorf("process group membership is not implemented on this platform")
+}
