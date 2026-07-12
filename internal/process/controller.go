@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -270,16 +268,7 @@ func pidsOf(members []Identity) []int {
 }
 
 func processMissing(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "no such process") ||
-		strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "no such file")
+	return IsProcessNotFound(err)
 }
 
 func isUnsupported(err error) bool {

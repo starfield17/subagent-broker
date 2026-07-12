@@ -196,11 +196,21 @@ func TestDefaultCancelPolicyPositive(t *testing.T) {
 }
 
 func TestProcessMissingHelpers(t *testing.T) {
-	if !isProcessMissing(os.ErrNotExist) {
-		t.Fatal("expected missing")
+	if !process.IsProcessNotFound(os.ErrNotExist) {
+		t.Fatal("expected missing for os.ErrNotExist")
 	}
-	if isProcessMissing(errors.New("permission denied")) {
+	if !process.IsProcessNotFound(process.ErrProcessNotFound) {
+		t.Fatal("expected missing for ErrProcessNotFound")
+	}
+	if process.IsProcessNotFound(errors.New("permission denied")) {
 		t.Fatal("permission is not missing")
+	}
+	// Natural-language strings must NOT count as process-not-found.
+	if process.IsProcessNotFound(errors.New("no such process")) {
+		t.Fatal("string-only errors must not prove process missing")
+	}
+	if process.IsProcessNotFound(errors.New("no such file or directory")) {
+		t.Fatal("generic no-such-file must not prove process missing")
 	}
 	_ = context.Background()
 }

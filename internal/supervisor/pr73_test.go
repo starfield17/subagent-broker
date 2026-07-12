@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -66,12 +67,36 @@ func TestRecoveryExplicitNotExistIsExited(t *testing.T) {
 			NativeSessionID: "sess-1",
 		},
 	}
-	d := ClassifyRecovery(base, process.Identity{}, os.ErrNotExist, true)
+	// Prefer typed sentinel from process package.
+	d := ClassifyRecovery(base, process.Identity{}, fmt.Errorf("%w: pid 42", process.ErrProcessNotFound), true)
 	if d.Class != RecoveryExitedResumable {
 		t.Fatalf("class=%s", d.Class)
 	}
 	if d.Process != state.ProcessExited {
 		t.Fatalf("process=%s", d.Process)
+	}
+	// os.ErrNotExist remains accepted via process.IsProcessNotFound for Inspect unwrap.
+	d = ClassifyRecovery(base, process.Identity{}, os.ErrNotExist, true)
+	if d.Class != RecoveryExitedResumable {
+		t.Fatalf("os.ErrNotExist class=%s", d.Class)
+	}
+}
+
+func TestRecoveryStringErrorIsInspectUnknown(t *testing.T) {
+	base := TaskState{
+		Task: domain.Task{TaskID: "task-a", Status: state.TaskRunning},
+		Worker: &domain.WorkerSession{
+			WorkerID: "w1", TaskID: "task-a", PID: 42, ProcessStartToken: "tok",
+			NativeSessionID: "sess-1",
+		},
+	}
+	// Free-form "no such process" text is NOT proof of exit.
+	d := ClassifyRecovery(base, process.Identity{}, errors.New("no such process"), true)
+	if d.Class != RecoveryInspectUnknown {
+		t.Fatalf("class=%s want inspect_unknown", d.Class)
+	}
+	if d.ResumeSessionID != "" {
+		t.Fatal("must not resume on string-only error")
 	}
 }
 

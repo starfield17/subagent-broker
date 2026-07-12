@@ -2,10 +2,7 @@ package supervisor
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
@@ -72,8 +69,9 @@ func ClassifyRecovery(runtime TaskState, inspect process.Identity, inspectErr er
 		decision.Process = state.ProcessUnknown
 		return decision
 	}
-	// Only explicit process-missing proves exit. Permission/IO/temporary failures are unknown.
-	if inspectErr != nil && isProcessMissing(inspectErr) {
+	// Only typed process-not-found proves exit. Permission/IO/temporary failures are unknown.
+	// Do not parse error strings here — process.IsProcessNotFound is the sole predicate.
+	if inspectErr != nil && process.IsProcessNotFound(inspectErr) {
 		return exitedDecision(decision, w, harnessSupportsResume, "worker process is gone")
 	}
 	if inspectErr != nil {
@@ -120,31 +118,6 @@ func recoveryTaskTerminal(runtime TaskState) bool {
 	default:
 		return false
 	}
-}
-
-// isProcessMissing reports whether err proves the OS process no longer exists.
-// Permission denied, temporary IO failures, and other inspect errors must NOT
-// be treated as proof of exit (those map to inspect_unknown).
-func isProcessMissing(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return true
-	}
-	// syscall.ESRCH and platform "no such process" strings.
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "permission denied") ||
-		strings.Contains(msg, "operation not permitted") ||
-		strings.Contains(msg, "access denied") ||
-		strings.Contains(msg, "eacces") ||
-		strings.Contains(msg, "eperm") {
-		return false
-	}
-	return strings.Contains(msg, "no such process") ||
-		strings.Contains(msg, "esrch") ||
-		// /proc/<pid> gone often surfaces as no such file/directory for that path.
-		(strings.Contains(msg, "no such file") && !strings.Contains(msg, "permission"))
 }
 
 func (s *Service) reconcileRecovery(ctx context.Context) error {

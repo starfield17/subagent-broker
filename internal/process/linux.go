@@ -4,6 +4,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,6 +29,11 @@ func Inspect(_ context.Context, pid int) (Identity, error) {
 	}
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
+		// Only /proc/<pid> absence is process-not-found. Other ReadFile failures
+		// (permission, IO) propagate unchanged so Recovery can classify inspect_unknown.
+		if errors.Is(err, os.ErrNotExist) {
+			return Identity{}, fmt.Errorf("%w: pid %d", ErrProcessNotFound, pid)
+		}
 		return Identity{}, err
 	}
 	closeParen := strings.LastIndex(string(data), ")")
