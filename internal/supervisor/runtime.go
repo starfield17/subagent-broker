@@ -543,25 +543,44 @@ func (s *Service) execute(ctx context.Context) error {
 		if err != nil {
 			return s.finishRun(domain.RunFailed, err.Error())
 		}
-		if verification.Result == domain.BarrierCancelled {
+		switch verification.Result {
+		case domain.BarrierCancelled:
 			return s.finishRun(domain.RunCancelled, "Wave cancelled")
-		}
-		if verification.Result != domain.BarrierPassed {
+		case domain.BarrierFailed:
+			return s.finishRun(domain.RunFailed, "Wave barrier failed")
+		case domain.BarrierBlocked:
+			// Blocked is not a hard Run failure; stop progression until Main Agent unblocks.
+			return s.finishRun(domain.RunDegraded, "Wave barrier blocked: pending decisions or final-blocked tasks")
+		case domain.BarrierPassedWithWarnings:
+			// Do not auto-continue; require AcceptBarrierWarnings before next Wave.
+			return s.finishRun(domain.RunDegraded, "Wave barrier passed_with_warnings; acceptance required before continuing")
+		case domain.BarrierPassed:
+			// Wave already marked verified inside runBarrier.
+			if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.WaveVerified, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID}}); err != nil {
+				return err
+			}
+		default:
 			return s.finishRun(domain.RunFailed, "Wave barrier ended with "+string(verification.Result))
-		}
-		if err := s.setWaveStatus(domain.WaveVerified); err != nil {
-			return err
-		}
-		if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.WaveVerified, Severity: "info", Payload: map[string]any{"wave_id": planned.WaveID}}); err != nil {
-			return err
 		}
 	}
 	final, err := s.runFinalVerification(ctx)
 	if err != nil {
 		return s.finishRun(domain.RunFailed, err.Error())
 	}
-	if final.Result != domain.BarrierPassed {
+	if final.Result != domain.BarrierPassed && final.Result != domain.BarrierPassedWithWarnings {
 		return s.finishRun(domain.RunFailed, "final verification ended with "+string(final.Result))
+	}
+	if final.Result == domain.BarrierPassedWithWarnings {
+		return s.finishRun(domain.RunDegraded, "final verification has warnings requiring acceptance")
+	}
+	// Ensure every wave is verified (or accepted) before completed.
+	for _, w := range s.Snapshot().Waves {
+		if w.Status != domain.WaveVerified {
+			return s.finishRun(domain.RunDegraded, fmt.Sprintf("wave %s is %s, not verified", w.WaveID, w.Status))
+		}
+		if w.BarrierResult == domain.BarrierPassedWithWarnings && !w.BarrierAccepted {
+			return s.finishRun(domain.RunDegraded, fmt.Sprintf("wave %s warnings not accepted", w.WaveID))
+		}
 	}
 	return s.finishRun(domain.RunCompleted, "")
 }
@@ -737,6 +756,9 @@ func (s *Service) preflightWave(ctx context.Context, planned domain.WavePlan) er
 	if err := storage.AtomicWriteJSON(paths.Preflight, result, 0o600); err != nil {
 		return err
 	}
+	if err := storage.AtomicWriteFile(filepath.Join(paths.Root, "preflight.md"), []byte(wave.RenderPreflightMarkdown(result)), 0o600); err != nil {
+		return err
+	}
 	if !result.Allowed {
 		return fmt.Errorf("Wave %q preflight rejected: %s", planned.WaveID, formatPreflightIssues(result.Issues))
 	}
@@ -755,73 +777,20 @@ func (s *Service) runBarrier(ctx context.Context, planned domain.WavePlan, basel
 		return wave.Verification{}, err
 	}
 
-	cancelled := false
-	reports := make([]wave.ReportAssessment, 0, len(planned.Tasks))
-	for _, item := range planned.Tasks {
-		runtime, ok := s.taskState(item.TaskID)
-		if !ok {
-			reports = append(reports, wave.ReportAssessment{
-				TaskID:  item.TaskID,
-				Present: false,
-				Error:   "missing task state: " + string(item.TaskID),
-			})
-			continue
-		}
-		if runtime.Task.Status == state.TaskCancelled {
-			cancelled = true
-		}
-		// TODO(pr1): reread report.meta.json / report.md from disk and validate identity.
-		// TODO(pr1): collect pending decisions from the message router for this Wave.
-		// TODO(pr1): collect high-risk changes from the actual workspace diff.
-		assessment := wave.ReportAssessment{
-			TaskID:        item.TaskID,
-			RuntimeStatus: runtime.Task.Status,
-			Present:       true,
-			MetaValid:     true,
-			MarkdownValid: true,
-			IdentityValid: true,
-		}
-		switch runtime.Task.Status {
-		case state.TaskVerifiedSuccess, state.TaskVerifiedPartial, state.TaskBlocked, state.TaskCancelled,
-			state.TaskFailed, state.TaskVerificationFailed:
-		default:
-			assessment.Error = fmt.Sprintf("task %s failed to verify: %s", item.TaskID, runtime.Task.Status)
-		}
-		reports = append(reports, assessment)
-	}
-
-	checks := make([]wave.CheckResult, 0, len(planned.IntegrationChecks))
-	for index, check := range planned.IntegrationChecks {
-		checks = append(checks, s.runCheck(ctx, check, filepath.Join(s.wavePaths(planned.WaveID).Root, fmt.Sprintf("check-%03d.log", index+1))))
-	}
-	after, err := verify.CaptureWorkspace(s.projectRoot(), s.config.BrokerHome)
+	input, err := s.collectBarrierInputs(ctx, planned, baseline)
 	if err != nil {
 		return wave.Verification{}, err
 	}
-	changed := verify.ChangedFiles(baseline, after)
-	leases := map[string][]string{}
-	for _, item := range planned.Tasks {
-		runtime, ok := s.taskState(item.TaskID)
-		if ok {
-			leases[string(item.TaskID)] = append([]string(nil), runtime.Task.WriteScope...)
-		}
-	}
-	scopeAudit, err := verify.AuditScopes(changed, leases)
-	if err != nil {
+	input.ExistingErrors = append(input.ExistingErrors, s.collectQueuedInstructionErrors(planned)...)
+	inputHash := hashBarrierInputs(input)
+	if err := storage.AtomicWriteJSON(filepath.Join(s.wavePaths(planned.WaveID).Root, "barrier-input.json"), input, 0o600); err != nil {
 		return wave.Verification{}, err
 	}
 
-	verification := wave.EvaluateBarrier(wave.BarrierInputs{
-		WaveID:       planned.WaveID,
-		Cancelled:    cancelled,
-		Reports:      reports,
-		ChangedFiles: changed,
-		ScopeAudit:   scopeAudit,
-		Checks:       checks,
-		// Pending / HighRiskChanges intentionally empty until PR1 collectors land.
-	}, time.Now().UTC())
+	verification := wave.EvaluateBarrier(input, time.Now().UTC())
 	verification.SchemaVersion = SchemaVersion
 	verification.StartedAt = started
+	verification.InputHash = inputHash
 
 	paths := s.wavePaths(planned.WaveID)
 	if err := storage.AtomicWriteJSON(paths.Verification, verification, 0o600); err != nil {
@@ -830,19 +799,40 @@ func (s *Service) runBarrier(ctx context.Context, planned domain.WavePlan, basel
 	if err := storage.AtomicWriteFile(paths.Barrier, []byte(wave.RenderBarrier(verification)), 0o600); err != nil {
 		return verification, err
 	}
+	_ = storage.AtomicWriteFile(filepath.Join(paths.Root, "verification.md"), []byte(wave.RenderBarrier(verification)), 0o600)
+
+	waveStatus := domain.WaveBarrier
+	switch verification.Result {
+	case domain.BarrierPassed:
+		waveStatus = domain.WaveVerified
+	case domain.BarrierPassedWithWarnings:
+		waveStatus = domain.WaveWaiting
+	case domain.BarrierBlocked:
+		waveStatus = domain.WaveBlocked
+	case domain.BarrierFailed:
+		waveStatus = domain.WaveFailed
+	case domain.BarrierCancelled:
+		waveStatus = domain.WaveCancelled
+	}
 	if err := s.commitMutate(ctx, event.Input{
 		Source: "supervisor", Type: event.WaveStateChanged, Severity: "info",
 		Payload: map[string]any{
 			"wave_id":        string(planned.WaveID),
 			"from":           string(domain.WaveBarrier),
-			"to":             string(domain.WaveBarrier),
+			"to":             string(waveStatus),
 			"reason":         "barrier_result",
 			"barrier_result": string(verification.Result),
+			"input_hash":     inputHash,
 		},
 	}, func(candidate *Snapshot) error {
 		for index := range candidate.Waves {
 			if candidate.Waves[index].WaveID == planned.WaveID {
 				candidate.Waves[index].BarrierResult = verification.Result
+				candidate.Waves[index].Status = waveStatus
+				if waveStatus == domain.WaveVerified || waveStatus == domain.WaveFailed || waveStatus == domain.WaveCancelled {
+					now := time.Now().UTC()
+					candidate.Waves[index].EndedAt = &now
+				}
 				candidate.Wave = candidate.Waves[index]
 				break
 			}
@@ -852,7 +842,101 @@ func (s *Service) runBarrier(ctx context.Context, planned domain.WavePlan, basel
 	}); err != nil {
 		return verification, err
 	}
+	_ = s.appendEvent(event.Input{Source: "supervisor", Type: "barrier.evaluated", Severity: "info", Payload: map[string]any{
+		"wave_id": string(planned.WaveID), "result": string(verification.Result), "input_hash": inputHash,
+	}})
 	return verification, nil
+}
+
+// AcceptBarrierWarnings records formal acceptance of passed_with_warnings for a Wave.
+func (s *Service) AcceptBarrierWarnings(waveID, actor, reason string) error {
+	if strings.TrimSpace(actor) == "" || strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("actor and reason are required to accept barrier warnings")
+	}
+	paths := s.wavePaths(domain.WaveID(waveID))
+	data, err := os.ReadFile(paths.Verification)
+	if err != nil {
+		return fmt.Errorf("read verification for %s: %w", waveID, err)
+	}
+	var verification wave.Verification
+	if err := json.Unmarshal(data, &verification); err != nil {
+		return err
+	}
+	if verification.Result != domain.BarrierPassedWithWarnings {
+		return fmt.Errorf("wave %s barrier result is %s, not passed_with_warnings", waveID, verification.Result)
+	}
+	// Recompute current input hash; acceptance binds to the stored verification input_hash.
+	if verification.InputHash == "" {
+		return fmt.Errorf("wave %s verification lacks input_hash; re-run barrier", waveID)
+	}
+	inputData, err := os.ReadFile(filepath.Join(paths.Root, "barrier-input.json"))
+	if err != nil {
+		return fmt.Errorf("barrier input missing for %s; re-run barrier", waveID)
+	}
+	var input wave.BarrierInputs
+	if err := json.Unmarshal(inputData, &input); err != nil {
+		return err
+	}
+	if hashBarrierInputs(input) != verification.InputHash {
+		return fmt.Errorf("barrier input changed since evaluation; acceptance rejected (re-run barrier)")
+	}
+	now := time.Now().UTC()
+	verification.Accepted = true
+	verification.AcceptReason = reason
+	verification.AcceptedBy = actor
+	verification.AcceptedAt = &now
+	if err := storage.AtomicWriteJSON(paths.Verification, verification, 0o600); err != nil {
+		return err
+	}
+	return s.commitMutate(context.Background(), event.Input{
+		Source: "supervisor", Type: "barrier.warnings_accepted", Severity: "info",
+		Payload: map[string]any{
+			"wave_id": waveID, "actor": actor, "reason": reason, "input_hash": verification.InputHash,
+			"from": string(domain.WaveWaiting), "to": string(domain.WaveVerified),
+		},
+	}, func(candidate *Snapshot) error {
+		for index := range candidate.Waves {
+			if string(candidate.Waves[index].WaveID) == waveID {
+				candidate.Waves[index].BarrierAccepted = true
+				candidate.Waves[index].BarrierReason = reason
+				candidate.Waves[index].Status = domain.WaveVerified
+				candidate.Waves[index].EndedAt = &now
+				if candidate.Wave.WaveID == candidate.Waves[index].WaveID {
+					candidate.Wave = candidate.Waves[index]
+				}
+				break
+			}
+		}
+		candidate.UpdatedAt = now
+		return nil
+	})
+}
+
+// RejectBarrierWarnings records rejection of warnings and fails the Wave.
+func (s *Service) RejectBarrierWarnings(waveID, actor, reason string) error {
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("reason is required to reject barrier warnings")
+	}
+	return s.commitMutate(context.Background(), event.Input{
+		Source: "supervisor", Type: "barrier.warnings_rejected", Severity: "error",
+		Payload: map[string]any{"wave_id": waveID, "actor": actor, "reason": reason, "from": string(domain.WaveWaiting), "to": string(domain.WaveFailed)},
+	}, func(candidate *Snapshot) error {
+		for index := range candidate.Waves {
+			if string(candidate.Waves[index].WaveID) == waveID {
+				candidate.Waves[index].Status = domain.WaveFailed
+				candidate.Waves[index].BarrierAccepted = false
+				candidate.Waves[index].BarrierReason = reason
+				now := time.Now().UTC()
+				candidate.Waves[index].EndedAt = &now
+				if candidate.Wave.WaveID == candidate.Waves[index].WaveID {
+					candidate.Wave = candidate.Waves[index]
+				}
+				break
+			}
+		}
+		candidate.UpdatedAt = time.Now().UTC()
+		return nil
+	})
 }
 
 func (s *Service) runCheck(ctx context.Context, check domain.ValidationCommand, logPath string) wave.CheckResult {
@@ -960,7 +1044,14 @@ func (s *Service) waveAlreadyVerified(id domain.WaveID) bool {
 	defer s.mu.Unlock()
 	for _, value := range s.snapshot.Waves {
 		if value.WaveID == id {
-			return value.Status == domain.WaveVerified
+			if value.Status == domain.WaveVerified {
+				return true
+			}
+			// Accepted warnings also count as complete for progression after AcceptBarrierWarnings.
+			if value.BarrierResult == domain.BarrierPassedWithWarnings && value.BarrierAccepted {
+				return true
+			}
+			return false
 		}
 	}
 	return false
@@ -1054,13 +1145,13 @@ func (s *Service) cancelTask(runtime *TaskState, reason string) error {
 }
 
 func (s *Service) finishRun(status domain.RunStatus, reason string) error {
-	// Expire all pending messages across tasks when the Run ends.
-	if status == domain.RunFailed || status == domain.RunCancelled || status == domain.RunDegraded || status == domain.RunCompleted {
+	// Expire all pending messages across tasks when the Run ends hard.
+	if status == domain.RunFailed || status == domain.RunCancelled || status == domain.RunCompleted {
 		for _, runtime := range s.Snapshot().Tasks {
 			s.onTaskTerminalMessages(string(runtime.Task.TaskID), "run ended: "+string(status))
 		}
 	}
-	if status == domain.RunFailed || status == domain.RunDegraded {
+	if status == domain.RunFailed {
 		if err := s.setWaveStatus(domain.WaveFailed); err != nil {
 			return err
 		}
@@ -1068,6 +1159,15 @@ func (s *Service) finishRun(status domain.RunStatus, reason string) error {
 		if err := s.setWaveStatus(domain.WaveCancelled); err != nil {
 			return err
 		}
+	}
+	// Aggregate durable summary before terminal status.
+	if summary, err := s.buildRunSummary(s.runBaseline); err == nil {
+		summary.RunStatus = status
+		if writeErr := s.writeRunSummary(summary); writeErr != nil && status == domain.RunCompleted {
+			return writeErr
+		}
+	} else if status == domain.RunCompleted {
+		return fmt.Errorf("build run summary: %w", err)
 	}
 	if err := s.setRunStatus(status, reason); err != nil {
 		return err

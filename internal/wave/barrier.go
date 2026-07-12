@@ -16,18 +16,24 @@ type CheckResult struct {
 }
 
 type Verification struct {
-	SchemaVersion string               `json:"schema_version"`
-	WaveID        domain.WaveID        `json:"wave_id"`
-	StartedAt     time.Time            `json:"started_at"`
-	EndedAt       time.Time            `json:"ended_at"`
-	Result        domain.BarrierResult `json:"result"`
-	ChangedFiles  []string             `json:"changed_files"`
-	ScopeAudit    verify.ScopeAudit    `json:"scope_audit"`
-	Checks        []CheckResult        `json:"checks,omitempty"`
-	Warnings      []string             `json:"warnings,omitempty"`
-	Errors        []string             `json:"errors,omitempty"`
-	Accepted      bool                 `json:"accepted,omitempty"`
-	AcceptReason  string               `json:"acceptance_reason,omitempty"`
+	SchemaVersion   string               `json:"schema_version"`
+	WaveID          domain.WaveID        `json:"wave_id"`
+	StartedAt       time.Time            `json:"started_at"`
+	EndedAt         time.Time            `json:"ended_at"`
+	Result          domain.BarrierResult `json:"result"`
+	InputHash       string               `json:"input_hash,omitempty"`
+	ChangedFiles    []string             `json:"changed_files"`
+	ScopeAudit      verify.ScopeAudit    `json:"scope_audit"`
+	Checks          []CheckResult        `json:"checks,omitempty"`
+	Warnings        []string             `json:"warnings,omitempty"`
+	Errors          []string             `json:"errors,omitempty"`
+	PendingMessages []string             `json:"pending_messages,omitempty"`
+	HighRiskChanges []HighRiskChange     `json:"high_risk_changes,omitempty"`
+	Reports         []ReportAssessment   `json:"reports,omitempty"`
+	Accepted        bool                 `json:"accepted,omitempty"`
+	AcceptReason    string               `json:"acceptance_reason,omitempty"`
+	AcceptedAt      *time.Time           `json:"accepted_at,omitempty"`
+	AcceptedBy      string               `json:"accepted_by,omitempty"`
 }
 
 func RenderBarrier(value Verification) string {
