@@ -800,7 +800,18 @@ func (s *Service) execute(ctx context.Context) error {
 		return s.finishRun(domain.RunFailed, "final verification ended with "+string(final.Result))
 	}
 	if final.Result == domain.BarrierPassedWithWarnings {
-		return s.finishRun(domain.RunDegraded, "final verification has warnings requiring acceptance")
+		if final.Accepted {
+			// Already accepted via AcceptFinalWarnings; fall through to complete.
+		} else {
+			// Non-terminal wait: keep Supervisor/IPC alive for accept/reject.
+			if err := s.setRunStatus(domain.RunBarrier, "final verification has warnings; acceptance required before run completion"); err != nil {
+				return err
+			}
+			_ = s.appendEvent(event.Input{Source: "supervisor", Type: "final_verification.awaiting_acceptance", Severity: "warning", Payload: map[string]any{
+				"input_hash": final.InputHash, "result": string(final.Result),
+			}})
+			return errAwaitingDecision
+		}
 	}
 	// Ensure every wave is verified (or accepted) before completed.
 	for _, w := range s.Snapshot().Waves {
@@ -821,11 +832,13 @@ func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) erro
 	sem := make(chan struct{}, s.config.MaxConcurrency)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var firstErr error
+	var errs []error
 	for _, taskID := range taskIDs(planned.Tasks) {
 		runtime, ok := s.taskState(taskID)
-		// Never re-run terminal tasks or orphaned workers (no second concurrent Worker).
-		if !ok || recoveryTaskTerminal(runtime) || runtime.Dimensions.Process == state.ProcessOrphaned {
+		// Never re-run terminal, orphaned, or unknown-process tasks.
+		if !ok || recoveryTaskTerminal(runtime) ||
+			runtime.Dimensions.Process == state.ProcessOrphaned ||
+			runtime.Dimensions.Process == state.ProcessUnknown {
 			continue
 		}
 		if !s.AcceptingWork() {
@@ -840,24 +853,23 @@ func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) erro
 				return
 			}
 			defer func() { <-sem }()
+			// executeTask owns final Task persistence; do not saveRuntime a stale local copy.
 			if err := s.executeTask(ctx, &runtime); err != nil {
 				mu.Lock()
-				if firstErr == nil && !s.AcceptingWork() {
-					firstErr = err
-				}
+				errs = append(errs, fmt.Errorf("task %s: %w", runtime.Task.TaskID, err))
 				mu.Unlock()
 			}
-			_ = s.saveRuntime(runtime)
 		}(runtime)
 	}
 	wg.Wait()
 	if !s.AcceptingWork() {
-		if firstErr != nil {
-			return firstErr
+		joined := errors.Join(errs...)
+		if joined != nil {
+			return joined
 		}
 		return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, native adapter.NativeEvent, workerID string) {
@@ -1337,13 +1349,42 @@ func (s *Service) runCheck(ctx context.Context, check domain.ValidationCommand, 
 
 func (s *Service) runFinalVerification(ctx context.Context) (wave.Verification, error) {
 	started := time.Now().UTC()
+	input, err := s.collectFinalVerificationInputs(ctx)
+	if err != nil {
+		return wave.Verification{}, err
+	}
+	inputHash := hashBarrierInputs(input)
+	if err := storage.AtomicWriteJSON(filepath.Join(s.runDir, "final-verification-input.json"), input, 0o600); err != nil {
+		return wave.Verification{}, err
+	}
+	value := wave.EvaluateBarrier(input, time.Now().UTC())
+	value.SchemaVersion = SchemaVersion
+	value.StartedAt = started
+	value.InputHash = inputHash
+	// Preserve prior acceptance if facts are unchanged.
+	if prev, readErr := s.readFinalVerification(); readErr == nil && prev.Accepted && prev.InputHash == inputHash {
+		value.Accepted = true
+		value.AcceptReason = prev.AcceptReason
+		value.AcceptedBy = prev.AcceptedBy
+		value.AcceptedAt = prev.AcceptedAt
+	}
+	if err := storage.AtomicWriteJSON(s.paths.Verification, value, 0o600); err != nil {
+		return value, err
+	}
+	_ = s.appendEvent(event.Input{Source: "supervisor", Type: "final_verification.evaluated", Severity: "info", Payload: map[string]any{
+		"result": string(value.Result), "input_hash": inputHash,
+	}})
+	return value, nil
+}
+
+func (s *Service) collectFinalVerificationInputs(ctx context.Context) (wave.BarrierInputs, error) {
 	checks := make([]wave.CheckResult, 0, len(s.plan.FinalChecks))
 	for index, check := range s.plan.FinalChecks {
 		checks = append(checks, s.runCheck(ctx, check, filepath.Join(s.runDir, fmt.Sprintf("final-check-%03d.log", index+1))))
 	}
 	after, err := verify.CaptureWorkspace(s.projectRoot(), s.config.BrokerHome)
 	if err != nil {
-		return wave.Verification{}, err
+		return wave.BarrierInputs{}, err
 	}
 	changed := verify.ChangedFiles(s.runBaseline, after)
 	leases := map[string][]string{}
@@ -1354,20 +1395,135 @@ func (s *Service) runFinalVerification(ctx context.Context) (wave.Verification, 
 	s.mu.Unlock()
 	scopeAudit, err := verify.AuditScopes(changed, leases)
 	if err != nil {
+		return wave.BarrierInputs{}, err
+	}
+	highRisk := classifyHighRiskChanges(changed, scopeAudit)
+	return wave.BarrierInputs{
+		WaveID:          "run-final",
+		ChangedFiles:    changed,
+		ScopeAudit:      scopeAudit,
+		HighRiskChanges: highRisk,
+		Checks:          checks,
+	}, nil
+}
+
+func (s *Service) readFinalVerification() (wave.Verification, error) {
+	data, err := os.ReadFile(s.paths.Verification)
+	if err != nil {
 		return wave.Verification{}, err
 	}
-	value := wave.EvaluateBarrier(wave.BarrierInputs{
-		WaveID:       "run-final",
-		ChangedFiles: changed,
-		ScopeAudit:   scopeAudit,
-		Checks:       checks,
-	}, time.Now().UTC())
-	value.SchemaVersion = SchemaVersion
-	value.StartedAt = started
-	if err := storage.AtomicWriteJSON(s.paths.Verification, value, 0o600); err != nil {
-		return value, err
+	var value wave.Verification
+	if err := json.Unmarshal(data, &value); err != nil {
+		return wave.Verification{}, err
 	}
 	return value, nil
+}
+
+// revalidateFinalCurrentFacts re-collects final verification inputs and compares
+// their hash to the stored verification InputHash.
+func (s *Service) revalidateFinalCurrentFacts(ctx context.Context, expectedHash string) error {
+	if strings.TrimSpace(expectedHash) == "" {
+		return fmt.Errorf("stale_verification: final verification lacks input_hash; re-run final verification")
+	}
+	current, err := s.collectFinalVerificationInputs(ctx)
+	if err != nil {
+		return fmt.Errorf("stale_verification: collect final inputs: %w", err)
+	}
+	if hashBarrierInputs(current) != expectedHash {
+		return fmt.Errorf("stale_verification: final verification inputs changed since evaluation (conflict); re-run final verification")
+	}
+	return nil
+}
+
+// AcceptFinalWarnings records formal acceptance of final verification warnings.
+// Revalidates current facts against the stored input hash before completing the Run.
+func (s *Service) AcceptFinalWarnings(actor, reason string) error {
+	if strings.TrimSpace(actor) == "" || strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("actor and reason are required to accept final verification warnings")
+	}
+	status := s.Snapshot().Run.Status
+	if status != domain.RunBarrier {
+		return fmt.Errorf("run is not awaiting final warning acceptance (status=%s)", status)
+	}
+	for _, w := range s.Snapshot().Waves {
+		if w.Status == domain.WaveWaiting && w.BarrierResult == domain.BarrierPassedWithWarnings && !w.BarrierAccepted {
+			return fmt.Errorf("wave %s is still awaiting barrier acceptance; not final verification", w.WaveID)
+		}
+	}
+	verification, err := s.readFinalVerification()
+	if err != nil {
+		return fmt.Errorf("read final verification: %w", err)
+	}
+	if verification.Result != domain.BarrierPassedWithWarnings || verification.Rejected {
+		return fmt.Errorf("final verification result is %s, not awaiting acceptance", verification.Result)
+	}
+	if verification.Accepted {
+		return s.finishRun(domain.RunCompleted, "final verification warnings already accepted")
+	}
+	if err := s.revalidateFinalCurrentFacts(context.Background(), verification.InputHash); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	verification.Accepted = true
+	verification.AcceptReason = reason
+	verification.AcceptedBy = actor
+	verification.AcceptedAt = &now
+	if err := storage.AtomicWriteJSON(s.paths.Verification, verification, 0o600); err != nil {
+		return err
+	}
+	if err := storage.AtomicWriteJSON(filepath.Join(s.runDir, "final-acceptance.json"), map[string]any{
+		"actor": actor, "reason": reason, "input_hash": verification.InputHash, "accepted_at": now,
+	}, 0o600); err != nil {
+		return err
+	}
+	if err := s.appendEvent(event.Input{Source: "supervisor", Type: "final_verification.warnings_accepted", Severity: "info", Payload: map[string]any{
+		"actor": actor, "reason": reason, "input_hash": verification.InputHash,
+	}}); err != nil {
+		return err
+	}
+	s.signalAdvance()
+	return s.finishRun(domain.RunCompleted, fmt.Sprintf("final verification warnings accepted by %s", actor))
+}
+
+// RejectFinalWarnings rejects final verification warnings and fails the Run.
+func (s *Service) RejectFinalWarnings(actor, reason string) error {
+	if strings.TrimSpace(actor) == "" || strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("actor and reason are required to reject final verification warnings")
+	}
+	status := s.Snapshot().Run.Status
+	if status != domain.RunBarrier {
+		return fmt.Errorf("run is not awaiting final warning acceptance (status=%s)", status)
+	}
+	for _, w := range s.Snapshot().Waves {
+		if w.Status == domain.WaveWaiting && w.BarrierResult == domain.BarrierPassedWithWarnings && !w.BarrierAccepted {
+			return fmt.Errorf("wave %s is still awaiting barrier acceptance; not final verification", w.WaveID)
+		}
+	}
+	verification, err := s.readFinalVerification()
+	if err != nil {
+		return fmt.Errorf("read final verification: %w", err)
+	}
+	if verification.Result != domain.BarrierPassedWithWarnings {
+		return fmt.Errorf("final verification is not awaiting rejection (result=%s)", verification.Result)
+	}
+	if err := s.revalidateFinalCurrentFacts(context.Background(), verification.InputHash); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	verification.Rejected = true
+	verification.RejectReason = reason
+	verification.RejectedBy = actor
+	verification.RejectedAt = &now
+	if err := storage.AtomicWriteJSON(s.paths.Verification, verification, 0o600); err != nil {
+		return err
+	}
+	if err := s.appendEvent(event.Input{Source: "supervisor", Type: "final_verification.warnings_rejected", Severity: "error", Payload: map[string]any{
+		"actor": actor, "reason": reason, "input_hash": verification.InputHash,
+	}}); err != nil {
+		return err
+	}
+	s.signalAdvance()
+	return s.finishRun(domain.RunFailed, fmt.Sprintf("final verification warnings rejected by %s: %s", actor, reason))
 }
 
 func (s *Service) taskState(taskID domain.TaskID) (TaskState, bool) {
@@ -1596,15 +1752,17 @@ func reportAttemptNumber(runtime *TaskState) int {
 }
 
 func (s *Service) finishRun(status domain.RunStatus, reason string) error {
-	// Expire all pending messages across tasks when the Run ends hard.
-	if status == domain.RunFailed || status == domain.RunCancelled || status == domain.RunCompleted {
+	// All terminal Run statuses (including RunDegraded) must expire pending messages.
+	if runTerminal(status) {
+		var expireErrs []error
 		for _, runtime := range s.Snapshot().Tasks {
 			if err := s.onTaskTerminalMessages(string(runtime.Task.TaskID), "run ended: "+string(status)); err != nil {
-				// Fail-closed for completed runs; still proceed for failed/cancelled so status is durable.
-				if status == domain.RunCompleted {
-					return fmt.Errorf("expire messages on run complete: %w", err)
-				}
+				expireErrs = append(expireErrs, err)
 			}
+		}
+		if err := errors.Join(expireErrs...); err != nil {
+			// Fail-closed: cleanup persistence failure must surface for every terminal status.
+			return fmt.Errorf("expire messages on run %s: %w", status, err)
 		}
 	}
 	if status == domain.RunFailed {

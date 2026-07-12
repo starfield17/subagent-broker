@@ -224,6 +224,36 @@ func (s *Service) handleRequest(ctx context.Context, request Request) Response {
 		}
 		response.OK = true
 		response.Result = s.Snapshot()
+	case "final.accept", "final_accept", "accept_final_warnings":
+		var params struct {
+			Actor  string `json:"actor"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		if err := s.AcceptFinalWarnings(params.Actor, params.Reason); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		response.OK = true
+		response.Result = s.Snapshot()
+	case "final.reject", "final_reject", "reject_final_warnings":
+		var params struct {
+			Actor  string `json:"actor"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		if err := s.RejectFinalWarnings(params.Actor, params.Reason); err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		response.OK = true
+		response.Result = s.Snapshot()
 	case "worker_request":
 		var params struct {
 			TaskID   string           `json:"task_id"`

@@ -180,17 +180,15 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		return s.failTask(runtime, "start_session", err)
 	}
 
+	// Only OS Inspect may populate ProcessGroupToken. Never synthesize a PGID:
+	// a fake group token would make identity.Complete() true and could mis-report
+	// tree exit while real children remain.
 	identity := process.Identity{PID: session.PID, StartToken: session.ProcessStartToken}
 	if session.PID > 0 {
 		if inspected, inspectErr := process.Inspect(context.Background(), session.PID); inspectErr == nil {
 			identity = inspected
-		} else if session.ProcessStartToken != "" {
-			// Harness reported a start token but the PID is not inspectable yet
-			// (or is synthetic). Fill ProcessGroupToken so identity is Complete()
-			// for tree confirmation after Exited; missing-process Inspect then
-			// yields TreeExited rather than "incomplete identity → unknown".
-			identity.ProcessGroupToken = "pg:" + session.ProcessStartToken
 		}
+		// Inspect failure keeps identity incomplete (no ProcessGroupToken).
 	}
 
 	s.mu.Lock()
@@ -461,6 +459,27 @@ func (s *Service) runWorkerSession(
 			}
 			exited = nil
 			closing = true
+			// Prefer any already-buffered events before the post-exit drain timer
+			// (select races can otherwise observe Exited first and drop result.submitted).
+			for events != nil {
+				select {
+				case native, ok := <-events:
+					if !ok {
+						events = nil
+						break
+					}
+					s.handleNative(runtime, harness, native, workerID)
+					if native.Kind == event.ResultSubmitted {
+						out.ResultSeen = true
+					}
+					if native.Kind == event.TurnFailed {
+						// keep draining; resultSeen stays false
+					}
+				default:
+					goto exitDrainDone
+				}
+			}
+		exitDrainDone:
 			// Process exited: allow a short drain of trailing events/stderr only.
 			startBoundedDrain()
 		case native, ok := <-events:

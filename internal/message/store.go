@@ -120,9 +120,17 @@ func ReplayDetailed(path string) (ReplayResult, error) {
 			if err := validateMessageLifecycle(previous, value); err != nil {
 				return &ErrJournalCorrupt{MessageID: value.MessageID, Reason: err.Error()}
 			}
-		} else if err := validateMessageStatusFields(value); err != nil {
-			// First complete record for this id must still obey status/resolution rules.
-			return &ErrJournalCorrupt{MessageID: value.MessageID, Reason: err.Error()}
+		} else {
+			// First complete record for this id must obey status/resolution rules and
+			// any DeliveryMode must be a legal first routing assignment.
+			if err := validateMessageStatusFields(value); err != nil {
+				return &ErrJournalCorrupt{MessageID: value.MessageID, Reason: err.Error()}
+			}
+			if value.DeliveryMode != "" {
+				if err := validateDeliveryModeFirstAssignment(value); err != nil {
+					return &ErrJournalCorrupt{MessageID: value.MessageID, Reason: err.Error()}
+				}
+			}
 		}
 		previousByID[value.MessageID] = value
 		return nil
@@ -181,10 +189,18 @@ func validateMessageLifecycle(previous, next Message) error {
 		return fmt.Errorf("payload is immutable and must not change")
 	}
 
-	// DeliveryMode: unset → set once is allowed; once set must not change.
+	// DeliveryMode: unset → set once only for Instruction in Validated/Queued;
+	// once set must not change or clear.
 	if previous.DeliveryMode != "" {
+		if next.DeliveryMode == "" {
+			return fmt.Errorf("delivery_mode cannot be cleared once set")
+		}
 		if next.DeliveryMode != previous.DeliveryMode {
 			return fmt.Errorf("delivery_mode changed from %q to %q", previous.DeliveryMode, next.DeliveryMode)
+		}
+	} else if next.DeliveryMode != "" {
+		if err := validateDeliveryModeFirstAssignment(next); err != nil {
+			return err
 		}
 	}
 
@@ -234,8 +250,11 @@ func validateMessageLifecycle(previous, next Message) error {
 	return nil
 }
 
-// validateMessageStatusFields enforces Resolution/DeliveryMode rules per status.
+// validateMessageStatusFields enforces Resolution and DeliveryMode type/enum rules.
 func validateMessageStatusFields(value Message) error {
+	if err := validateDeliveryModePresence(value); err != nil {
+		return err
+	}
 	switch value.Status {
 	case Created, Validated, Queued, Delivered:
 		// Final resolution must not appear before Answered.
@@ -249,6 +268,37 @@ func validateMessageStatusFields(value Message) error {
 	case Acknowledged, Expired, Failed:
 		// Acknowledgement/terminal without forged answer is allowed; if resolution
 		// is present it must remain stable once set (checked against previous).
+	}
+	return nil
+}
+
+// validateDeliveryModePresence: any non-empty mode must be on Instruction with a valid enum.
+func validateDeliveryModePresence(value Message) error {
+	if value.DeliveryMode == "" {
+		return nil
+	}
+	if value.Type != Instruction {
+		return fmt.Errorf("delivery_mode is only valid on instruction messages (type=%s)", value.Type)
+	}
+	if !IsValidDeliveryMode(value.DeliveryMode) {
+		return fmt.Errorf("invalid delivery_mode %q", value.DeliveryMode)
+	}
+	return nil
+}
+
+// validateDeliveryModeFirstAssignment restricts first-time assignment of DeliveryMode
+// to Instruction routing (Validated/Queued) with a legal enum value.
+func validateDeliveryModeFirstAssignment(value Message) error {
+	if value.DeliveryMode == "" {
+		return nil
+	}
+	if err := validateDeliveryModePresence(value); err != nil {
+		return err
+	}
+	switch value.Status {
+	case Validated, Queued:
+	default:
+		return fmt.Errorf("delivery_mode may only be first set in validated/queued status (status=%s)", value.Status)
 	}
 	return nil
 }

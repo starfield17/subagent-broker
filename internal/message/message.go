@@ -52,6 +52,16 @@ const (
 	DeliveryUnsupported DeliveryMode = "unsupported"
 )
 
+// IsValidDeliveryMode reports whether mode is a known Broker delivery semantic.
+func IsValidDeliveryMode(mode DeliveryMode) bool {
+	switch mode {
+	case DeliveryImmediate, DeliveryNextTurn, DeliveryResume, DeliveryUnsupported:
+		return true
+	default:
+		return false
+	}
+}
+
 // SchemaVersion is the message journal / envelope schema.
 const SchemaVersion = "v1alpha1"
 
