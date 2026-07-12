@@ -17,7 +17,6 @@ import (
 	"github.com/vnai/subagent-broker/internal/storage"
 	"github.com/vnai/subagent-broker/internal/task"
 	"github.com/vnai/subagent-broker/internal/wave"
-	workerpkg "github.com/vnai/subagent-broker/internal/worker"
 )
 
 func (s *Service) Inbox(includeResolved bool) []message.Message {
@@ -48,12 +47,9 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 	if err != nil {
 		return message.Resolution{}, "", err
 	}
-	s.syncMessageProjection(value)
-	_ = s.appendEvent(event.Input{
-		TaskID: taskID, WorkerID: workerID, Source: "message-router",
-		Type: event.MessageQueued, Severity: "info",
-		Payload: map[string]any{"message_id": value.MessageID, "type": messageType, "status": string(message.Queued)},
-	})
+	if err := s.CommitMessageProjection(ctx, value, event.MessageQueued); err != nil {
+		return message.Resolution{}, value.MessageID, err
+	}
 
 	question := s.questionEnvelopeFor(value)
 	taskDir := filepath.Join(s.paths.Tasks, taskID)
@@ -61,7 +57,7 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 	if err := message.PublishQuestionProjection(taskDir, value.MessageID, taskID, question, false); err != nil {
 		failed, tErr := s.router.Transition(value.MessageID, message.Failed, "", nil, err)
 		if tErr == nil {
-			s.syncMessageProjection(failed)
+			_ = s.CommitMessageProjection(ctx, failed, event.MessageFailed)
 		}
 		return message.Resolution{}, value.MessageID, err
 	}
@@ -84,7 +80,9 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 	} else if messageType == message.PermissionRequest {
 		eventType = event.PermissionRequested
 	}
-	_ = s.appendEvent(event.Input{TaskID: taskID, WorkerID: workerID, Source: "message-router", Type: eventType, Severity: "warning", Payload: map[string]any{"message_id": value.MessageID, "type": messageType}})
+	if err := s.appendEvent(event.Input{TaskID: taskID, WorkerID: workerID, Source: "message-router", Type: eventType, Severity: "warning", Payload: map[string]any{"message_id": value.MessageID, "type": messageType}}); err != nil {
+		return message.Resolution{}, value.MessageID, err
+	}
 
 	select {
 	case resolution := <-wait:
@@ -124,7 +122,9 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 	if err != nil {
 		return err
 	}
-	s.syncMessageProjection(answered)
+	if err := s.CommitMessageProjection(context.Background(), answered, event.MessageAnswered); err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	wait := s.pending[id]
@@ -150,7 +150,9 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 	} else if value.Type == message.PermissionRequest {
 		eventType = event.PermissionResolved
 	}
-	_ = s.appendEvent(event.Input{TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router", Type: eventType, Severity: "info", Payload: map[string]any{"message_id": id, "status": string(message.Answered)}})
+	if err := s.appendEvent(event.Input{TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router", Type: eventType, Severity: "info", Payload: map[string]any{"message_id": id, "status": string(message.Answered)}}); err != nil {
+		return err
+	}
 	// A resolved decision may remove the Barrier's blocking input. Wake the
 	// long-lived Supervisor so it re-evaluates the Barrier automatically.
 	if !s.router.HasPendingDecisions(value.TaskID) {
@@ -178,11 +180,15 @@ func (s *Service) SendInstruction(ctx context.Context, taskID, text string) (ada
 	if err != nil {
 		return adapter.DeliveryResult{}, err
 	}
-	s.syncMessageProjection(queued)
-	_ = s.appendEvent(event.Input{
+	if err := s.CommitMessageProjection(ctx, queued, event.MessageQueued); err != nil {
+		return adapter.DeliveryResult{MessageID: queued.MessageID}, err
+	}
+	if err := s.appendEvent(event.Input{
 		TaskID: taskID, WorkerID: workerID, Source: "message-router", Type: event.MessageQueued, Severity: "info",
 		Payload: map[string]any{"message_id": queued.MessageID, "delivery_mode": string(mode), "status": string(message.Queued)},
-	})
+	}); err != nil {
+		return adapter.DeliveryResult{MessageID: queued.MessageID}, err
+	}
 
 	return s.deliverInstruction(ctx, queued, text)
 }
@@ -259,8 +265,9 @@ func (s *Service) deliverInstruction(ctx context.Context, queued message.Message
 		if !isActive {
 			failed, tErr := s.router.Transition(queued.MessageID, message.Failed, mode, nil, adapter.ErrUnsupported)
 			if tErr == nil {
-				s.syncMessageProjection(failed)
-				_ = s.appendEvent(event.Input{TaskID: queued.TaskID, Source: "message-router", Type: event.MessageFailed, Severity: "error", Payload: map[string]any{"message_id": queued.MessageID}})
+				if cErr := s.CommitMessageProjection(ctx, failed, event.MessageFailed); cErr != nil {
+					return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported, MessageID: queued.MessageID}, cErr
+				}
 			}
 			return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported, MessageID: queued.MessageID}, adapter.ErrUnsupported
 		}
@@ -274,31 +281,57 @@ func (s *Service) deliverInstruction(ctx context.Context, queued message.Message
 		}
 		if sendErr != nil {
 			failed, tErr := s.router.RecordDeliveryAttempt(queued.MessageID, message.Failed, sendErr)
-			if tErr == nil {
-				s.syncMessageProjection(failed)
+			if tErr != nil {
+				return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, tErr
 			}
-			_ = s.appendEvent(event.Input{TaskID: queued.TaskID, Source: "message-router", Type: event.MessageFailed, Severity: "error", Payload: map[string]any{"message_id": queued.MessageID, "error": sendErr.Error()}})
+			if cErr := s.CommitMessageProjection(ctx, failed, event.MessageFailed); cErr != nil {
+				return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, cErr
+			}
 			return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, sendErr
 		}
 		delivered, tErr := s.router.RecordDeliveryAttempt(queued.MessageID, message.Delivered, nil)
 		if tErr != nil {
 			return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, tErr
 		}
-		s.syncMessageProjection(delivered)
-		_ = s.appendEvent(event.Input{TaskID: queued.TaskID, Source: "message-router", Type: event.MessageDelivered, Severity: "info", Payload: map[string]any{"message_id": queued.MessageID, "delivery_mode": string(mode)}})
+		if cErr := s.CommitMessageProjection(ctx, delivered, event.MessageDelivered); cErr != nil {
+			return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, cErr
+		}
 		return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, nil
 
 	case message.DeliveryNextTurn:
 		return adapter.DeliveryResult{Mode: adapter.DeliveryNextTurn, MessageID: queued.MessageID}, nil
 
 	case message.DeliveryResume:
+		s.mu.Lock()
+		_, isActive := s.active[queued.TaskID]
+		s.mu.Unlock()
+		if isActive {
+			// Session already live: keep outbox semantics (queued until explicit
+			// session_resume/recovery flush). Do not create another attempt.
+			return adapter.DeliveryResult{Mode: adapter.DeliveryResume, MessageID: queued.MessageID}, nil
+		}
+		// Inactive task: actively create recovery_resume attempt and deliver.
+		if err := s.EnsureResumeAndFlushOutbox(ctx, queued.TaskID); err != nil {
+			return adapter.DeliveryResult{Mode: adapter.DeliveryResume, MessageID: queued.MessageID}, err
+		}
+		// Re-read message status after flush.
+		if latest, ok := s.router.Get(queued.MessageID); ok {
+			switch latest.Status {
+			case message.Delivered:
+				return adapter.DeliveryResult{Mode: adapter.DeliveryResume, MessageID: queued.MessageID}, nil
+			case message.Failed:
+				return adapter.DeliveryResult{Mode: adapter.DeliveryResume, MessageID: queued.MessageID}, fmt.Errorf("%s", latest.Error)
+			}
+		}
 		return adapter.DeliveryResult{Mode: adapter.DeliveryResume, MessageID: queued.MessageID}, nil
 
 	default:
 		failed, tErr := s.router.Transition(queued.MessageID, message.Failed, message.DeliveryUnsupported, nil, adapter.ErrUnsupported)
-		if tErr == nil {
-			s.syncMessageProjection(failed)
-			_ = s.appendEvent(event.Input{TaskID: queued.TaskID, Source: "message-router", Type: event.MessageFailed, Severity: "error", Payload: map[string]any{"message_id": queued.MessageID}})
+		if tErr != nil {
+			return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported, MessageID: queued.MessageID}, tErr
+		}
+		if cErr := s.CommitMessageProjection(ctx, failed, event.MessageFailed); cErr != nil {
+			return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported, MessageID: queued.MessageID}, cErr
 		}
 		return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported, MessageID: queued.MessageID}, adapter.ErrUnsupported
 	}
@@ -310,47 +343,70 @@ func (s *Service) FlushInstructionOutbox(ctx context.Context, taskID, trigger st
 		return nil
 	}
 	if runtime, ok := s.taskState(domain.TaskID(taskID)); ok && recoveryTaskTerminal(runtime) {
-		_, _ = s.expireTaskMessages(taskID, "task terminal during flush")
+		if _, err := s.expireTaskMessages(taskID, "task terminal during flush"); err != nil {
+			return err
+		}
 		return nil
 	}
 
 	switch trigger {
 	case "turn_boundary", "active_session":
 		pending := s.router.PendingInstructions(taskID, message.DeliveryNextTurn, message.DeliveryImmediate)
+		var firstErr error
 		for _, item := range pending {
 			if item.DeliveryMode != message.DeliveryNextTurn && item.DeliveryMode != message.DeliveryImmediate {
 				continue
 			}
 			text := instructionText(item)
 			if _, err := s.deliverInstruction(ctx, item, text); err != nil {
-				// Keep going for remaining messages when failure is non-fatal.
+				if firstErr == nil {
+					firstErr = err
+				}
+				if !s.AcceptingWork() {
+					return err
+				}
 				continue
 			}
-			_ = s.appendEvent(event.Input{TaskID: taskID, Source: "message-router", Type: event.InstructionFlushed, Severity: "info", Payload: map[string]any{"message_id": item.MessageID, "trigger": trigger}})
+			if err := s.appendEvent(event.Input{TaskID: taskID, Source: "message-router", Type: event.InstructionFlushed, Severity: "info", Payload: map[string]any{"message_id": item.MessageID, "trigger": trigger}}); err != nil {
+				return err
+			}
 		}
+		return firstErr
 	case "session_resume", "recovery":
 		pending := s.router.PendingInstructions(taskID, message.DeliveryResume)
 		if len(pending) == 0 {
 			return nil
 		}
-		// Resume delivery creates a recovery_resume attempt via execute path if needed.
-		// Here we only deliver if an active session already exists after resume.
 		s.mu.Lock()
 		active, isActive := s.active[taskID]
 		s.mu.Unlock()
 		if !isActive {
-			// Leave queued for executeTask recovery_resume to pick up; do not fresh-retry.
-			return nil
+			// Active resume entry point handles creating the recovery_resume attempt.
+			return s.EnsureResumeAndFlushOutbox(ctx, taskID)
 		}
+		var firstErr error
 		for _, item := range pending {
+			// Skip already-delivered (PendingInstructions already filters, but double-check).
+			if message.IsTerminal(item.Status) {
+				continue
+			}
 			text := instructionText(item)
 			// Force immediate delivery on active resumed session.
 			item.DeliveryMode = message.DeliveryImmediate
 			if _, err := s.deliverInstruction(ctx, item, text); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				if !s.AcceptingWork() {
+					return err
+				}
 				continue
 			}
-			_ = s.appendEvent(event.Input{TaskID: taskID, WorkerID: active.workerID, Source: "message-router", Type: event.InstructionFlushed, Severity: "info", Payload: map[string]any{"message_id": item.MessageID, "trigger": trigger}})
+			if err := s.appendEvent(event.Input{TaskID: taskID, WorkerID: active.workerID, Source: "message-router", Type: event.InstructionFlushed, Severity: "info", Payload: map[string]any{"message_id": item.MessageID, "trigger": trigger}}); err != nil {
+				return err
+			}
 		}
+		return firstErr
 	}
 	return nil
 }
@@ -373,11 +429,9 @@ func (s *Service) expireTaskMessages(taskID, reason string) ([]message.Message, 
 		return expired, err
 	}
 	for _, item := range expired {
-		s.syncMessageProjection(item)
-		_ = s.appendEvent(event.Input{
-			TaskID: taskID, Source: "message-router", Type: event.MessageExpired, Severity: "warning",
-			Payload: map[string]any{"message_id": item.MessageID, "reason": reason},
-		})
+		if cErr := s.CommitMessageProjection(context.Background(), item, event.MessageExpired); cErr != nil {
+			return expired, cErr
+		}
 		// Unblock any waiters.
 		s.mu.Lock()
 		if wait := s.pending[item.MessageID]; wait != nil {
@@ -386,8 +440,12 @@ func (s *Service) expireTaskMessages(taskID, reason string) ([]message.Message, 
 		}
 		s.mu.Unlock()
 	}
-	_ = message.ClearTopLevelQuestion(filepath.Join(s.paths.Tasks, taskID))
-	_ = s.recomputeTaskWaiting(taskID)
+	if err := message.ClearTopLevelQuestion(filepath.Join(s.paths.Tasks, taskID)); err != nil {
+		return expired, err
+	}
+	if err := s.recomputeTaskWaiting(taskID); err != nil {
+		return expired, err
+	}
 	return expired, nil
 }
 
@@ -584,37 +642,48 @@ func (s *Service) questionEnvelopeFor(value message.Message) message.QuestionEnv
 	return result
 }
 
-// syncMessageProjection updates the legacy messageIndex / snapshot projection
-// after a Router mutation. Router remains the authority for message state.
-func (s *Service) syncMessageProjection(value message.Message) {
+// CommitMessageProjection updates the in-memory message index and persists the
+// Snapshot message projection via the existing Commit API. Snapshot.Messages is
+// never written directly on the production path; only the Commit candidate is mutated.
+// Router journal append must already have succeeded before calling this.
+// On Commit failure the Supervisor fail-closes and the error is returned (not swallowed).
+func (s *Service) CommitMessageProjection(ctx context.Context, value message.Message, eventType string) error {
 	s.mu.Lock()
 	if s.messageIndex == nil {
 		s.messageIndex = map[string]message.Message{}
 	}
 	s.messageIndex[value.MessageID] = value
-	if s.router != nil {
-		s.snapshot.Messages = s.router.Snapshot(false)
-	}
 	s.mu.Unlock()
 
-	// When the event sink is available, also checkpoint Messages via Commit.
-	if s.events == nil || !s.AcceptingWork() {
-		return
+	if eventType == "" {
+		eventType = event.MessageQueued
+		switch value.Status {
+		case message.Delivered:
+			eventType = event.MessageDelivered
+		case message.Answered:
+			eventType = event.MessageAnswered
+		case message.Expired:
+			eventType = event.MessageExpired
+		case message.Failed:
+			eventType = event.MessageFailed
+		case message.Acknowledged:
+			eventType = event.MessageAcknowledged
+		}
 	}
-	eventType := event.MessageQueued
-	switch value.Status {
-	case message.Delivered:
-		eventType = event.MessageDelivered
-	case message.Answered:
-		eventType = event.MessageAnswered
-	case message.Expired:
-		eventType = event.MessageExpired
-	case message.Failed:
-		eventType = event.MessageFailed
-	case message.Acknowledged:
-		eventType = event.MessageAcknowledged
+
+	// Lightweight unit-test path without an event sink: update snapshot under lock only.
+	if s.events == nil {
+		s.mu.Lock()
+		if s.router != nil {
+			s.snapshot.Messages = s.router.Snapshot(false)
+		}
+		s.mu.Unlock()
+		return nil
 	}
-	_ = s.commitMutate(context.Background(), event.Input{
+	if !s.AcceptingWork() {
+		return &CommitError{Stage: CommitStageValidate, Err: fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")}
+	}
+	return s.commitMutate(ctx, event.Input{
 		TaskID: value.TaskID, Source: "message-router", Type: eventType, Severity: "info",
 		Payload: map[string]any{"message_id": value.MessageID, "status": string(value.Status), "reason": "projection_sync"},
 	}, func(candidate *Snapshot) error {
@@ -624,6 +693,11 @@ func (s *Service) syncMessageProjection(value message.Message) {
 		candidate.UpdatedAt = time.Now().UTC()
 		return nil
 	})
+}
+
+// syncMessageProjection is retained for tests; production paths must use CommitMessageProjection.
+func (s *Service) syncMessageProjection(value message.Message) {
+	_ = s.CommitMessageProjection(context.Background(), value, "")
 }
 
 func (s *Service) approveScope(value message.Message, decision message.DecisionPayload) error {
@@ -692,10 +766,180 @@ func (s *Service) approveScope(value message.Message, decision message.DecisionP
 	})
 }
 
-// Used by finish/fail/cancel paths — expire zombies.
-func (s *Service) onTaskTerminalMessages(taskID, reason string) {
-	_, _ = s.expireTaskMessages(taskID, reason)
+// Used by finish/fail/cancel paths — expire zombies. Errors are returned (fail-closed).
+func (s *Service) onTaskTerminalMessages(taskID, reason string) error {
+	_, err := s.expireTaskMessages(taskID, reason)
+	return err
 }
 
-// Ensure workerpkg import used when flush triggers resume attempt metadata.
-var _ = workerpkg.AttemptFresh
+// EnsureResumeAndFlushOutbox is the single active entry for resume delivery:
+// load queued resume instructions, create one recovery_resume attempt when needed,
+// ResumeSession, register the active worker, and flush outbox in order.
+// Concurrent callers for the same task are serialized via the Service mutex / active map CAS.
+func (s *Service) EnsureResumeAndFlushOutbox(ctx context.Context, taskID string) error {
+	if s.router == nil {
+		return fmt.Errorf("message router is not initialized")
+	}
+	pending := s.router.PendingInstructions(taskID, message.DeliveryResume)
+	if len(pending) == 0 {
+		return nil
+	}
+
+	// Already active: flush on the live session without creating another attempt.
+	s.mu.Lock()
+	_, isActive := s.active[taskID]
+	s.mu.Unlock()
+	if isActive {
+		return s.flushResumeOnActive(ctx, taskID)
+	}
+
+	runtime, ok := s.taskState(domain.TaskID(taskID))
+	if !ok {
+		return fmt.Errorf("task %s not found", taskID)
+	}
+	if recoveryTaskTerminal(runtime) {
+		return s.onTaskTerminalMessages(taskID, "task terminal during resume")
+	}
+
+	// Singleflight / CAS: claim resume-in-progress slot so concurrent callers
+	// do not create multiple recovery_resume attempts.
+	s.mu.Lock()
+	if s.resumeInFlight == nil {
+		s.resumeInFlight = map[string]bool{}
+	}
+	if s.resumeInFlight[taskID] {
+		s.mu.Unlock()
+		// Another caller owns resume; wait for active session or completion.
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+			s.mu.Lock()
+			_, activeNow := s.active[taskID]
+			inFlight := s.resumeInFlight[taskID]
+			s.mu.Unlock()
+			if activeNow {
+				return s.flushResumeOnActive(ctx, taskID)
+			}
+			if !inFlight {
+				// Owner finished: if outbox empty, succeed without a second attempt.
+				if len(s.router.PendingInstructions(taskID, message.DeliveryResume)) == 0 {
+					return nil
+				}
+				// Remaining queued resume instructions: try again from the top.
+				return s.EnsureResumeAndFlushOutbox(ctx, taskID)
+			}
+		}
+		return fmt.Errorf("concurrent resume in progress for task %s", taskID)
+	}
+	s.resumeInFlight[taskID] = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.resumeInFlight, taskID)
+		s.mu.Unlock()
+	}()
+
+	// Validate native session + Effective.ResumeSession.
+	nativeSessionID := ""
+	if runtime.Worker != nil {
+		nativeSessionID = runtime.Worker.NativeSessionID
+	}
+	if nativeSessionID == "" {
+		for i := len(runtime.Attempts) - 1; i >= 0; i-- {
+			if runtime.Attempts[i].Worker.NativeSessionID != "" {
+				nativeSessionID = runtime.Attempts[i].Worker.NativeSessionID
+				break
+			}
+		}
+	}
+	if nativeSessionID == "" {
+		return s.failQueuedResumeInstructions(taskID, adapter.ErrUnsupported, "native session missing")
+	}
+
+	harness, ok := s.registry.Get(adapter.HarnessName(s.config.Harness))
+	if !ok {
+		return s.failQueuedResumeInstructions(taskID, adapter.ErrUnsupported, "adapter not registered")
+	}
+	eff := s.effectiveCapsForTask(taskID, harness)
+	if !eff.ResumeSession {
+		return s.failQueuedResumeInstructions(taskID, adapter.ErrUnsupported, "resume capability unsupported")
+	}
+
+	// Ensure state selects recovery_resume (never fresh) inside executeTask.
+	if runtime.Worker == nil {
+		runtime.Worker = &domain.WorkerSession{TaskID: runtime.Task.TaskID}
+	}
+	if runtime.Worker.NativeSessionID == "" {
+		runtime.Worker.NativeSessionID = nativeSessionID
+	}
+	runtime.Dimensions.Process = state.ProcessExited
+	runtime.Worker.StatusDimensions.Process = state.ProcessExited
+	if err := s.saveRuntime(runtime); err != nil {
+		return err
+	}
+	// Full Worker Session lifecycle: attempt create → ResumeSession → register →
+	// outbox flush → Events/stderr drain → Exited → result → finish → unregister.
+	// Reuses executeTask; does not start a second lightweight path.
+	return s.executeTask(ctx, &runtime)
+}
+
+func (s *Service) failQueuedResumeInstructions(taskID string, cause error, reason string) error {
+	pending := s.router.PendingInstructions(taskID, message.DeliveryResume)
+	var firstErr error
+	for _, item := range pending {
+		failed, tErr := s.router.Transition(item.MessageID, message.Failed, message.DeliveryUnsupported, nil, fmt.Errorf("%s: %w", reason, cause))
+		if tErr != nil {
+			if firstErr == nil {
+				firstErr = tErr
+			}
+			continue
+		}
+		if cErr := s.CommitMessageProjection(context.Background(), failed, event.MessageFailed); cErr != nil {
+			return cErr
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return fmt.Errorf("%s: %w", reason, cause)
+}
+
+// flushResumeOnActive delivers pending resume instructions via immediate mode
+// on an already-registered active session.
+func (s *Service) flushResumeOnActive(ctx context.Context, taskID string) error {
+	if s.router == nil {
+		return nil
+	}
+	pending := s.router.PendingInstructions(taskID, message.DeliveryResume)
+	s.mu.Lock()
+	active, isActive := s.active[taskID]
+	s.mu.Unlock()
+	if !isActive {
+		return fmt.Errorf("no active session for resume flush on task %s", taskID)
+	}
+	var firstErr error
+	for _, item := range pending {
+		if message.IsTerminal(item.Status) {
+			continue
+		}
+		text := instructionText(item)
+		item.DeliveryMode = message.DeliveryImmediate
+		if _, err := s.deliverInstruction(ctx, item, text); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			if !s.AcceptingWork() {
+				return err
+			}
+			continue
+		}
+		if err := s.appendEvent(event.Input{
+			TaskID: taskID, WorkerID: active.workerID, Source: "message-router",
+			Type: event.InstructionFlushed, Severity: "info",
+			Payload: map[string]any{"message_id": item.MessageID, "trigger": "ensure_resume"},
+		}); err != nil {
+			return err
+		}
+	}
+	return firstErr
+}

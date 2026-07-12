@@ -16,13 +16,13 @@ func TestPublishCreatesFormalReportOnlyAfterValidation(t *testing.T) {
 	dir := t.TempDir()
 	invalid := validSuccess()
 	invalid.Summary = ""
-	if err := Publish(dir, invalid, time.Unix(0, 0)); err == nil {
+	if err := Publish(dir, invalid, 1, time.Unix(0, 0)); err == nil {
 		t.Fatal("invalid envelope should fail")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "report.md")); !os.IsNotExist(err) {
 		t.Fatal("formal report must not exist after validation failure")
 	}
-	if err := Publish(dir, validSuccess(), time.Unix(0, 0)); err != nil {
+	if err := Publish(dir, validSuccess(), 1, time.Unix(0, 0)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {

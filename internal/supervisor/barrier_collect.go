@@ -81,7 +81,7 @@ func (s *Service) assessTaskReport(runtime TaskState) wave.ReportAssessment {
 	metaPath := filepath.Join(taskDir, "report.meta.json")
 	mdPath := filepath.Join(taskDir, "report.md")
 
-	metaData, metaErr := os.ReadFile(metaPath)
+	_, metaErr := os.Stat(metaPath)
 	mdData, mdErr := os.ReadFile(mdPath)
 	if metaErr != nil && mdErr != nil {
 		// Tasks that never reached report publication still fail Barrier unless cancelled with no work.
@@ -107,34 +107,78 @@ func (s *Service) assessTaskReport(runtime TaskState) wave.ReportAssessment {
 		return assessment
 	}
 
-	var meta report.Meta
-	if err := json.Unmarshal(metaData, &meta); err != nil {
-		assessment.Present = true
+	assessment.Present = true
+
+	// Prefer full disk integrity verification (meta↔envelope binding + hashes).
+	verifiedMeta, envelope, verifyErr := report.VerifyDiskArtifacts(taskDir)
+	if verifyErr != nil {
 		assessment.MetaValid = false
-		assessment.Error = fmt.Sprintf("task %s report.meta.json invalid: %v", runtime.Task.TaskID, err)
+		assessment.MarkdownValid = false
+		assessment.IdentityValid = false
+		assessment.Error = fmt.Sprintf("task %s report integrity failed: %v", runtime.Task.TaskID, verifyErr)
 		return assessment
 	}
-	assessment.Present = true
-	assessment.MetaValid = meta.SchemaVersion == report.SchemaVersion && meta.TaskID != ""
-	assessment.EnvelopeStatus = meta.Status
+	meta := verifiedMeta
 
-	// Identity: meta task_id must match; worker_id should match current or historical attempt.
-	if meta.TaskID != string(runtime.Task.TaskID) {
+	// Canonical envelope is the source of status, not an unbound meta field.
+	assessment.EnvelopeStatus = envelope.Status
+	if assessment.EnvelopeStatus == "" {
+		assessment.EnvelopeStatus = meta.Status
+	}
+	assessment.MetaValid = meta.SchemaVersion == report.SchemaVersion && meta.TaskID != ""
+
+	// Legacy reports without attempt/hash binding are not Phase 1–3 passable.
+	if meta.Unverified || meta.AttemptNumber <= 0 || meta.EnvelopeHash == "" || meta.MarkdownHash == "" {
+		assessment.MetaValid = false
+		assessment.MarkdownValid = false
 		assessment.IdentityValid = false
-		assessment.Error = fmt.Sprintf("task %s report identity mismatch: meta task_id=%q", runtime.Task.TaskID, meta.TaskID)
-	} else {
-		assessment.IdentityValid = workerMatches(runtime, meta.WorkerID)
-		if !assessment.IdentityValid {
-			assessment.Error = fmt.Sprintf("task %s report worker_id %q does not match attempts", runtime.Task.TaskID, meta.WorkerID)
-		}
+		assessment.Error = fmt.Sprintf("task %s report is legacy/unverified (missing attempt or content hashes)", runtime.Task.TaskID)
+		return assessment
 	}
 
-	// Markdown must match meta-rendered content when we can load envelope from meta-adjacent storage.
-	// We only have status in Meta; re-render check uses Status line presence + non-empty body.
+	// Identity: disk meta must match the frozen ReportIdentity from publication time,
+	// and that attempt must still exist in history with the same worker id.
+	// Do NOT bind to a dynamic current/latest ActiveAttempt.
+	if meta.TaskID != string(runtime.Task.TaskID) || envelope.TaskID != string(runtime.Task.TaskID) {
+		assessment.IdentityValid = false
+		assessment.Error = fmt.Sprintf("task %s report identity mismatch: meta task_id=%q envelope task_id=%q", runtime.Task.TaskID, meta.TaskID, envelope.TaskID)
+	} else if runtime.ReportIdentity == nil {
+		assessment.IdentityValid = false
+		assessment.Error = fmt.Sprintf("task %s has no frozen ReportIdentity; report cannot be verified", runtime.Task.TaskID)
+	} else if runtime.ReportIdentity.Stale {
+		assessment.IdentityValid = false
+		assessment.Error = fmt.Sprintf("task %s ReportIdentity is stale after a newer attempt", runtime.Task.TaskID)
+	} else if meta.WorkerID != runtime.ReportIdentity.WorkerID || meta.AttemptNumber != runtime.ReportIdentity.AttemptNumber ||
+		envelope.WorkerID != runtime.ReportIdentity.WorkerID {
+		assessment.IdentityValid = false
+		assessment.Error = fmt.Sprintf(
+			"task %s report meta worker=%q attempt=%d does not match frozen ReportIdentity worker=%s attempt=%d",
+			runtime.Task.TaskID, meta.WorkerID, meta.AttemptNumber,
+			runtime.ReportIdentity.WorkerID, runtime.ReportIdentity.AttemptNumber,
+		)
+	} else if meta.EnvelopeHash != runtime.ReportIdentity.EnvelopeHash || meta.MarkdownHash != runtime.ReportIdentity.MarkdownHash {
+		assessment.IdentityValid = false
+		assessment.Error = fmt.Sprintf("task %s report hashes do not match frozen ReportIdentity", runtime.Task.TaskID)
+	} else if !attemptExists(runtime, meta.WorkerID, meta.AttemptNumber) {
+		assessment.IdentityValid = false
+		assessment.Error = fmt.Sprintf(
+			"task %s report attempt %d worker %q not found in Attempts history",
+			runtime.Task.TaskID, meta.AttemptNumber, meta.WorkerID,
+		)
+	} else {
+		assessment.IdentityValid = true
+	}
+
+	// Markdown integrity already verified via hash; also require non-empty body + envelope status line.
+	statusForMD := string(envelope.Status)
+	if statusForMD == "" {
+		statusForMD = string(meta.Status)
+	}
 	assessment.MarkdownValid = len(strings.TrimSpace(string(mdData))) > 0 &&
-		strings.Contains(string(mdData), string(meta.Status))
+		strings.Contains(string(mdData), statusForMD) &&
+		meta.MarkdownHash == report.HashBytes(mdData)
 	if !assessment.MarkdownValid && assessment.Error == "" {
-		assessment.Error = fmt.Sprintf("task %s report.md does not match meta status", runtime.Task.TaskID)
+		assessment.Error = fmt.Sprintf("task %s report.md integrity or status mismatch", runtime.Task.TaskID)
 	}
 
 	// Incomplete runtime status still fails when report claims success but task not verified.
@@ -149,28 +193,30 @@ func (s *Service) assessTaskReport(runtime TaskState) wave.ReportAssessment {
 	return assessment
 }
 
-func workerMatches(runtime TaskState, workerID string) bool {
-	if workerID == "" {
+// attemptExists confirms the frozen report's attempt is still in durable history.
+func attemptExists(runtime TaskState, workerID string, attemptNumber int) bool {
+	if workerID == "" || attemptNumber <= 0 {
 		return false
 	}
-	if runtime.Worker != nil && string(runtime.Worker.WorkerID) == workerID {
-		return true
-	}
-	for _, attempt := range runtime.Attempts {
-		if string(attempt.Worker.WorkerID) == workerID {
+	for _, a := range runtime.Attempts {
+		if a.Number == attemptNumber && string(a.Worker.WorkerID) == workerID {
 			return true
 		}
 	}
-	return runtime.Worker == nil && len(runtime.Attempts) == 0
+	// Legacy single-worker projection without Attempts.
+	if len(runtime.Attempts) == 0 && runtime.Worker != nil {
+		number := runtime.Worker.Attempt
+		if number <= 0 {
+			number = 1
+		}
+		return string(runtime.Worker.WorkerID) == workerID && number == attemptNumber
+	}
+	return false
 }
 
 func (s *Service) collectPendingDecisions(planned domain.WavePlan) []wave.PendingDecision {
 	if s.router == nil {
 		return nil
-	}
-	taskSet := map[string]bool{}
-	for _, item := range planned.Tasks {
-		taskSet[string(item.TaskID)] = true
 	}
 	var pending []wave.PendingDecision
 	for _, item := range planned.Tasks {
@@ -179,8 +225,6 @@ func (s *Service) collectPendingDecisions(planned domain.WavePlan) []wave.Pendin
 				MessageID: msg.MessageID, TaskID: msg.TaskID, Type: msg.Type,
 			})
 		}
-		// Queued instructions on a verified/partial task are consistency errors handled via ExistingErrors by caller.
-		_ = taskSet
 	}
 	sort.Slice(pending, func(i, j int) bool {
 		if pending[i].TaskID == pending[j].TaskID {
@@ -249,4 +293,45 @@ func (s *Service) collectQueuedInstructionErrors(planned domain.WavePlan) []stri
 		}
 	}
 	return errors
+}
+
+// revalidateBarrierCurrentFacts re-collects current Barrier inputs and compares
+// their hash to the stored verification InputHash. Old barrier-input.json is never
+// treated as current fact.
+func (s *Service) revalidateBarrierCurrentFacts(ctx context.Context, waveID domain.WaveID, expectedHash string) error {
+	if strings.TrimSpace(expectedHash) == "" {
+		return fmt.Errorf("stale_verification: wave %s verification lacks input_hash; re-run barrier", waveID)
+	}
+	planned, ok := s.plannedWave(waveID)
+	if !ok {
+		return fmt.Errorf("stale_verification: wave %s plan not found", waveID)
+	}
+	paths := s.wavePaths(waveID)
+	baselineData, err := os.ReadFile(paths.Baseline)
+	if err != nil {
+		return fmt.Errorf("stale_verification: wave %s baseline missing; re-run barrier: %w", waveID, err)
+	}
+	var baseline verify.WorkspaceSnapshot
+	if err := json.Unmarshal(baselineData, &baseline); err != nil {
+		return fmt.Errorf("stale_verification: wave %s baseline invalid: %w", waveID, err)
+	}
+	currentInputs, err := s.collectBarrierInputs(ctx, planned, baseline)
+	if err != nil {
+		return fmt.Errorf("stale_verification: collect current barrier inputs: %w", err)
+	}
+	currentInputs.ExistingErrors = append(currentInputs.ExistingErrors, s.collectQueuedInstructionErrors(planned)...)
+	currentHash := hashBarrierInputs(currentInputs)
+	if currentHash != expectedHash {
+		return fmt.Errorf("stale_verification: barrier inputs changed since evaluation (conflict); re-run barrier")
+	}
+	return nil
+}
+
+func (s *Service) plannedWave(waveID domain.WaveID) (domain.WavePlan, bool) {
+	for _, planned := range s.plan.Waves {
+		if planned.WaveID == waveID {
+			return planned, true
+		}
+	}
+	return domain.WavePlan{}, false
 }

@@ -213,6 +213,12 @@ func ApplyEvent(snapshot Snapshot, ev event.Event) (Snapshot, error) {
 		next.Tasks[index].ActiveAttempt = number
 		next.Tasks[index].Worker = &w
 		next.Tasks[index].Dimensions = w.StatusDimensions
+		// New attempt invalidates any previously frozen report identity.
+		if next.Tasks[index].ReportIdentity != nil {
+			stale := *next.Tasks[index].ReportIdentity
+			stale.Stale = true
+			next.Tasks[index].ReportIdentity = &stale
+		}
 
 	case event.WorkerAttemptFinished:
 		if ev.TaskID != "" {

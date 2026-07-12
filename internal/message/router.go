@@ -254,8 +254,8 @@ func (r *Router) Snapshot(includeResolved bool) []Message {
 	return Sorted(copyIndex(r.index), includeResolved)
 }
 
-// PendingInstructions returns pending instruction messages for a task, optionally
-// filtered by delivery mode, ordered by CreatedAt then MessageID.
+// PendingInstructions returns instructions that still need delivery (StatusQueued).
+// Delivered/failed/expired instructions are never returned (no re-send on flush).
 func (r *Router) PendingInstructions(taskID string, modes ...DeliveryMode) []Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -265,7 +265,7 @@ func (r *Router) PendingInstructions(taskID string, modes ...DeliveryMode) []Mes
 	}
 	result := make([]Message, 0)
 	for _, value := range r.index {
-		if value.Type != Instruction || value.TaskID != taskID || !IsPending(value.Status) {
+		if value.TaskID != taskID || !IsDeliveryPending(value) {
 			continue
 		}
 		if len(modeFilter) > 0 && !modeFilter[value.DeliveryMode] {
@@ -313,13 +313,13 @@ func (r *Router) ExpireTask(taskID, reason string) ([]Message, error) {
 	return expired, nil
 }
 
-// PendingDecisions returns pending non-instruction messages for a task, ordered.
+// PendingDecisions returns pending non-instruction decision messages for a task.
 func (r *Router) PendingDecisions(taskID string) []Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	result := make([]Message, 0)
 	for _, value := range r.index {
-		if value.TaskID != taskID || !IsPending(value.Status) || value.Type == Instruction {
+		if value.TaskID != taskID || !IsDecisionPending(value) {
 			continue
 		}
 		result = append(result, copyMessage(value))

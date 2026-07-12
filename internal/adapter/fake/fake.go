@@ -139,17 +139,82 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	return session, nil
 }
 
-func (a *Adapter) ResumeSession(_ context.Context, req adapter.ResumeRequest) (adapter.Session, error) {
+func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) (adapter.Session, error) {
 	if !a.capabilities.ResumeSession {
 		return adapter.Session{}, adapter.ErrUnsupported
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	state, ok := a.sessions[req.NativeSessionID]
 	if !ok {
+		a.mu.Unlock()
 		return adapter.Session{}, fmt.Errorf("unknown session %q", req.NativeSessionID)
 	}
-	return state.session, nil
+	// Open a fresh event/exit stream for the resumed turn so callers can drive a
+	// full Worker Session lifecycle (Events → result → Exited).
+	channel := make(chan adapter.NativeEvent, 8)
+	exited := make(chan adapter.ExitStatus, 1)
+	session := adapter.Session{
+		NativeSessionID:   req.NativeSessionID,
+		NativeTurnID:      "turn-resume",
+		Events:            channel,
+		Exited:            exited,
+		PID:               state.session.PID,
+		ProcessStartToken: state.session.ProcessStartToken,
+	}
+	if state.final == nil {
+		// Ensure resume always has a collectable result for full lifecycle tests.
+		final := report.Envelope{
+			SchemaVersion: report.SchemaVersion, TaskID: req.TaskID, WorkerID: req.WorkerID,
+			Status: report.StatusSucceeded, Summary: "fake resume completed", WorkCompleted: []string{"resumed work"},
+			NoFilesChangedReason: "scenario does not edit a real workspace",
+			Validation:           []report.Validation{{Command: "fake-check", Passed: true}},
+		}
+		state.final = &final
+	} else {
+		if req.TaskID != "" {
+			state.final.TaskID = req.TaskID
+		}
+		if req.WorkerID != "" {
+			state.final.WorkerID = req.WorkerID
+		}
+	}
+	state.session = session
+	state.events = channel
+	state.closed = false
+	state.done = make(chan struct{})
+	a.mu.Unlock()
+
+	now := time.Now().UTC()
+	events := []adapter.NativeEvent{
+		{Kind: "session.resumed", Timestamp: now},
+		{Kind: "turn.started", Timestamp: now},
+		{Kind: "result.submitted", Timestamp: now},
+	}
+	go func() {
+		defer func() {
+			exited <- adapter.ExitStatus{Code: 0}
+			close(exited)
+			a.mu.Lock()
+			if !state.closed {
+				close(channel)
+				state.closed = true
+			}
+			a.mu.Unlock()
+		}()
+		for _, native := range events {
+			select {
+			case <-ctx.Done():
+				return
+			case <-state.done:
+				return
+			case channel <- native:
+				a.mu.Lock()
+				state.history = append(state.history, native)
+				a.mu.Unlock()
+			}
+		}
+	}()
+	return session, nil
 }
 
 func (a *Adapter) SendMessage(_ context.Context, id, message string) (adapter.DeliveryResult, error) {

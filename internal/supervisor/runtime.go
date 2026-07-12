@@ -108,6 +108,19 @@ const (
 	BlockKindFinal          BlockKind = "final"
 )
 
+// ReportIdentity freezes the producing attempt identity at report publication time.
+// Barrier validates disk meta against this snapshot, not a dynamic current/latest attempt.
+type ReportIdentity struct {
+	TaskID        string    `json:"task_id"`
+	WorkerID      string    `json:"worker_id"`
+	AttemptNumber int       `json:"attempt_number"`
+	EnvelopeHash  string    `json:"envelope_hash"`
+	MarkdownHash  string    `json:"markdown_hash"`
+	PublishedAt   time.Time `json:"published_at"`
+	// Stale is set when a newer attempt begins; old reports must not pass Barrier.
+	Stale bool `json:"stale,omitempty"`
+}
+
 type TaskState struct {
 	Task                domain.Task           `json:"task"`
 	Worker              *domain.WorkerSession `json:"worker,omitempty"` // current/active attempt projection (compat)
@@ -116,6 +129,7 @@ type TaskState struct {
 	BlockKind           BlockKind             `json:"block_kind,omitempty"`
 	Dimensions          state.Dimensions      `json:"status_dimensions"`
 	ReportPath          string                `json:"report_path,omitempty"`
+	ReportIdentity      *ReportIdentity       `json:"report_identity,omitempty"`
 	Validation          []ValidationResult    `json:"validation,omitempty"`
 	LastError           string                `json:"last_error,omitempty"`
 	LastProgress        time.Time             `json:"last_progress_at,omitempty"`
@@ -169,6 +183,7 @@ type Service struct {
 	router         *message.Router
 	pending        map[string]chan message.Resolution
 	active         map[string]activeWorker
+	resumeInFlight map[string]bool
 	runBaseline    verify.WorkspaceSnapshot
 
 	// Commit fail-closed control plane.
@@ -320,12 +335,79 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 			return nil, fmt.Errorf("write recovered state.json: %w", err)
 		}
 	}
-	messageIndex, err := message.Replay(paths.Messages)
-	if err != nil {
-		return nil, fmt.Errorf("replay messages: %w", err)
-	}
-	snapshot.Messages = message.Sorted(messageIndex, false)
+	messageReplay, err := message.ReplayDetailed(paths.Messages)
 	messageStore := message.NewStore(paths.Messages)
+	messageIndex := messageReplay.Messages
+	if messageIndex == nil {
+		messageIndex = map[string]message.Message{}
+	}
+	acceptingWork := true
+	if err != nil {
+		var corrupt *message.ErrJournalCorrupt
+		if errors.As(err, &corrupt) {
+			// Complete lifecycle-illegal records: fail-closed. Do not truncate mid-journal.
+			// Incomplete tails are repaired by ReplayDetailed before this path.
+			disableReason := "message_journal_corrupt: " + corrupt.Error()
+			messageStore.DisableAppend(disableReason)
+			// Durable marker so a later NewStore(path).Append also refuses writes
+			// even if this Load returns an error before a Service is retained.
+			if markerErr := os.WriteFile(paths.Messages+".append-disabled", []byte(disableReason+"\n"), 0o600); markerErr != nil {
+				return nil, errors.Join(
+					fmt.Errorf("message journal corrupt: %w", corrupt),
+					fmt.Errorf("write append-disabled marker: %w", markerErr),
+				)
+			}
+			acceptingWork = false
+			snapshot.Run.Status = domain.RunDegraded
+			snapshot.LastError = disableReason
+			// Empty projection — corrupt journal is not a trustworthy message source.
+			messageIndex = map[string]message.Message{}
+			snapshot.Messages = nil
+			// Fail-closed status must be durable; write failures must surface.
+			persistErr := errors.Join(
+				storage.AtomicWriteJSON(paths.State, snapshot, 0o600),
+				storage.AtomicWriteFile(paths.Status, []byte(
+					"# Run Status\n\n- status: `degraded`\n- reason: `message_journal_corrupt`\n- error: `"+corrupt.Error()+"`\n",
+				), 0o600),
+			)
+			if persistErr != nil {
+				// Still construct a fail-closed Service so callers that retain it
+				// cannot start workers or append; also return the persist error.
+				svc := &Service{
+					runDir: runDir, paths: paths, registry: registry, config: config,
+					snapshot: snapshot, events: event.NewStore(paths.Events, string(run.RunID), lastSeq),
+					terminal: make(chan struct{}), recovering: recovering, plan: plan,
+					messages: messageStore, messageIndex: messageIndex,
+					pending: map[string]chan message.Resolution{}, active: map[string]activeWorker{},
+					cancelledTasks: map[string]bool{}, runBaseline: verify.WorkspaceSnapshot{},
+					fatalPersistence: make(chan error, 1), acceptingWork: false, advance: make(chan struct{}, 1),
+				}
+				// Router still required for API surface; store is append-disabled.
+				if r, rErr := message.NewRouter(message.NewRouterOptions{RunID: string(run.RunID), Store: messageStore, Initial: messageIndex}); rErr == nil {
+					svc.router = r
+				}
+				return svc, errors.Join(
+					fmt.Errorf("message journal corrupt: %w", corrupt),
+					fmt.Errorf("persist fail-closed status: %w", persistErr),
+				)
+			}
+		} else {
+			return nil, fmt.Errorf("replay messages: %w", err)
+		}
+	} else {
+		snapshot.Messages = message.Sorted(messageIndex, false)
+		// Honor prior append-disabled marker from a previous corrupt Load.
+		if _, markerErr := os.Stat(paths.Messages + ".append-disabled"); markerErr == nil {
+			messageStore.DisableAppend("message journal append disabled by prior corruption marker")
+			acceptingWork = false
+			if snapshot.Run.Status != domain.RunDegraded && snapshot.Run.Status != domain.RunFailed {
+				snapshot.Run.Status = domain.RunDegraded
+			}
+			if snapshot.LastError == "" {
+				snapshot.LastError = "message_journal_corrupt"
+			}
+		}
+	}
 	router, err := message.NewRouter(message.NewRouterOptions{
 		RunID:   string(run.RunID),
 		Store:   messageStore,
@@ -347,7 +429,7 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 		snapshot: snapshot, events: event.NewStore(paths.Events, string(run.RunID), lastSeq),
 		terminal: make(chan struct{}), recovering: recovering, plan: plan,
 		messages: messageStore, messageIndex: messageIndex, router: router, pending: map[string]chan message.Resolution{}, active: map[string]activeWorker{}, cancelledTasks: map[string]bool{}, runBaseline: runBaseline,
-		fatalPersistence: make(chan error, 1), acceptingWork: true, advance: make(chan struct{}, 1),
+		fatalPersistence: make(chan error, 1), acceptingWork: acceptingWork, advance: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -470,24 +552,32 @@ func (s *Service) RequestCancel(ctx context.Context) error {
 		active = append(active, worker)
 	}
 	s.mu.Unlock()
-	_ = s.appendEvent(event.Input{Source: "supervisor", Type: event.CancelTreeRequested, Severity: "warning", Payload: map[string]any{"scope": "run"}})
-	var firstErr error
+
+	var errs []error
+	if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.CancelTreeRequested, Severity: "warning", Payload: map[string]any{"scope": "run"}}); err != nil {
+		errs = append(errs, err)
+	}
 	degraded := false
+	// One worker failure must not stop cancellation of others.
 	for _, worker := range active {
 		result, err := s.terminateActiveWorker(ctx, worker)
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if err != nil {
+			errs = append(errs, err)
 		}
 		if !result.TreeExited && !result.PIDReused {
 			degraded = true
 		}
 	}
-	_ = s.appendEvent(event.Input{Source: "supervisor", Type: event.CancelTreeCompleted, Severity: "warning", Payload: map[string]any{"scope": "run", "degraded": degraded}})
+	if err := s.appendEvent(event.Input{Source: "supervisor", Type: event.CancelTreeCompleted, Severity: "warning", Payload: map[string]any{"scope": "run", "degraded": degraded}}); err != nil {
+		errs = append(errs, err)
+	}
 	if degraded {
-		_ = s.setRunStatus(domain.RunDegraded, "cancel completed with residual worker processes")
+		if err := s.setRunStatus(domain.RunDegraded, "cancel completed with residual worker processes"); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	s.signalAdvance()
-	return firstErr
+	return errors.Join(errs...)
 }
 
 func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
@@ -498,8 +588,17 @@ func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 		if !ok {
 			return nil // idempotent: already cancelled and inactive
 		}
-		_, err := s.terminateActiveWorker(ctx, worker)
-		return err
+		result, err := s.terminateActiveWorker(ctx, worker)
+		var errs []error
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if !result.TreeExited && !result.PIDReused {
+			if sErr := s.setRunStatus(domain.RunDegraded, "task cancel left residual processes"); sErr != nil {
+				errs = append(errs, sErr)
+			}
+		}
+		return errors.Join(errs...)
 	}
 	worker, ok := s.active[taskID]
 	if !ok {
@@ -508,36 +607,110 @@ func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 	}
 	s.cancelledTasks[taskID] = true
 	s.mu.Unlock()
-	_ = s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: event.CancelTreeRequested, Severity: "warning", Payload: map[string]any{"scope": "task"}})
+
+	var errs []error
+	if err := s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: event.CancelTreeRequested, Severity: "warning", Payload: map[string]any{"scope": "task"}}); err != nil {
+		errs = append(errs, err)
+	}
 	result, err := s.terminateActiveWorker(ctx, worker)
-	_ = s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: event.CancelTreeCompleted, Severity: "warning", Payload: map[string]any{
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if err := s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: event.CancelTreeCompleted, Severity: "warning", Payload: map[string]any{
 		"tree_exited": result.TreeExited, "pid_reused": result.PIDReused, "remaining": result.RemainingPIDs,
-	}})
-	if err == nil && !result.TreeExited && !result.PIDReused {
-		_ = s.setRunStatus(domain.RunDegraded, "task cancel left residual processes")
+		"orphan_risk": result.OrphanRisk,
+	}}); err != nil {
+		errs = append(errs, err)
+	}
+	if !result.TreeExited && !result.PIDReused {
+		if err := s.setRunStatus(domain.RunDegraded, "task cancel left residual processes"); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	s.signalAdvance()
-	return err
+	return errors.Join(errs...)
 }
 
 func (s *Service) terminateActiveWorker(ctx context.Context, worker activeWorker) (process.TerminationResult, error) {
 	// Protocol interrupt first (best effort).
-	_ = worker.adapter.InterruptTurn(ctx, worker.sessionID)
+	if worker.adapter != nil {
+		_ = worker.adapter.InterruptTurn(ctx, worker.sessionID)
+	}
 	policy := defaultCancelPolicy(s.config.CancelGrace)
 	var result process.TerminationResult
 	var err error
 	if worker.identity.Complete() {
 		result, err = process.Controller{Manager: process.PlatformManager{}}.TerminateTree(ctx, worker.identity, policy)
+		if err == nil && !result.TreeExited && !result.PIDReused {
+			result.OrphanRisk = true
+		}
 	} else {
-		// Fall back to adapter terminate when OS identity is incomplete.
-		_ = worker.adapter.TerminateSession(context.Background(), worker.sessionID)
+		// Incomplete identity: Adapter terminate is best-effort only.
+		// TerminateSession returning nil does NOT confirm full process-tree exit.
 		result.TermSent = true
-		result.TreeExited = true
+		result.TreeExited = false
+		result.OrphanRisk = true
+		if worker.adapter != nil {
+			if termErr := worker.adapter.TerminateSession(context.Background(), worker.sessionID); termErr != nil {
+				result.Errors = append(result.Errors, "adapter terminate: "+termErr.Error())
+				err = termErr
+			} else {
+				result.Errors = append(result.Errors, "incomplete process identity: tree exit unconfirmed after adapter terminate")
+			}
+		} else {
+			result.Errors = append(result.Errors, "incomplete process identity and no adapter for terminate fallback")
+			err = fmt.Errorf("incomplete process identity; cannot confirm tree exit")
+		}
 	}
 	if worker.cancel != nil {
 		worker.cancel()
 	}
+	// Persist residual / orphan facts onto the Task when confirmation failed.
+	if !result.TreeExited && !result.PIDReused {
+		if persistErr := s.recordCancelOrphanRisk(worker, result); persistErr != nil {
+			err = errors.Join(err, persistErr)
+		}
+	}
 	return result, err
+}
+
+// recordCancelOrphanRisk marks process unknown/orphaned when cancel could not
+// confirm tree exit. Remaining PIDs and reason are durable via Commit.
+func (s *Service) recordCancelOrphanRisk(worker activeWorker, result process.TerminationResult) error {
+	if worker.taskID == "" {
+		return nil
+	}
+	processState := state.ProcessUnknown
+	if len(result.RemainingPIDs) > 0 || result.OrphanRisk {
+		if len(result.RemainingPIDs) > 0 {
+			processState = state.ProcessOrphaned
+		}
+	}
+	reason := "cancel could not confirm process tree exit"
+	if len(result.Errors) > 0 {
+		reason = reason + ": " + strings.Join(result.Errors, "; ")
+	}
+	return s.commitMutate(context.Background(), event.Input{
+		TaskID: worker.taskID, WorkerID: worker.workerID, Source: "supervisor",
+		Type: event.ProcessOrphaned, Severity: "error",
+		Payload: map[string]any{
+			"from": string(state.ProcessAlive), "to": string(processState),
+			"reason": reason, "remaining": result.RemainingPIDs, "orphan_risk": result.OrphanRisk,
+			"tree_exited": result.TreeExited,
+		},
+	}, func(candidate *Snapshot) error {
+		index, err := findTaskIndex(candidate, domain.TaskID(worker.taskID))
+		if err != nil {
+			return err
+		}
+		candidate.Tasks[index].Dimensions.Process = processState
+		if candidate.Tasks[index].Worker != nil {
+			candidate.Tasks[index].Worker.StatusDimensions.Process = processState
+		}
+		candidate.LastError = reason
+		candidate.UpdatedAt = time.Now().UTC()
+		return nil
+	})
 }
 
 func (s *Service) execute(ctx context.Context) error {
@@ -1000,6 +1173,8 @@ func (s *Service) runBarrier(ctx context.Context, planned domain.WavePlan, basel
 }
 
 // AcceptBarrierWarnings records formal acceptance of passed_with_warnings for a Wave.
+// Current workspace/report/message/task facts are re-collected; old barrier-input.json
+// is never treated as proof that nothing changed.
 func (s *Service) AcceptBarrierWarnings(waveID, actor, reason string) error {
 	if strings.TrimSpace(actor) == "" || strings.TrimSpace(reason) == "" {
 		return fmt.Errorf("actor and reason are required to accept barrier warnings")
@@ -1023,20 +1198,8 @@ func (s *Service) AcceptBarrierWarnings(waveID, actor, reason string) error {
 	if verification.Result != domain.BarrierPassedWithWarnings || verification.Rejected {
 		return fmt.Errorf("wave %s barrier result is %s, not passed_with_warnings", waveID, verification.Result)
 	}
-	// Recompute current input hash; acceptance binds to the stored verification input_hash.
-	if verification.InputHash == "" {
-		return fmt.Errorf("wave %s verification lacks input_hash; re-run barrier", waveID)
-	}
-	inputData, err := os.ReadFile(filepath.Join(paths.Root, "barrier-input.json"))
-	if err != nil {
-		return fmt.Errorf("barrier input missing for %s; re-run barrier", waveID)
-	}
-	var input wave.BarrierInputs
-	if err := json.Unmarshal(inputData, &input); err != nil {
+	if err := s.revalidateBarrierCurrentFacts(context.Background(), domain.WaveID(waveID), verification.InputHash); err != nil {
 		return err
-	}
-	if hashBarrierInputs(input) != verification.InputHash {
-		return fmt.Errorf("barrier input changed since evaluation; acceptance rejected (re-run barrier)")
 	}
 	now := time.Now().UTC()
 	verification.Accepted = true
@@ -1075,6 +1238,7 @@ func (s *Service) AcceptBarrierWarnings(waveID, actor, reason string) error {
 }
 
 // RejectBarrierWarnings records rejection of warnings and fails the Wave.
+// Current facts are re-collected the same way as AcceptBarrierWarnings.
 func (s *Service) RejectBarrierWarnings(waveID, actor, reason string) error {
 	if strings.TrimSpace(actor) == "" || strings.TrimSpace(reason) == "" {
 		return fmt.Errorf("actor and reason are required to reject barrier warnings")
@@ -1095,19 +1259,11 @@ func (s *Service) RejectBarrierWarnings(waveID, actor, reason string) error {
 	if err := json.Unmarshal(data, &verification); err != nil {
 		return err
 	}
-	if verification.Result != domain.BarrierPassedWithWarnings || verification.InputHash == "" {
+	if verification.Result != domain.BarrierPassedWithWarnings {
 		return fmt.Errorf("wave %s verification is stale; re-run barrier", waveID)
 	}
-	inputData, err := os.ReadFile(filepath.Join(paths.Root, "barrier-input.json"))
-	if err != nil {
-		return fmt.Errorf("barrier input missing for %s; re-run barrier", waveID)
-	}
-	var input wave.BarrierInputs
-	if err := json.Unmarshal(inputData, &input); err != nil {
+	if err := s.revalidateBarrierCurrentFacts(context.Background(), domain.WaveID(waveID), verification.InputHash); err != nil {
 		return err
-	}
-	if hashBarrierInputs(input) != verification.InputHash {
-		return fmt.Errorf("barrier input changed since evaluation; rejection rejected (re-run barrier)")
 	}
 	now := time.Now().UTC()
 	verification.Rejected = true
@@ -1386,10 +1542,14 @@ func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
 			return transitionErr
 		}
 	}
-	s.onTaskTerminalMessages(string(runtime.Task.TaskID), "task failed: "+stage)
+	if expireErr := s.onTaskTerminalMessages(string(runtime.Task.TaskID), "task failed: "+stage); expireErr != nil {
+		// Fail-closed: terminal cleanup persistence errors must surface.
+		return fmt.Errorf("task failed (%s): %w; also expire messages: %v", stage, err, expireErr)
+	}
 	if stage != "result" && stage != "result_validation" && runtime.ReportPath == "" {
 		failed := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusFailed, Summary: "Worker execution failed", NoFilesChangedReason: "No verified file list was available after the failure", ValidationNotRunReason: "validation was not reached", FailureStage: stage, ErrorSummary: err.Error(), WorkspaceState: "Workspace was left in place; no rollback was performed", HandoffNotes: []string{"Main Agent should inspect the workspace before retrying."}}
-		if publishErr := report.Publish(s.taskDir(runtime.Task), failed, time.Now().UTC()); publishErr == nil {
+		attemptNumber := reportAttemptNumber(runtime)
+		if publishErr := report.Publish(s.taskDir(runtime.Task), failed, attemptNumber, time.Now().UTC()); publishErr == nil {
 			runtime.ReportPath = filepath.Join(s.taskDir(runtime.Task), "report.md")
 			_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.ReportPublished, Severity: "error"})
 		}
@@ -1408,20 +1568,43 @@ func (s *Service) cancelTask(runtime *TaskState, reason string) error {
 			return err
 		}
 	}
-	s.onTaskTerminalMessages(string(runtime.Task.TaskID), "task cancelled: "+reason)
+	if expireErr := s.onTaskTerminalMessages(string(runtime.Task.TaskID), "task cancelled: "+reason); expireErr != nil {
+		return expireErr
+	}
 	result := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusCancelled, Summary: "Task was cancelled", NoFilesChangedReason: "cancellation state was collected before verification", ValidationNotRunReason: "run cancelled", StopReason: reason, WorkspaceState: "workspace was left in place; no rollback was performed", HandoffNotes: []string{"Main Agent must inspect the current workspace before retrying."}}
-	if err := report.Publish(s.taskDir(runtime.Task), result, time.Now().UTC()); err == nil {
+	if err := report.Publish(s.taskDir(runtime.Task), result, reportAttemptNumber(runtime), time.Now().UTC()); err == nil {
 		runtime.ReportPath = filepath.Join(s.taskDir(runtime.Task), "report.md")
 		_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.ReportPublished, Severity: "warning"})
 	}
 	return s.saveRuntime(*runtime)
 }
 
+func reportAttemptNumber(runtime *TaskState) int {
+	if runtime == nil {
+		return 1
+	}
+	if runtime.ActiveAttempt > 0 {
+		return runtime.ActiveAttempt
+	}
+	if runtime.Worker != nil && runtime.Worker.Attempt > 0 {
+		return runtime.Worker.Attempt
+	}
+	if n := len(runtime.Attempts); n > 0 {
+		return runtime.Attempts[n-1].Number
+	}
+	return 1
+}
+
 func (s *Service) finishRun(status domain.RunStatus, reason string) error {
 	// Expire all pending messages across tasks when the Run ends hard.
 	if status == domain.RunFailed || status == domain.RunCancelled || status == domain.RunCompleted {
 		for _, runtime := range s.Snapshot().Tasks {
-			s.onTaskTerminalMessages(string(runtime.Task.TaskID), "run ended: "+string(status))
+			if err := s.onTaskTerminalMessages(string(runtime.Task.TaskID), "run ended: "+string(status)); err != nil {
+				// Fail-closed for completed runs; still proceed for failed/cancelled so status is durable.
+				if status == domain.RunCompleted {
+					return fmt.Errorf("expire messages on run complete: %w", err)
+				}
+			}
 		}
 	}
 	if status == domain.RunFailed {

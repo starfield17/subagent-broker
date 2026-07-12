@@ -21,12 +21,17 @@ type TerminationPolicy struct {
 
 // TerminationResult records which signals were sent and whether the original
 // process tree exited (or was replaced by PID reuse).
+//
+// TreeExited=true only when the controller confirmed the original tree is gone
+// (or PID reuse). Inability to confirm is never reported as success: TreeExited
+// stays false and OrphanRisk may be set.
 type TerminationResult struct {
 	InterruptSent bool
 	TermSent      bool
 	KillSent      bool
 	TreeExited    bool
 	PIDReused     bool
+	OrphanRisk    bool
 	RemainingPIDs []int
 	Errors        []string
 }
@@ -130,6 +135,7 @@ func (c Controller) TerminateTree(
 	}
 
 	result.TreeExited = false
+	result.OrphanRisk = true
 	result.RemainingPIDs = remaining
 	return result, nil
 }

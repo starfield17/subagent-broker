@@ -2,6 +2,7 @@ package message
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,8 +87,30 @@ func IsTerminal(status Status) bool {
 }
 
 // IsPending reports whether status is non-terminal.
+// Do not use this alone for instruction outbox membership — see IsDeliveryPending.
 func IsPending(status Status) bool {
 	return !IsTerminal(status)
+}
+
+// IsDeliveryPending reports whether an instruction still needs to be sent.
+// Delivered instructions are NOT delivery-pending (must not be re-sent on flush).
+func IsDeliveryPending(msg Message) bool {
+	return msg.Type == Instruction && msg.Status == Queued
+}
+
+// IsDecisionType reports whether the message is a Main Agent decision request.
+func IsDecisionType(t Type) bool {
+	switch t {
+	case Question, ScopeExpansionRequest, PermissionRequest:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsDecisionPending reports whether a decision message still blocks the Task.
+func IsDecisionPending(msg Message) bool {
+	return IsDecisionType(msg.Type) && !IsTerminal(msg.Status)
 }
 
 type Category string
@@ -225,9 +248,14 @@ func PublishQuestionProjection(taskDir, messageID, taskID string, q QuestionEnve
 }
 
 // ClearTopLevelQuestion removes only the current-question projection files.
+// Missing files are ignored; any other remove error is returned (fail-closed callers).
 func ClearTopLevelQuestion(taskDir string) error {
-	_ = os.Remove(filepath.Join(taskDir, "question.md"))
-	_ = os.Remove(filepath.Join(taskDir, "question.meta.json"))
+	for _, name := range []string{"question.md", "question.meta.json"} {
+		path := filepath.Join(taskDir, name)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove question projection %s: %w", name, err)
+		}
+	}
 	return nil
 }
 

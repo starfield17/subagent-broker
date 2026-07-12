@@ -201,15 +201,20 @@ func (s *Service) saveRuntime(runtime TaskState) error {
 		// Preserve scope expansions applied while the worker was running.
 		runtime.Task.WriteScope = append([]string(nil), candidate.Tasks[index].Task.WriteScope...)
 		runtime.Task.AllowPublicInterfaceChange = candidate.Tasks[index].Task.AllowPublicInterfaceChange
-		// Re-apply blocked status if messages are still pending.
-		// Commit already holds s.mu; read messageIndex without re-locking.
+		// Re-apply blocked status only for pending decision messages (questions/
+		// permissions/scope). Instructions are outbox items and must not force
+		// TaskBlocked mid-execution (that breaks result → verification transitions).
 		for _, pending := range s.messageIndex {
-			if pending.TaskID == string(taskID) && pending.Status != message.Answered && pending.Status != message.Expired && pending.Status != message.Failed {
-				runtime.Task.Status = state.TaskBlocked
-				runtime.Dimensions.Task = state.TaskBlocked
-				runtime.Dimensions.Progress = state.ProgressQuiet
-				break
+			if pending.TaskID != string(taskID) || message.IsTerminal(pending.Status) {
+				continue
 			}
+			if pending.Type == message.Instruction {
+				continue
+			}
+			runtime.Task.Status = state.TaskBlocked
+			runtime.Dimensions.Task = state.TaskBlocked
+			runtime.Dimensions.Progress = state.ProgressQuiet
+			break
 		}
 		candidate.Tasks[index] = cloneTaskState(runtime)
 		candidate.UpdatedAt = time.Now().UTC()
@@ -262,6 +267,10 @@ func (s *Service) commitTaskDimensions(runtime *TaskState, eventType string, fro
 		}
 		if runtime.ReportPath != "" {
 			candidate.Tasks[index].ReportPath = runtime.ReportPath
+		}
+		if runtime.ReportIdentity != nil {
+			id := *runtime.ReportIdentity
+			candidate.Tasks[index].ReportIdentity = &id
 		}
 		if len(runtime.Validation) > 0 {
 			candidate.Tasks[index].Validation = append([]ValidationResult(nil), runtime.Validation...)

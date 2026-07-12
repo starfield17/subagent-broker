@@ -1,8 +1,11 @@
 package report
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -137,27 +140,136 @@ func ValidateEnvelope(e Envelope) error {
 	return nil
 }
 
+// Meta is durable report identity + content integrity binding.
 type Meta struct {
-	SchemaVersion string    `json:"schema_version"`
-	TaskID        string    `json:"task_id"`
-	WorkerID      string    `json:"worker_id"`
-	Status        Status    `json:"status"`
-	PublishedAt   time.Time `json:"published_at"`
+	SchemaVersion  string    `json:"schema_version"`
+	TaskID         string    `json:"task_id"`
+	WorkerID       string    `json:"worker_id"`
+	AttemptNumber  int       `json:"attempt_number,omitempty"`
+	Status         Status    `json:"status"`
+	EnvelopeHash   string    `json:"envelope_hash,omitempty"`
+	MarkdownHash   string    `json:"markdown_hash,omitempty"`
+	PublishedAt    time.Time `json:"published_at"`
+	// Unverified is set for legacy reports that lack attempt/hash binding.
+	Unverified bool `json:"unverified,omitempty"`
 }
 
-func Publish(taskDir string, e Envelope, now time.Time) error {
+// HashBytes returns a stable hex sha256 of content.
+func HashBytes(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
+// CanonicalEnvelopeJSON returns deterministic JSON for envelope hashing.
+func CanonicalEnvelopeJSON(e Envelope) ([]byte, error) {
+	return json.Marshal(e)
+}
+
+// Publish atomically publishes report.meta.json then report.md (formal marker).
+// attemptNumber binds the report to the Worker Attempt that produced it.
+// report.envelope.json is written for Barrier re-hash verification.
+func Publish(taskDir string, e Envelope, attemptNumber int, now time.Time) error {
 	if err := ValidateEnvelope(e); err != nil {
 		return err
 	}
-	meta, err := json.MarshalIndent(Meta{SchemaVersion: SchemaVersion, TaskID: e.TaskID, WorkerID: e.WorkerID, Status: e.Status, PublishedAt: now.UTC()}, "", "  ")
+	if attemptNumber <= 0 {
+		return fmt.Errorf("attempt_number is required for report publication")
+	}
+	envelopeJSON, err := CanonicalEnvelopeJSON(e)
 	if err != nil {
 		return err
 	}
-	// Metadata is written first; report.md is the formal publication marker.
-	if err := storage.AtomicWriteFile(filepath.Join(taskDir, "report.meta.json"), append(meta, '\n'), 0o600); err != nil {
+	markdown := RenderMarkdown(e)
+	meta := Meta{
+		SchemaVersion: SchemaVersion,
+		TaskID:        e.TaskID,
+		WorkerID:      e.WorkerID,
+		AttemptNumber: attemptNumber,
+		Status:        e.Status,
+		EnvelopeHash:  HashBytes(envelopeJSON),
+		MarkdownHash:  HashBytes([]byte(markdown)),
+		PublishedAt:   now.UTC(),
+	}
+	metaJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
 		return err
 	}
-	return storage.AtomicWriteFile(filepath.Join(taskDir, "report.md"), []byte(RenderMarkdown(e)), 0o600)
+	// Envelope + meta first; report.md is the formal publication marker.
+	if err := storage.AtomicWriteFile(filepath.Join(taskDir, "report.envelope.json"), append(envelopeJSON, '\n'), 0o600); err != nil {
+		return err
+	}
+	if err := storage.AtomicWriteFile(filepath.Join(taskDir, "report.meta.json"), append(metaJSON, '\n'), 0o600); err != nil {
+		return err
+	}
+	return storage.AtomicWriteFile(filepath.Join(taskDir, "report.md"), []byte(markdown), 0o600)
+}
+
+// ErrReportIdentityMismatch is returned when meta fields disagree with the
+// canonical envelope or expected frozen report identity.
+var ErrReportIdentityMismatch = fmt.Errorf("report identity mismatch")
+
+// VerifyDiskArtifacts re-reads on-disk report artifacts and validates hashes
+// plus meta↔envelope field binding. Envelope is the canonical status source.
+func VerifyDiskArtifacts(taskDir string) (Meta, Envelope, error) {
+	metaPath := filepath.Join(taskDir, "report.meta.json")
+	mdPath := filepath.Join(taskDir, "report.md")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		return Meta{}, Envelope{}, err
+	}
+	mdData, err := os.ReadFile(mdPath)
+	if err != nil {
+		return Meta{}, Envelope{}, err
+	}
+	var meta Meta
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		return Meta{}, Envelope{}, fmt.Errorf("decode report.meta.json: %w", err)
+	}
+	var envelope Envelope
+	envPath := filepath.Join(taskDir, "report.envelope.json")
+	envData, envErr := os.ReadFile(envPath)
+	if envErr == nil {
+		if err := json.Unmarshal(envData, &envelope); err != nil {
+			return meta, Envelope{}, fmt.Errorf("decode report.envelope.json: %w", err)
+		}
+	}
+
+	// Legacy reports without hash/attempt are unverified.
+	if meta.AttemptNumber <= 0 || meta.EnvelopeHash == "" || meta.MarkdownHash == "" {
+		meta.Unverified = true
+		return meta, envelope, nil
+	}
+	if envErr != nil {
+		return meta, envelope, fmt.Errorf("report.envelope.json missing for hashed report: %w", envErr)
+	}
+
+	// Meta must bind to the canonical envelope (status/task/worker).
+	if meta.TaskID != envelope.TaskID || meta.WorkerID != envelope.WorkerID || meta.Status != envelope.Status {
+		return meta, envelope, fmt.Errorf("%w: meta(task=%q worker=%q status=%q) != envelope(task=%q worker=%q status=%q)",
+			ErrReportIdentityMismatch, meta.TaskID, meta.WorkerID, meta.Status, envelope.TaskID, envelope.WorkerID, envelope.Status)
+	}
+
+	if got := HashBytes(mdData); got != meta.MarkdownHash {
+		return meta, envelope, fmt.Errorf("report.md hash mismatch: meta=%s disk=%s", meta.MarkdownHash, got)
+	}
+	// Prefer hash of canonical envelope JSON; accept on-disk bytes with optional trailing newline.
+	if raw, cErr := CanonicalEnvelopeJSON(envelope); cErr == nil {
+		if HashBytes(raw) != meta.EnvelopeHash &&
+			HashBytes(bytesTrimTrailingNewline(envData)) != meta.EnvelopeHash &&
+			HashBytes(envData) != meta.EnvelopeHash {
+			return meta, envelope, fmt.Errorf("report.envelope.json hash mismatch: meta=%s", meta.EnvelopeHash)
+		}
+	} else {
+		return meta, envelope, cErr
+	}
+	return meta, envelope, nil
+}
+
+func bytesTrimTrailingNewline(data []byte) []byte {
+	if len(data) > 0 && data[len(data)-1] == '\n' {
+		return data[:len(data)-1]
+	}
+	return data
 }
 
 func RenderMarkdown(e Envelope) string {

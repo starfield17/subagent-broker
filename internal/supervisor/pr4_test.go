@@ -87,6 +87,7 @@ func TestHighRiskUnauthorizedIsError(t *testing.T) {
 
 func TestAcceptBarrierWarningsRequiresReasonAndHash(t *testing.T) {
 	home := t.TempDir()
+	projectRoot := t.TempDir()
 	layout, err := storage.NewLayout(home)
 	if err != nil {
 		t.Fatal(err)
@@ -101,9 +102,49 @@ func TestAcceptBarrierWarningsRequiresReasonAndHash(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = os.MkdirAll(wavePaths.Root, 0o700)
-	input := wave.BarrierInputs{WaveID: "wave-1", ExistingWarnings: []string{"w"}}
+
+	// Baseline + empty workspace → stable current-facts hash for revalidation.
+	baseline, err := verify.CaptureWorkspace(projectRoot, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.AtomicWriteJSON(wavePaths.Baseline, baseline, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runPaths, _ := layout.RunPaths(projectID, runID)
+	service := &Service{
+		config: Config{BrokerHome: home},
+		runDir: runDir,
+		paths:  runPaths,
+		plan: domain.RunPlan{Waves: []domain.WavePlan{{
+			WaveID: "wave-1",
+			// No tasks: collectBarrierInputs only captures workspace/pending/checks.
+		}}},
+		snapshot: Snapshot{
+			Run: domain.Run{RunID: domain.RunID(runID), ProjectID: domain.ProjectID(projectID)},
+			Waves: []domain.Wave{{
+				WaveID: "wave-1", Status: domain.WaveWaiting, BarrierResult: domain.BarrierPassedWithWarnings,
+			}},
+			// projectRoot is resolved from first task; seed a non-task-bearing root via a dummy task.
+			Tasks: []TaskState{{Task: domain.Task{TaskID: "seed", ProjectRoot: projectRoot, WaveID: "other"}}},
+		},
+		acceptingWork:     true,
+		fatalPersistence:  make(chan error, 1),
+		events:            &fakeEventAppender{},
+		persistSnapshotFn: func(Snapshot) error { return nil },
+	}
+
+	// Collect current facts the same way Accept will, then bind verification to that hash.
+	input, err := service.collectBarrierInputs(context.Background(), service.plan.Waves[0], baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hash binds to recollected facts only (ExistingWarnings are evaluation-only extras).
 	hash := hashBarrierInputs(input)
-	verification := wave.EvaluateBarrier(input, time.Now().UTC())
+	evalInput := input
+	evalInput.ExistingWarnings = []string{"w"}
+	verification := wave.EvaluateBarrier(evalInput, time.Now().UTC())
 	verification.InputHash = hash
 	if verification.Result != domain.BarrierPassedWithWarnings {
 		t.Fatalf("%s", verification.Result)
@@ -113,20 +154,6 @@ func TestAcceptBarrierWarningsRequiresReasonAndHash(t *testing.T) {
 	inRaw, _ := json.Marshal(input)
 	_ = os.WriteFile(filepath.Join(wavePaths.Root, "barrier-input.json"), inRaw, 0o600)
 
-	runPaths, _ := layout.RunPaths(projectID, runID)
-	service := &Service{
-		config: Config{BrokerHome: home},
-		runDir: runDir,
-		paths:  runPaths,
-		snapshot: Snapshot{
-			Run:   domain.Run{RunID: domain.RunID(runID), ProjectID: domain.ProjectID(projectID)},
-			Waves: []domain.Wave{{WaveID: "wave-1", Status: domain.WaveWaiting, BarrierResult: domain.BarrierPassedWithWarnings}},
-		},
-		acceptingWork:     true,
-		fatalPersistence:  make(chan error, 1),
-		events:            &fakeEventAppender{},
-		persistSnapshotFn: func(Snapshot) error { return nil },
-	}
 	if err := service.AcceptBarrierWarnings("wave-1", "agent", ""); err == nil {
 		t.Fatal("empty reason should fail")
 	}

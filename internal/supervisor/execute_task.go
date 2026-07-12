@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
@@ -84,6 +85,8 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	// Resume-mode outbox will flush after session is active.
 
 	// Persist new attempt without dropping history.
+	// Starting any new attempt invalidates a previously frozen report identity
+	// (explicit retry / recovery resume must not silently reuse an old report).
 	if err := s.commitMutate(parent, event.Input{
 		TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
 		Type: event.WorkerAttemptStarted, Severity: "info",
@@ -104,6 +107,12 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		candidate.Tasks[index].Worker = &w
 		candidate.Tasks[index].Dimensions = w.StatusDimensions
 		candidate.Tasks[index].LastProgress = w.LastProgressAt
+		if candidate.Tasks[index].ReportIdentity != nil {
+			// Freeze invalidation: prior report no longer represents current execution facts.
+			stale := *candidate.Tasks[index].ReportIdentity
+			stale.Stale = true
+			candidate.Tasks[index].ReportIdentity = &stale
+		}
 		candidate.UpdatedAt = time.Now().UTC()
 		return nil
 	}); err != nil {
@@ -222,23 +231,43 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	}
 	// After resume/start, flush resume-queued instructions into the active session.
 	if mode == workerpkg.AttemptRecoveryResume {
-		_ = s.FlushInstructionOutbox(workerCtx, string(runtime.Task.TaskID), "session_resume")
+		if flushErr := s.FlushInstructionOutbox(workerCtx, string(runtime.Task.TaskID), "session_resume"); flushErr != nil {
+			// Non-fatal for session continuation, but surface when fail-closed.
+			if !s.AcceptingWork() {
+				return flushErr
+			}
+		}
 	}
 
-	resultSeen, timedOut, exit, drainErr := s.runWorkerSession(workerCtx, runtime, harness, session, workerID, identity)
+	sessionResult, drainErr := s.runWorkerSession(workerCtx, runtime, harness, session, workerID, identity)
 	if drainErr != nil && !s.AcceptingWork() {
 		return drainErr
 	}
 	s.refreshTaskRuntime(runtime)
 
+	if sessionResult.Resolution.OrphanRisk || sessionResult.Resolution.ProcessState == state.ProcessOrphaned || sessionResult.Resolution.ProcessState == state.ProcessUnknown {
+		// Cannot forge success; surface as failure with honest process state already committed.
+		if s.isCancelled() || s.isTaskCancelled(string(runtime.Task.TaskID)) {
+			return s.cancelTask(runtime, "cancelled by main agent with unconfirmed process tree")
+		}
+		if !sessionResult.ResultSeen {
+			return s.failTask(runtime, "process_unconfirmed", fmt.Errorf("worker process tree exit unconfirmed: %s", strings.Join(sessionResult.Resolution.Errors, "; ")))
+		}
+		// Result was collected but process state is orphaned/unknown — still try to apply result,
+		// but do not pretend ProcessExited.
+	}
+
 	if s.isCancelled() || s.isTaskCancelled(string(runtime.Task.TaskID)) {
 		return s.cancelTask(runtime, "cancelled by main agent")
 	}
-	if timedOut {
+	if sessionResult.TimedOut {
 		return s.failTask(runtime, "hard_timeout", fmt.Errorf("Worker exceeded the hard timeout"))
 	}
-	if exit.Code != 0 && !resultSeen {
-		return s.failTask(runtime, "process", fmt.Errorf("worker exited with code %d: %s", exit.Code, exit.Error))
+	if sessionResult.Exit.Code != 0 && sessionResult.ResultSeen == false && sessionResult.Resolution.ExitObserved {
+		return s.failTask(runtime, "process", fmt.Errorf("worker exited with code %d: %s", sessionResult.Exit.Code, sessionResult.Exit.Error))
+	}
+	if !sessionResult.ResultSeen && !sessionResult.Resolution.ExitObserved && sessionResult.Resolution.OrphanRisk {
+		return s.failTask(runtime, "process_unconfirmed", fmt.Errorf("worker exit unobserved and tree unconfirmed"))
 	}
 
 	result, err := harness.CollectFinalResult(context.Background(), session.NativeSessionID)
@@ -253,21 +282,71 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		runtime.Task.AllowPublicInterfaceChange = latest.Task.AllowPublicInterfaceChange
 	}
 	taskDir := s.taskDir(runtime.Task)
-	if err := report.Publish(taskDir, result, time.Now().UTC()); err != nil {
+	attemptNumber := reportAttemptNumber(runtime)
+	if err := report.Publish(taskDir, result, attemptNumber, time.Now().UTC()); err != nil {
 		return s.failTask(runtime, "result_validation", err)
 	}
 	runtime.ReportPath = filepath.Join(taskDir, "report.md")
-	_ = s.finishAttempt(runtime, workerpkg.AttemptExited, "result collected")
+	// Freeze producing-attempt identity at publication time (not Barrier-time latest).
+	meta, _, verifyErr := report.VerifyDiskArtifacts(taskDir)
+	if verifyErr != nil {
+		return s.failTask(runtime, "result_validation", verifyErr)
+	}
+	reportID := ReportIdentity{
+		TaskID: meta.TaskID, WorkerID: meta.WorkerID, AttemptNumber: meta.AttemptNumber,
+		EnvelopeHash: meta.EnvelopeHash, MarkdownHash: meta.MarkdownHash, PublishedAt: meta.PublishedAt,
+	}
+	runtime.ReportIdentity = &reportID
+	attemptOutcome := workerpkg.AttemptExited
+	if sessionResult.Resolution.ProcessState == state.ProcessOrphaned {
+		attemptOutcome = workerpkg.AttemptOrphaned
+	}
+	if finErr := s.finishAttempt(runtime, attemptOutcome, "result collected"); finErr != nil {
+		return finErr
+	}
+	// Re-apply frozen identity after finishAttempt (refresh may have overwritten runtime).
+	s.refreshTaskRuntime(runtime)
+	runtime.ReportPath = filepath.Join(taskDir, "report.md")
+	runtime.ReportIdentity = &reportID
 	if err := s.saveRuntime(*runtime); err != nil {
 		return err
 	}
-	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ReportPublished, Severity: "info"}); err != nil {
+	if err := s.appendEvent(event.Input{
+		TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ReportPublished, Severity: "info",
+		Payload: map[string]any{
+			"attempt_number": attemptNumber, "worker_id": workerID,
+			"envelope_hash": reportID.EnvelopeHash, "markdown_hash": reportID.MarkdownHash,
+		},
+	}); err != nil {
 		return err
 	}
 	return s.applyResultEnvelope(runtime, result, workerID)
 }
 
-// runWorkerSession drains Events/Stderr until closed or process exits after result.
+// WorkerExitResolution is the structured outcome of drain/cleanup termination.
+// Inability to confirm exit is never reported as ProcessExited.
+type WorkerExitResolution struct {
+	ExitObserved      bool
+	TreeExitConfirmed bool
+	ExitCode          *int
+	RemainingPIDs     []int
+	OrphanRisk        bool
+	ProcessState      state.Process
+	Errors            []string
+}
+
+// workerSessionResult is the full outcome of runWorkerSession.
+type workerSessionResult struct {
+	ResultSeen bool
+	TimedOut   bool
+	Exit       adapter.ExitStatus
+	Resolution WorkerExitResolution
+}
+
+// runWorkerSession drains Events/Stderr and observes session.Exited in one select.
+// Process exit is never deferred until after streams close — Exited starts a
+// bounded post-exit drain so hang-open streams cannot stall the driver forever.
+// It never forges ProcessExited when exit and tree confirmation are both missing.
 func (s *Service) runWorkerSession(
 	workerCtx context.Context,
 	runtime *TaskState,
@@ -275,20 +354,29 @@ func (s *Service) runWorkerSession(
 	session adapter.Session,
 	workerID string,
 	identity process.Identity,
-) (resultSeen bool, timedOut bool, exit adapter.ExitStatus, err error) {
+) (workerSessionResult, error) {
+	var out workerSessionResult
 	events := session.Events
 	stderr := session.Stderr
+	exited := session.Exited
 	contextDone := workerCtx.Done()
 	progressTicker := time.NewTicker(250 * time.Millisecond)
 	defer progressTicker.Stop()
 
 	closing := false
+	exitObserved := false
+	out.Exit = adapter.ExitStatus{Code: -1}
 	drainTimeout := s.config.CancelGrace
 	if drainTimeout <= 0 {
 		drainTimeout = 1500 * time.Millisecond
 	}
 	var drainTimer *time.Timer
 	var drainC <-chan time.Time
+	var lastTerm process.TerminationResult
+	var lastTermErr error
+	controller := process.Controller{Manager: process.PlatformManager{}}
+	policy := defaultCancelPolicy(s.config.CancelGrace)
+
 	stopDrainTimer := func() {
 		if drainTimer != nil {
 			drainTimer.Stop()
@@ -298,26 +386,74 @@ func (s *Service) runWorkerSession(
 	}
 	defer stopDrainTimer()
 
-	for events != nil || stderr != nil {
+	startBoundedDrain := func() {
+		if drainC != nil {
+			return
+		}
+		stopDrainTimer()
+		drainTimer = time.NewTimer(drainTimeout)
+		drainC = drainTimer.C
+	}
+
+	terminateReliable := func() {
+		if termErr := harness.TerminateSession(context.Background(), session.NativeSessionID); termErr != nil {
+			lastTerm.Errors = append(lastTerm.Errors, "adapter terminate: "+termErr.Error())
+			lastTermErr = termErr
+		}
+		if identity.Complete() {
+			result, err := controller.TerminateTree(context.Background(), identity, policy)
+			lastTerm = result
+			if err != nil {
+				lastTermErr = err
+				lastTerm.Errors = append(lastTerm.Errors, err.Error())
+			}
+		} else {
+			lastTerm.TermSent = true
+			lastTerm.TreeExited = false
+			lastTerm.OrphanRisk = true
+			lastTerm.Errors = append(lastTerm.Errors, "incomplete process identity during drain")
+		}
+	}
+
+	// Main loop: Events, Stderr, and Exited are peers. Never wait for stream
+	// close before observing process exit. Nil channels are never selected.
+	for events != nil || stderr != nil || exited != nil {
 		select {
 		case <-contextDone:
 			contextDone = nil
-			if !resultSeen {
-				_ = harness.TerminateSession(context.Background(), session.NativeSessionID)
-				if identity.Complete() {
-					_, _ = process.Controller{Manager: process.PlatformManager{}}.TerminateTree(context.Background(), identity, defaultCancelPolicy(s.config.CancelGrace))
-				}
+			if !out.ResultSeen {
+				terminateReliable()
 			}
+			startBoundedDrain()
 		case now := <-progressTicker.C:
 			if !closing {
 				s.updateProgress(runtime, now.UTC())
 			}
 		case <-drainC:
-			if identity.Complete() {
-				_, _ = process.Controller{Manager: process.PlatformManager{}}.TerminateTree(context.Background(), identity, defaultCancelPolicy(s.config.CancelGrace))
+			// Bounded drain elapsed: stop waiting on hang-open streams.
+			if !exitObserved {
+				terminateReliable()
+			} else if identity.Complete() && !lastTerm.TreeExited {
+				// Parent exited but tree may still have children.
+				result, err := controller.TerminateTree(context.Background(), identity, policy)
+				lastTerm = result
+				if err != nil {
+					lastTermErr = err
+					lastTerm.Errors = append(lastTerm.Errors, err.Error())
+				}
 			}
 			events = nil
 			stderr = nil
+			exited = nil
+		case exitStatus, ok := <-exited:
+			if ok {
+				out.Exit = exitStatus
+				exitObserved = true
+			}
+			exited = nil
+			closing = true
+			// Process exited: allow a short drain of trailing events/stderr only.
+			startBoundedDrain()
 		case native, ok := <-events:
 			if !ok {
 				events = nil
@@ -325,13 +461,12 @@ func (s *Service) runWorkerSession(
 			}
 			s.handleNative(runtime, harness, native, workerID)
 			if (native.Kind == event.ResultSubmitted || native.Kind == event.TurnFailed) && !closing {
-				resultSeen = native.Kind == event.ResultSubmitted
+				out.ResultSeen = native.Kind == event.ResultSubmitted
 				closing = true
-				// Do not break: drain remaining events/stderr until channels close or deadline.
-				_ = harness.TerminateSession(context.Background(), session.NativeSessionID)
-				stopDrainTimer()
-				drainTimer = time.NewTimer(drainTimeout)
-				drainC = drainTimer.C
+				if termErr := harness.TerminateSession(context.Background(), session.NativeSessionID); termErr != nil {
+					lastTerm.Errors = append(lastTerm.Errors, "adapter terminate after result: "+termErr.Error())
+				}
+				startBoundedDrain()
 			}
 		case chunk, ok := <-stderr:
 			if !ok {
@@ -351,34 +486,126 @@ func (s *Service) runWorkerSession(
 		}
 	}
 
-	timedOut = errors.Is(workerCtx.Err(), context.DeadlineExceeded)
-	exit = adapter.ExitStatus{Code: -1}
-	if session.Exited != nil {
-		select {
-		case value, ok := <-session.Exited:
-			if ok {
-				exit = value
-			}
-		case <-time.After(s.config.CancelGrace + time.Second):
-			if identity.Complete() {
-				_, _ = process.Controller{Manager: process.PlatformManager{}}.TerminateTree(context.Background(), identity, defaultCancelPolicy(s.config.CancelGrace))
-			}
+	out.TimedOut = errors.Is(workerCtx.Err(), context.DeadlineExceeded)
+
+	// If Exited never arrived, attempt one final reliable terminate + tree confirm.
+	if !exitObserved {
+		terminateReliable()
+	} else if identity.Complete() && !lastTerm.TreeExited && len(lastTerm.RemainingPIDs) == 0 {
+		// Confirm tree gone after observed exit (children may remain).
+		result, err := controller.TerminateTree(context.Background(), identity, policy)
+		if err == nil {
+			lastTerm = result
+		} else {
+			lastTermErr = err
+			lastTerm.Errors = append(lastTerm.Errors, err.Error())
 		}
 	}
 
-	if runtime.Worker != nil {
-		runtime.Worker.ExitCode = &exit.Code
-		runtime.Worker.EndedAt = timePtr(time.Now().UTC())
-		runtime.Worker.StatusDimensions.Process = state.ProcessExited
-		runtime.Dimensions = runtime.Worker.StatusDimensions
+	resolution := WorkerExitResolution{
+		ExitObserved:      exitObserved,
+		TreeExitConfirmed: lastTerm.TreeExited || lastTerm.PIDReused,
+		RemainingPIDs:     append([]int(nil), lastTerm.RemainingPIDs...),
+		OrphanRisk:        lastTerm.OrphanRisk || (!exitObserved && !lastTerm.TreeExited && !lastTerm.PIDReused),
+		Errors:            append([]string(nil), lastTerm.Errors...),
 	}
-	_ = s.saveRuntime(*runtime)
-	_ = s.appendEvent(event.Input{
+	if lastTermErr != nil {
+		resolution.Errors = append(resolution.Errors, lastTermErr.Error())
+	}
+	if exitObserved {
+		code := out.Exit.Code
+		resolution.ExitCode = &code
+	}
+
+	// Map to process dimension honestly.
+	switch {
+	case exitObserved:
+		resolution.ProcessState = state.ProcessExited
+		resolution.OrphanRisk = false
+		if len(resolution.RemainingPIDs) > 0 {
+			// Parent exited but process tree still has members.
+			resolution.ProcessState = state.ProcessOrphaned
+			resolution.OrphanRisk = true
+		}
+	case resolution.TreeExitConfirmed:
+		resolution.ProcessState = state.ProcessExited
+		resolution.OrphanRisk = false
+		if !exitObserved {
+			out.Exit = adapter.ExitStatus{Code: -1, Error: "tree exit confirmed without session exit status"}
+		}
+	case len(resolution.RemainingPIDs) > 0:
+		resolution.ProcessState = state.ProcessOrphaned
+		resolution.OrphanRisk = true
+	default:
+		resolution.ProcessState = state.ProcessUnknown
+		resolution.OrphanRisk = true
+	}
+	out.Resolution = resolution
+
+	if err := s.commitWorkerExitResolution(runtime, workerID, resolution, out.Exit); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// commitWorkerExitResolution persists the honest process dimension after drain.
+func (s *Service) commitWorkerExitResolution(runtime *TaskState, workerID string, resolution WorkerExitResolution, exit adapter.ExitStatus) error {
+	eventType := event.ProcessExited
+	severity := "info"
+	switch resolution.ProcessState {
+	case state.ProcessOrphaned:
+		eventType = event.ProcessOrphaned
+		severity = "error"
+	case state.ProcessUnknown:
+		eventType = event.ProcessStateChanged
+		severity = "error"
+	default:
+		severity = severityForExit(exit.Code)
+	}
+	if resolution.ExitCode != nil {
+		code := *resolution.ExitCode
+		if runtime.Worker != nil {
+			runtime.Worker.ExitCode = &code
+		}
+	}
+	if runtime.Worker != nil {
+		runtime.Worker.EndedAt = timePtr(time.Now().UTC())
+		runtime.Worker.StatusDimensions.Process = resolution.ProcessState
+		runtime.Dimensions = runtime.Worker.StatusDimensions
+	} else {
+		runtime.Dimensions.Process = resolution.ProcessState
+	}
+
+	return s.commitMutate(context.Background(), event.Input{
 		TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
-		Type: event.ProcessExited, Severity: severityForExit(exit.Code),
-		Payload: map[string]any{"from": string(state.ProcessAlive), "to": string(state.ProcessExited), "exit": exit},
+		Type: eventType, Severity: severity,
+		Payload: map[string]any{
+			"from": string(state.ProcessAlive), "to": string(resolution.ProcessState),
+			"exit_observed": resolution.ExitObserved, "tree_exit_confirmed": resolution.TreeExitConfirmed,
+			"orphan_risk": resolution.OrphanRisk, "remaining": resolution.RemainingPIDs,
+			"errors": resolution.Errors, "exit": exit,
+		},
+	}, func(candidate *Snapshot) error {
+		index, err := findTaskIndex(candidate, runtime.Task.TaskID)
+		if err != nil {
+			return err
+		}
+		candidate.Tasks[index].Dimensions.Process = resolution.ProcessState
+		if candidate.Tasks[index].Worker != nil {
+			candidate.Tasks[index].Worker.StatusDimensions.Process = resolution.ProcessState
+			candidate.Tasks[index].Worker.EndedAt = timePtr(time.Now().UTC())
+			if resolution.ExitCode != nil {
+				code := *resolution.ExitCode
+				candidate.Tasks[index].Worker.ExitCode = &code
+			}
+			updateAttemptWorker(&candidate.Tasks[index], *candidate.Tasks[index].Worker)
+		}
+		if resolution.OrphanRisk {
+			candidate.LastError = "worker process exit unconfirmed"
+		}
+		candidate.UpdatedAt = time.Now().UTC()
+		return nil
 	})
-	return resultSeen, timedOut, exit, nil
 }
 
 func defaultCancelPolicy(grace time.Duration) process.TerminationPolicy {
