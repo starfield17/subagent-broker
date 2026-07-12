@@ -1,6 +1,7 @@
 package report
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,6 +27,17 @@ func TestPublishCreatesFormalReportOnlyAfterValidation(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "report.md")); err != nil {
 		t.Fatalf("formal report should exist: %v", err)
+	}
+}
+
+func TestEnvelopeAcceptsTextValidationItems(t *testing.T) {
+	var envelope Envelope
+	data := []byte(`{"schema_version":"v1alpha1","task_id":"task-a","worker_id":"worker-a","status":"succeeded","summary":"implemented","work_completed":["implemented feature"],"files_changed":["internal/a/a.go"],"validation":["go test ./internal/a — PASSED"],"remaining_work":[],"blocking_issues":[],"risks":[],"handoff_notes":["ready"]}`)
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if len(envelope.Validation) != 1 || !envelope.Validation[0].Passed {
+		t.Fatalf("unexpected validation: %+v", envelope.Validation)
 	}
 }
 

@@ -1,0 +1,26 @@
+[
+  {
+    "task_id": "phase1-smoke",
+    "title": "Create smoke marker",
+    "objective": "Create a file named smoke-output.txt containing the single line phase1-ok.",
+    "completion_criteria": [
+      "smoke-output.txt exists",
+      "smoke-output.txt contains phase1-ok"
+    ],
+    "write_scope": [
+      "smoke-output.txt"
+    ],
+    "forbidden_scope": [],
+    "known_read_dependencies": [],
+    "parallel_responsibilities": {},
+    "validation_commands": [
+      {
+        "command": "test -f smoke-output.txt && grep -Fxq phase1-ok smoke-output.txt",
+        "scope": "local"
+      }
+    ],
+    "depends_on": [],
+    "allow_nested_agents": false,
+    "allow_public_interface_change": false
+  }
+]

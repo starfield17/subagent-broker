@@ -99,29 +99,29 @@ func PublishQuestion(taskDir string, q QuestionEnvelope) error {
 		return err
 	}
 	var b strings.Builder
-	b.WriteString("# 需要主 Agent 决策\n\n## 问题\n\n" + q.Question + "\n\n## 原因\n\n" + q.Reason + "\n\n## 当前任务范围\n\n")
+	b.WriteString("# Main Agent Decision Required\n\n## Question\n\n" + q.Question + "\n\n## Reason\n\n" + q.Reason + "\n\n## Current Task Scope\n\n")
 	for _, item := range q.CurrentScope {
 		fmt.Fprintf(&b, "- `%s`\n", item)
 	}
-	b.WriteString("\n## 请求扩大范围（如适用）\n\n")
+	b.WriteString("\n## Scope Expansion Request (if applicable)\n\n")
 	if len(q.RequestedScope) == 0 {
-		b.WriteString("- 无。\n")
+		b.WriteString("- None.\n")
 	} else {
 		for _, item := range q.RequestedScope {
 			fmt.Fprintf(&b, "- `%s`\n", item)
 		}
 	}
-	b.WriteString("\n## 与其他任务的关系\n\n")
+	b.WriteString("\n## Relationship to Other Tasks\n\n")
 	if len(q.RelatedTasks) == 0 {
-		b.WriteString("无已知关系。\n")
+		b.WriteString("No known relationship.\n")
 	} else {
 		for _, item := range q.RelatedTasks {
 			fmt.Fprintf(&b, "- `%s`\n", item)
 		}
 	}
-	b.WriteString("\n## 当前工作区状态\n\n" + q.WorkspaceState + "\n\n## 建议\n\n")
+	b.WriteString("\n## Current Workspace State\n\n" + q.WorkspaceState + "\n\n## Recommendation\n\n")
 	if q.Suggestion == "" {
-		b.WriteString("无。\n")
+		b.WriteString("None.\n")
 	} else {
 		b.WriteString(q.Suggestion + "\n")
 	}

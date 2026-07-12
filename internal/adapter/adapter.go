@@ -74,6 +74,22 @@ type StartRequest struct {
 	Options     map[string]string `json:"options,omitempty"`
 }
 
+type ResumeRequest struct {
+	NativeSessionID string            `json:"native_session_id"`
+	RunID           string            `json:"run_id"`
+	TaskID          string            `json:"task_id"`
+	WorkerID        string            `json:"worker_id"`
+	ProjectRoot     string            `json:"project_root"`
+	Contract        string            `json:"contract"`
+	Model           string            `json:"model,omitempty"`
+	Options         map[string]string `json:"options,omitempty"`
+}
+
+type OutputChunk struct {
+	Timestamp time.Time
+	Data      []byte
+}
+
 type Session struct {
 	NativeSessionID   string             `json:"native_session_id"`
 	NativeTurnID      string             `json:"native_turn_id,omitempty"`
@@ -81,6 +97,7 @@ type Session struct {
 	ProcessStartToken string             `json:"process_start_token,omitempty"`
 	Events            <-chan NativeEvent `json:"-"`
 	Exited            <-chan ExitStatus  `json:"-"`
+	Stderr            <-chan OutputChunk `json:"-"`
 }
 
 type ExitStatus struct {
@@ -128,7 +145,7 @@ type Adapter interface {
 	Descriptor() Descriptor
 	Probe(context.Context, ProbeRequest) (ProbeResult, error)
 	StartSession(context.Context, StartRequest) (Session, error)
-	ResumeSession(context.Context, string) (Session, error)
+	ResumeSession(context.Context, ResumeRequest) (Session, error)
 	SendMessage(context.Context, string, string) (DeliveryResult, error)
 	SteerActiveTurn(context.Context, string, string) (DeliveryResult, error)
 	InterruptTurn(context.Context, string) error

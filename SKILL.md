@@ -2,7 +2,7 @@
 
 ## Status
 
-This repository is a **Phase 0 architecture skeleton**. It defines contracts and test fixtures, but intentionally does not expose production dispatch commands or connect to real Harnesses yet.
+This repository is a **Phase 1 runtime** built on the Phase 0 architecture skeleton. It exposes a one-task Claude Code dispatch path and keeps the remaining Harness runtimes and Wave execution behind explicit phase boundaries.
 
 ## Main Agent responsibilities
 
@@ -49,3 +49,37 @@ Workers may read the project, but may only write within the approved scope. When
 - Broker state stays outside the project repository.
 - V1 does not create worktrees and does not allow nested agents by default.
 - Adapter capability declarations must be truthful.
+
+## Phase 1 operator workflow
+
+Build and probe the Claude adapter before dispatching:
+
+```bash
+go build -o /tmp/subagent-broker ./cmd/subagent-broker
+/tmp/subagent-broker doctor
+```
+
+Dispatch accepts one Task JSON file. The file may contain a JSON array or an object with a `tasks` array. Each Task must include a project root, a local validation command, an allowed write scope, and a complete final-report contract.
+
+```bash
+/tmp/subagent-broker dispatch \
+  --project /path/to/project \
+  --goal "Complete the requested task" \
+  --tasks /path/to/tasks.json \
+  --permission-mode acceptEdits \
+  --model sonnet
+```
+
+The command starts a detached Supervisor and prints the Run ID. The Supervisor is the only writer of Run state and owns the Claude process group. Inspect or control the Run with:
+
+```bash
+/tmp/subagent-broker status --project /path/to/project --run <run-id>
+/tmp/subagent-broker wait --project /path/to/project --run <run-id>
+/tmp/subagent-broker collect --project /path/to/project --run <run-id>
+/tmp/subagent-broker events --project /path/to/project --run <run-id>
+/tmp/subagent-broker cancel --project /path/to/project --run <run-id>
+```
+
+If the Supervisor itself stops before the Run is terminal, start reconciliation with `recover`. Recovery never treats a reused PID as the original Worker without a matching process start token.
+
+Phase 1 supports `claude-code` only and intentionally limits dispatch to one Task. The Fake Harness remains the deterministic lifecycle test adapter for unit and race tests.

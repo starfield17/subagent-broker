@@ -1,10 +1,20 @@
 package storage
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+func AtomicWriteJSON(path string, value any, mode os.FileMode) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal JSON: %w", err)
+	}
+	data = append(data, '\n')
+	return AtomicWriteFile(path, data, mode)
+}
 
 func AtomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)

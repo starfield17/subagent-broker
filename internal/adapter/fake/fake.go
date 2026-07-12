@@ -77,7 +77,16 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	channel := make(chan adapter.NativeEvent, len(scenario.Events)+1)
 	exited := make(chan adapter.ExitStatus, 1)
 	session := adapter.Session{NativeSessionID: id, NativeTurnID: "turn-1", Events: channel, Exited: exited}
-	state := &sessionState{session: session, events: channel, done: make(chan struct{}), final: cloneEnvelope(scenario.Final), diff: append([]string(nil), scenario.Diff...), usage: scenario.Usage}
+	final := cloneEnvelope(scenario.Final)
+	if final != nil {
+		if req.TaskID != "" {
+			final.TaskID = req.TaskID
+		}
+		if req.WorkerID != "" {
+			final.WorkerID = req.WorkerID
+		}
+	}
+	state := &sessionState{session: session, events: channel, done: make(chan struct{}), final: final, diff: append([]string(nil), scenario.Diff...), usage: scenario.Usage}
 	a.sessions[id] = state
 	a.mu.Unlock()
 
@@ -114,15 +123,15 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	return session, nil
 }
 
-func (a *Adapter) ResumeSession(_ context.Context, id string) (adapter.Session, error) {
+func (a *Adapter) ResumeSession(_ context.Context, req adapter.ResumeRequest) (adapter.Session, error) {
 	if !a.capabilities.ResumeSession {
 		return adapter.Session{}, adapter.ErrUnsupported
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	state, ok := a.sessions[id]
+	state, ok := a.sessions[req.NativeSessionID]
 	if !ok {
-		return adapter.Session{}, fmt.Errorf("unknown session %q", id)
+		return adapter.Session{}, fmt.Errorf("unknown session %q", req.NativeSessionID)
 	}
 	return state.session, nil
 }

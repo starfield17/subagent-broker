@@ -1,5 +1,6 @@
 # Go build/test artifacts
 bin/
+subagent-broker
 coverage.out
 *.test
 

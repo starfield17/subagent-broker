@@ -1,6 +1,6 @@
-# subagent-broker — Phase 0 Architecture Skeleton
+# subagent-broker — Phase 1 Runtime
 
-This repository implements **Phase 0: architecture skeleton** from the Multi-Harness Parallel Subagent Skill manual.
+This repository implements the Phase 0 architecture skeleton and the Phase 1 runtime slice from the Multi-Harness Parallel Subagent Skill manual.
 
 ## Included
 
@@ -12,19 +12,48 @@ This repository implements **Phase 0: architecture skeleton** from the Multi-Har
 - Deterministic Fake Harness with scripted scenarios for lifecycle and protocol tests.
 - Append-only event store with monotonic Run sequence and incomplete-tail recovery.
 - Result/question semantic validation and atomic Markdown publication.
+- Claude Code stream-json Adapter with structured results, normalized events, stderr capture, and session identity.
+- Detached run-scoped Supervisor with process-group control, Unix-socket IPC, persistence, timeout handling, and recovery reconciliation.
+- A production CLI for one-task Claude dispatch, status, events, wait, collect, cancel, recover, and doctor operations.
+- A real Claude smoke fixture in `examples/phase1-smoke-tasks.json`.
 - Twelve accepted Architecture Decision Records (ADRs).
-- Unit and contract tests.
+- Unit, contract, race, and real smoke verification.
 
-## Explicitly deferred
+## Phase 1 boundary
 
-Phase 0 does **not** implement a production CLI, real Harness connections, a runnable Supervisor, IPC, process-tree control, Wave execution, recovery takeover, or Git integration. Those belong to later phases. No worktree support is present.
+Phase 1 dispatches exactly one Task through Claude Code. Same-Wave parallel execution, complete Wave barriers, the other three Harness runtimes, permission routing, Git baseline/diff execution, and full Worker takeover remain later-phase work. V1 does not create worktrees or nested agents.
 
 ## Verify
 
 ```bash
 go test ./...
+go test -race ./...
 go vet ./...
+go build ./cmd/subagent-broker
 ```
+
+## Run a Phase 1 smoke
+
+```bash
+go build -o /tmp/subagent-broker ./cmd/subagent-broker
+/tmp/subagent-broker doctor
+/tmp/subagent-broker dispatch \
+  --project /path/to/project \
+  --goal "Run the Phase 1 smoke task" \
+  --tasks examples/phase1-smoke-tasks.json \
+  --permission-mode acceptEdits \
+  --model sonnet
+```
+
+The dispatch command prints the Run ID and Run directory. Use that Run ID with `status`, `wait`, `collect`, `events`, or `cancel`:
+
+```bash
+/tmp/subagent-broker wait --project /path/to/project --run <run-id>
+/tmp/subagent-broker collect --project /path/to/project --run <run-id>
+/tmp/subagent-broker events --project /path/to/project --run <run-id>
+```
+
+Set `BROKER_HOME` or pass `--broker-home` to keep Broker state outside the project repository.
 
 ## Package map
 
@@ -42,7 +71,7 @@ go vet ./...
 - `internal/storage`: Broker Home layout and atomic I/O.
 - `internal/verify`: Run-level scope audit.
 - `internal/process`: process identity abstractions for later process-tree management.
-- `internal/supervisor`: Phase 0 Supervisor boundaries only.
+- `internal/supervisor`: run-scoped Supervisor, persistence, recovery, and IPC.
 - `internal/doctor`: descriptor-level compatibility inventory.
 
-See `docs/phase0-coverage.md` for a requirement-to-code matrix.
+See `docs/phase0-coverage.md` and `docs/phase1-coverage.md` for requirement-to-code matrices.

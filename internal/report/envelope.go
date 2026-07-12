@@ -29,6 +29,31 @@ type Validation struct {
 	Details string `json:"details,omitempty"`
 }
 
+func (v *Validation) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasPrefix(trimmed, "\"") {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		lower := strings.ToLower(text)
+		passed := !strings.Contains(lower, "failed") &&
+			!strings.Contains(lower, "failure") &&
+			!strings.Contains(lower, "not run") &&
+			!strings.Contains(lower, "error")
+		*v = Validation{Command: text, Passed: passed}
+		return nil
+	}
+
+	type validationAlias Validation
+	var decoded validationAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*v = Validation(decoded)
+	return nil
+}
+
 type ScopeExpansion struct {
 	Paths               []string `json:"paths"`
 	Reason              string   `json:"reason"`
@@ -137,19 +162,19 @@ func Publish(taskDir string, e Envelope, now time.Time) error {
 
 func RenderMarkdown(e Envelope) string {
 	var b strings.Builder
-	b.WriteString("# Task 报告\n\n## 状态\n\n" + string(e.Status) + "\n\n")
-	b.WriteString("## 完成内容\n\n")
+	b.WriteString("# Task Report\n\n## Status\n\n" + string(e.Status) + "\n\n")
+	b.WriteString("## Completed Work\n\n")
 	writeItems(&b, e.WorkCompleted, e.Summary)
-	b.WriteString("## 修改文件\n\n")
+	b.WriteString("## Changed Files\n\n")
 	writeItems(&b, e.FilesChanged, e.NoFilesChangedReason)
-	b.WriteString("## 验证\n\n")
+	b.WriteString("## Verification\n\n")
 	if len(e.Validation) == 0 {
 		b.WriteString(e.ValidationNotRunReason + "\n\n")
 	} else {
 		for _, v := range e.Validation {
-			result := "失败"
+			result := "failed"
 			if v.Passed {
-				result = "通过"
+				result = "passed"
 			}
 			fmt.Fprintf(&b, "- `%s`: %s", v.Command, result)
 			if v.Details != "" {
@@ -159,12 +184,12 @@ func RenderMarkdown(e Envelope) string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("## 未完成内容\n\n")
-	writeItems(&b, e.RemainingWork, "无。")
-	b.WriteString("## 风险与注意事项\n\n")
-	writeItems(&b, e.Risks, "无已知风险。")
-	b.WriteString("## 交接说明\n\n")
-	writeItems(&b, e.HandoffNotes, "无额外交接说明。")
+	b.WriteString("## Remaining Work\n\n")
+	writeItems(&b, e.RemainingWork, "None.")
+	b.WriteString("## Risks and Notes\n\n")
+	writeItems(&b, e.Risks, "No known risks.")
+	b.WriteString("## Handoff Notes\n\n")
+	writeItems(&b, e.HandoffNotes, "No additional handoff notes.")
 	return b.String()
 }
 
