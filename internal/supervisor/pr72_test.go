@@ -281,11 +281,12 @@ func TestRunWorkerSessionObservesExitWithOpenStreams(t *testing.T) {
 		if !result.Resolution.ExitObserved {
 			t.Fatal("expected ExitObserved with open streams")
 		}
-		if result.Resolution.ProcessState != state.ProcessExited && result.Resolution.ProcessState != state.ProcessUnknown {
-			// Incomplete identity → may be unknown; exit was observed so should be exited.
-			if result.Exit.Code != 0 {
-				t.Fatalf("exit=%+v resolution=%+v", result.Exit, result.Resolution)
-			}
+		// Incomplete identity: session.Exited alone is ProcessUnknown, not ProcessExited.
+		if result.Resolution.ProcessState != state.ProcessUnknown {
+			t.Fatalf("expected ProcessUnknown without tree confirmation, got %+v", result.Resolution)
+		}
+		if !result.Resolution.OrphanRisk {
+			t.Fatal("expected OrphanRisk")
 		}
 		if result.Exit.Code != 0 {
 			t.Fatalf("exit code=%d", result.Exit.Code)

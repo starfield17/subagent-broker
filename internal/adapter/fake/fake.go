@@ -89,10 +89,18 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 		a.mu.Unlock()
 		return adapter.Session{}, fmt.Errorf("unknown fake scenario %q", req.Scenario)
 	}
-	id := fmt.Sprintf("fake-session-%d", a.counter.Add(1))
+	n := a.counter.Add(1)
+	id := fmt.Sprintf("fake-session-%d", n)
 	channel := make(chan adapter.NativeEvent, len(scenario.Events)+1)
 	exited := make(chan adapter.ExitStatus, 1)
-	session := adapter.Session{NativeSessionID: id, NativeTurnID: "turn-1", Events: channel, Exited: exited}
+	// Synthetic process identity: PID is chosen so it does not refer to a live
+	// process. Supervisor fills ProcessGroupToken; Controller then confirms
+	// "tree gone" after Exited (Inspect returns not-found).
+	fakePID := int(1_000_000_000 + n)
+	session := adapter.Session{
+		NativeSessionID: id, NativeTurnID: "turn-1", Events: channel, Exited: exited,
+		PID: fakePID, ProcessStartToken: "fake-start-" + id,
+	}
 	final := cloneEnvelope(scenario.Final)
 	if final != nil {
 		if req.TaskID != "" {
@@ -153,13 +161,20 @@ func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) 
 	// full Worker Session lifecycle (Events → result → Exited).
 	channel := make(chan adapter.NativeEvent, 8)
 	exited := make(chan adapter.ExitStatus, 1)
+	// Keep PID/start-token so supervisor can form a complete process identity.
+	pid := state.session.PID
+	startTok := state.session.ProcessStartToken
+	if pid <= 0 || startTok == "" {
+		pid = int(1_000_000_000 + a.counter.Add(1))
+		startTok = "fake-start-resume-" + req.NativeSessionID
+	}
 	session := adapter.Session{
 		NativeSessionID:   req.NativeSessionID,
 		NativeTurnID:      "turn-resume",
 		Events:            channel,
 		Exited:            exited,
-		PID:               state.session.PID,
-		ProcessStartToken: state.session.ProcessStartToken,
+		PID:               pid,
+		ProcessStartToken: startTok,
 	}
 	if state.final == nil {
 		// Ensure resume always has a collectable result for full lifecycle tests.

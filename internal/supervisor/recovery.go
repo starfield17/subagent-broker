@@ -20,12 +20,14 @@ import (
 type RecoveryClass string
 
 const (
-	RecoveryAlreadyTerminal   RecoveryClass = "already_terminal"
-	RecoveryAliveOrphaned     RecoveryClass = "alive_orphaned"
-	RecoveryPIDReused         RecoveryClass = "pid_reused"
-	RecoveryExitedResumable   RecoveryClass = "exited_resumable"
-	RecoveryExitedUnresumable RecoveryClass = "exited_unresumable"
-	RecoveryMissingIdentity   RecoveryClass = "missing_identity"
+	RecoveryAlreadyTerminal    RecoveryClass = "already_terminal"
+	RecoveryAliveOrphaned      RecoveryClass = "alive_orphaned"
+	RecoveryPIDReused          RecoveryClass = "pid_reused"
+	RecoveryExitedResumable    RecoveryClass = "exited_resumable"
+	RecoveryExitedUnresumable  RecoveryClass = "exited_unresumable"
+	RecoveryMissingIdentity    RecoveryClass = "missing_identity"
+	RecoveryIdentityIncomplete RecoveryClass = "identity_incomplete"
+	RecoveryInspectUnknown     RecoveryClass = "inspect_unknown"
 )
 
 // RecoveryDecision is the pure classification result for one Task.
@@ -63,14 +65,22 @@ func ClassifyRecovery(runtime TaskState, inspect process.Identity, inspectErr er
 	}
 	decision.NativeSessionID = w.NativeSessionID
 
+	// Incomplete identity: cannot prove exit; never Resume or Fresh retry.
 	if w.PID <= 0 || w.ProcessStartToken == "" {
-		return exitedDecision(decision, w, harnessSupportsResume, "process identity missing")
+		decision.Class = RecoveryIdentityIncomplete
+		decision.Reason = "process identity incomplete (pid/start_token missing)"
+		decision.Process = state.ProcessUnknown
+		return decision
 	}
+	// Only explicit process-missing proves exit. Permission/IO/temporary failures are unknown.
 	if inspectErr != nil && isProcessMissing(inspectErr) {
 		return exitedDecision(decision, w, harnessSupportsResume, "worker process is gone")
 	}
 	if inspectErr != nil {
-		return exitedDecision(decision, w, harnessSupportsResume, "process inspect failed: "+inspectErr.Error())
+		decision.Class = RecoveryInspectUnknown
+		decision.Reason = "process inspect failed without proof of exit: " + inspectErr.Error()
+		decision.Process = state.ProcessUnknown
+		return decision
 	}
 	expected := process.Identity{PID: w.PID, StartToken: w.ProcessStartToken, ProcessGroupToken: w.ProcessGroupIdentity}
 	if !expected.SameProcess(inspect) {
@@ -112,6 +122,9 @@ func recoveryTaskTerminal(runtime TaskState) bool {
 	}
 }
 
+// isProcessMissing reports whether err proves the OS process no longer exists.
+// Permission denied, temporary IO failures, and other inspect errors must NOT
+// be treated as proof of exit (those map to inspect_unknown).
 func isProcessMissing(err error) bool {
 	if err == nil {
 		return false
@@ -119,10 +132,19 @@ func isProcessMissing(err error) bool {
 	if errors.Is(err, os.ErrNotExist) {
 		return true
 	}
+	// syscall.ESRCH and platform "no such process" strings.
 	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "operation not permitted") ||
+		strings.Contains(msg, "access denied") ||
+		strings.Contains(msg, "eacces") ||
+		strings.Contains(msg, "eperm") {
+		return false
+	}
 	return strings.Contains(msg, "no such process") ||
-		strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "no such file")
+		strings.Contains(msg, "esrch") ||
+		// /proc/<pid> gone often surfaces as no such file/directory for that path.
+		(strings.Contains(msg, "no such file") && !strings.Contains(msg, "permission"))
 }
 
 func (s *Service) reconcileRecovery(ctx context.Context) error {
@@ -143,16 +165,17 @@ func (s *Service) reconcileRecovery(ctx context.Context) error {
 		w := runtime.Worker
 		var identity process.Identity
 		var inspectErr error
-		if w != nil && w.PID > 0 {
+		if w != nil && w.PID > 0 && w.ProcessStartToken != "" {
 			identity, inspectErr = process.Inspect(ctx, w.PID)
-		} else if !recoveryTaskTerminal(runtime) {
-			inspectErr = os.ErrNotExist
 		}
+		// Missing PID/token is classified as identity_incomplete inside ClassifyRecovery;
+		// do not invent os.ErrNotExist (that would falsely allow Resume).
 		decisions = append(decisions, ClassifyRecovery(runtime, identity, inspectErr, supportsResume))
 	}
 
 	hasOrphan := false
-	hasUnrecoverable := false
+	hasUnknown := false
+	hasFailedWorker := false
 	for _, d := range decisions {
 		if err := s.applyRecoveryDecision(ctx, d); err != nil {
 			return err
@@ -160,17 +183,19 @@ func (s *Service) reconcileRecovery(ctx context.Context) error {
 		switch d.Class {
 		case RecoveryAliveOrphaned:
 			hasOrphan = true
-		case RecoveryExitedUnresumable, RecoveryMissingIdentity, RecoveryPIDReused:
-			hasUnrecoverable = true
+		case RecoveryInspectUnknown, RecoveryIdentityIncomplete, RecoveryPIDReused:
+			hasUnknown = true
+		case RecoveryExitedUnresumable, RecoveryMissingIdentity:
+			hasFailedWorker = true
 		}
 	}
 
-	// Aggregate Run status from all decisions.
+	// Aggregate Run status: unknown/orphan never return to clean RunRunning.
 	switch {
-	case hasOrphan:
-		return s.setRunStatus(domain.RunDegraded, "one or more workers are alive but cannot be reattached safely")
-	case hasUnrecoverable:
-		return s.setRunStatus(domain.RunRunning, "recovery finished with unrecoverable workers")
+	case hasOrphan || hasUnknown:
+		return s.setRunStatus(domain.RunDegraded, "recovery finished with unknown or orphaned worker processes")
+	case hasFailedWorker:
+		return s.setRunStatus(domain.RunFailed, "recovery finished with unrecoverable workers")
 	default:
 		return s.setRunStatus(domain.RunRunning, "recovery finished")
 	}
@@ -224,6 +249,32 @@ func (s *Service) applyRecoveryDecision(ctx context.Context, d RecoveryDecision)
 			return nil
 		})
 
+	case RecoveryInspectUnknown, RecoveryIdentityIncomplete:
+		// ProcessUnknown: no Resume, no Fresh retry. Leave Task non-terminal but degraded process dimension.
+		return s.commitMutate(ctx, event.Input{
+			TaskID: string(d.TaskID), WorkerID: d.WorkerID, Source: "recovery", Type: event.ProcessStateChanged, Severity: "error",
+			Payload: map[string]any{
+				"from": string(state.ProcessAlive), "to": string(state.ProcessUnknown),
+				"reason": d.Reason, "class": string(d.Class),
+			},
+		}, func(candidate *Snapshot) error {
+			index, err := findTaskIndex(candidate, d.TaskID)
+			if err != nil {
+				return err
+			}
+			candidate.Tasks[index].Dimensions.Process = state.ProcessUnknown
+			if candidate.Tasks[index].Worker != nil {
+				candidate.Tasks[index].Worker.StatusDimensions.Process = state.ProcessUnknown
+			}
+			candidate.Tasks[index].LastError = d.Reason
+			// Do not finish as exited — we cannot confirm exit; leave attempt history honest.
+			if candidate.Tasks[index].ActiveAttempt > 0 {
+				finishActiveAttempt(&candidate.Tasks[index], workerpkg.AttemptOrphaned, d.Reason, time.Now().UTC())
+			}
+			candidate.UpdatedAt = time.Now().UTC()
+			return nil
+		})
+
 	case RecoveryExitedUnresumable, RecoveryMissingIdentity:
 		return s.commitMutate(ctx, event.Input{
 			TaskID: string(d.TaskID), WorkerID: d.WorkerID, Source: "recovery", Type: event.TaskStateChanged, Severity: "error",
@@ -237,9 +288,18 @@ func (s *Service) applyRecoveryDecision(ctx context.Context, d RecoveryDecision)
 				return err
 			}
 			from := candidate.Tasks[index].Task.Status
-			candidate.Tasks[index].Dimensions.Process = state.ProcessExited
+			// MissingIdentity is not proven exited; ExitedUnresumable is.
+			proc := state.ProcessExited
+			if d.Class == RecoveryMissingIdentity {
+				proc = state.ProcessUnknown
+			}
+			candidate.Tasks[index].Dimensions.Process = proc
 			candidate.Tasks[index].LastError = d.Reason
-			finishActiveAttempt(&candidate.Tasks[index], workerpkg.AttemptExited, d.Reason, time.Now().UTC())
+			outcome := workerpkg.AttemptExited
+			if d.Class == RecoveryMissingIdentity {
+				outcome = workerpkg.AttemptOrphaned
+			}
+			finishActiveAttempt(&candidate.Tasks[index], outcome, d.Reason, time.Now().UTC())
 			if err := state.ValidateTaskTransition(from, state.TaskFailed); err == nil {
 				candidate.Tasks[index].Task.Status = state.TaskFailed
 				candidate.Tasks[index].Dimensions.Task = state.TaskFailed

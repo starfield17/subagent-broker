@@ -29,6 +29,9 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	if runtime.Dimensions.Process == state.ProcessOrphaned {
 		return fmt.Errorf("task %s has an orphaned worker and cannot start another", runtime.Task.TaskID)
 	}
+	if runtime.Dimensions.Process == state.ProcessUnknown {
+		return fmt.Errorf("task %s has unknown process state; resume and fresh retry are forbidden until process tree is confirmed", runtime.Task.TaskID)
+	}
 
 	harness, ok := s.registry.Get(adapter.HarnessName(s.config.Harness))
 	if !ok {
@@ -181,6 +184,12 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	if session.PID > 0 {
 		if inspected, inspectErr := process.Inspect(context.Background(), session.PID); inspectErr == nil {
 			identity = inspected
+		} else if session.ProcessStartToken != "" {
+			// Harness reported a start token but the PID is not inspectable yet
+			// (or is synthetic). Fill ProcessGroupToken so identity is Complete()
+			// for tree confirmation after Exited; missing-process Inspect then
+			// yields TreeExited rather than "incomplete identity → unknown".
+			identity.ProcessGroupToken = "pg:" + session.ProcessStartToken
 		}
 	}
 
@@ -518,34 +527,48 @@ func (s *Service) runWorkerSession(
 	}
 
 	// Map to process dimension honestly.
-	switch {
-	case exitObserved:
-		resolution.ProcessState = state.ProcessExited
-		resolution.OrphanRisk = false
-		if len(resolution.RemainingPIDs) > 0 {
-			// Parent exited but process tree still has members.
-			resolution.ProcessState = state.ProcessOrphaned
-			resolution.OrphanRisk = true
-		}
-	case resolution.TreeExitConfirmed:
-		resolution.ProcessState = state.ProcessExited
-		resolution.OrphanRisk = false
-		if !exitObserved {
-			out.Exit = adapter.ExitStatus{Code: -1, Error: "tree exit confirmed without session exit status"}
-		}
-	case len(resolution.RemainingPIDs) > 0:
-		resolution.ProcessState = state.ProcessOrphaned
-		resolution.OrphanRisk = true
-	default:
-		resolution.ProcessState = state.ProcessUnknown
-		resolution.OrphanRisk = true
+	// session.Exited proves only the harness root exited — never the full tree by default.
+	resolution.ProcessState, resolution.OrphanRisk = mapWorkerExitProcessState(resolution, identity.Complete())
+	if resolution.ProcessState == state.ProcessExited && !exitObserved {
+		out.Exit = adapter.ExitStatus{Code: -1, Error: "tree exit confirmed without session exit status"}
 	}
 	out.Resolution = resolution
 
 	if err := s.commitWorkerExitResolution(runtime, workerID, resolution, out.Exit); err != nil {
 		return out, err
 	}
+	// Unknown/orphaned process state degrades the Run; do not pretend clean completion.
+	if resolution.OrphanRisk || resolution.ProcessState == state.ProcessOrphaned || resolution.ProcessState == state.ProcessUnknown {
+		_ = s.setRunStatus(domain.RunDegraded, "worker process tree exit unconfirmed or orphaned")
+	}
 	return out, nil
+}
+
+// mapWorkerExitProcessState applies the shared exit/tree confirmation matrix used by
+// drain and cancel paths.
+//
+//	ExitObserved + TreeExitConfirmed → ProcessExited
+//	ExitObserved + RemainingPIDs     → ProcessOrphaned
+//	ExitObserved + unconfirmed tree  → ProcessUnknown + OrphanRisk
+//	!ExitObserved + TreeExitConfirmed → ProcessExited
+//	RemainingPIDs                    → ProcessOrphaned
+//	else                             → ProcessUnknown + OrphanRisk
+func mapWorkerExitProcessState(r WorkerExitResolution, identityComplete bool) (state.Process, bool) {
+	if len(r.RemainingPIDs) > 0 {
+		return state.ProcessOrphaned, true
+	}
+	if r.TreeExitConfirmed {
+		return state.ProcessExited, false
+	}
+	if r.ExitObserved {
+		// Parent exited but tree not confirmed (incomplete identity or controller inconclusive).
+		if !identityComplete || r.OrphanRisk {
+			return state.ProcessUnknown, true
+		}
+		// Identity complete but tree still not confirmed after terminate attempts.
+		return state.ProcessUnknown, true
+	}
+	return state.ProcessUnknown, true
 }
 
 // commitWorkerExitResolution persists the honest process dimension after drain.

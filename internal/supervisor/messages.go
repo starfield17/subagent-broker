@@ -865,6 +865,11 @@ func (s *Service) EnsureResumeAndFlushOutbox(ctx context.Context, taskID string)
 		return s.failQueuedResumeInstructions(taskID, adapter.ErrUnsupported, "resume capability unsupported")
 	}
 
+	// Refuse resume when process state is unknown/orphaned — cannot invent exited.
+	if runtime.Dimensions.Process == state.ProcessUnknown || runtime.Dimensions.Process == state.ProcessOrphaned {
+		return s.failQueuedResumeInstructions(taskID, adapter.ErrUnsupported,
+			fmt.Sprintf("process state %s forbids resume", runtime.Dimensions.Process))
+	}
 	// Ensure state selects recovery_resume (never fresh) inside executeTask.
 	if runtime.Worker == nil {
 		runtime.Worker = &domain.WorkerSession{TaskID: runtime.Task.TaskID}
@@ -872,7 +877,11 @@ func (s *Service) EnsureResumeAndFlushOutbox(ctx context.Context, taskID string)
 	if runtime.Worker.NativeSessionID == "" {
 		runtime.Worker.NativeSessionID = nativeSessionID
 	}
-	runtime.Dimensions.Process = state.ProcessExited
+	// Only mark exited when already exited or we have a proven exit path.
+	if runtime.Dimensions.Process != state.ProcessExited {
+		return s.failQueuedResumeInstructions(taskID, adapter.ErrUnsupported,
+			fmt.Sprintf("process state %s is not recovery-resumable", runtime.Dimensions.Process))
+	}
 	runtime.Worker.StatusDimensions.Process = state.ProcessExited
 	if err := s.saveRuntime(runtime); err != nil {
 		return err

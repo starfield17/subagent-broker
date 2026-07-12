@@ -21,6 +21,7 @@ func TestStoreReplaysLatestMessageStatus(t *testing.T) {
 	}
 	value.Status = Answered
 	value.UpdatedAt = now.Add(time.Second)
+	value.Resolution = json.RawMessage(`{"answer":"yes"}`)
 	if err := store.Append(value); err != nil {
 		t.Fatal(err)
 	}

@@ -120,6 +120,9 @@ func ReplayDetailed(path string) (ReplayResult, error) {
 			if err := validateMessageLifecycle(previous, value); err != nil {
 				return &ErrJournalCorrupt{MessageID: value.MessageID, Reason: err.Error()}
 			}
+		} else if err := validateMessageStatusFields(value); err != nil {
+			// First complete record for this id must still obey status/resolution rules.
+			return &ErrJournalCorrupt{MessageID: value.MessageID, Reason: err.Error()}
 		}
 		previousByID[value.MessageID] = value
 		return nil
@@ -148,8 +151,13 @@ func ReplayDetailed(path string) (ReplayResult, error) {
 
 // validateMessageLifecycle checks status machine and immutable/monotonic fields.
 // Same-status records are only allowed when immutable fields are identical and
-// monotonic fields do not regress — payload replacement is corruption.
+// monotonic fields do not regress — payload/DeliveryMode replacement is corruption.
 func validateMessageLifecycle(previous, next Message) error {
+	// Absolute status/resolution rules for the new record.
+	if err := validateMessageStatusFields(next); err != nil {
+		return err
+	}
+
 	// Immutable identity / content fields (must never change once recorded).
 	if previous.MessageID != next.MessageID {
 		return fmt.Errorf("message_id drift")
@@ -171,6 +179,13 @@ func validateMessageLifecycle(previous, next Message) error {
 	}
 	if !bytes.Equal(previous.Payload, next.Payload) {
 		return fmt.Errorf("payload is immutable and must not change")
+	}
+
+	// DeliveryMode: unset → set once is allowed; once set must not change.
+	if previous.DeliveryMode != "" {
+		if next.DeliveryMode != previous.DeliveryMode {
+			return fmt.Errorf("delivery_mode changed from %q to %q", previous.DeliveryMode, next.DeliveryMode)
+		}
 	}
 
 	// Monotonic fields.
@@ -210,11 +225,30 @@ func validateMessageLifecycle(previous, next Message) error {
 	}
 
 	if previous.Status == next.Status {
-		// Same-status: immutables already checked; only monotonic deltas allowed.
+		// Same-status: immutables (including DeliveryMode) already checked.
 		return nil
 	}
 	if err := ValidateTransition(previous.Status, next.Status); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateMessageStatusFields enforces Resolution/DeliveryMode rules per status.
+func validateMessageStatusFields(value Message) error {
+	switch value.Status {
+	case Created, Validated, Queued, Delivered:
+		// Final resolution must not appear before Answered.
+		if len(value.Resolution) > 0 {
+			return fmt.Errorf("status %s must not carry resolution", value.Status)
+		}
+	case Answered:
+		if len(value.Resolution) == 0 {
+			return fmt.Errorf("status answered requires resolution")
+		}
+	case Acknowledged, Expired, Failed:
+		// Acknowledgement/terminal without forged answer is allowed; if resolution
+		// is present it must remain stable once set (checked against previous).
 	}
 	return nil
 }
