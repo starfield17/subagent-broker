@@ -33,21 +33,25 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu          sync.Mutex
-	process     *transport.Process
-	baseURL     string
-	directory   string
-	sessionID   string
-	workerID    string
-	events      chan adapter.NativeEvent
-	resultReady chan struct{}
-	resultOnce  sync.Once
-	finishOnce  sync.Once
-	closeEvents sync.Once
-	history     []adapter.NativeEvent
-	final       []byte
-	resultError string
-	usage       adapter.Usage
+	mu              sync.Mutex
+	process         *transport.Process
+	baseURL         string
+	directory       string
+	sessionID       string
+	workerID        string
+	events          chan adapter.NativeEvent
+	resultReady     chan struct{}
+	resultOnce      sync.Once
+	finishOnce      sync.Once
+	closeEvents     sync.Once
+	shutdown        chan struct{}
+	shutdownOnce    sync.Once
+	history         []adapter.NativeEvent
+	final           []byte
+	resultError     string
+	usage           adapter.Usage
+	droppedProgress uint64
+	closed          bool
 }
 
 type sseEvent struct {
@@ -125,7 +129,10 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 	if err != nil {
 		return adapter.Session{}, err
 	}
-	state := &sessionState{process: p, baseURL: baseURL, directory: req.ProjectRoot, workerID: req.WorkerID, events: make(chan adapter.NativeEvent, 256), resultReady: make(chan struct{})}
+	state := &sessionState{
+		process: p, baseURL: baseURL, directory: req.ProjectRoot, workerID: req.WorkerID,
+		events: make(chan adapter.NativeEvent, 256), resultReady: make(chan struct{}), shutdown: make(chan struct{}),
+	}
 	go a.drainServerOutput(p)
 	go a.watchExit(state)
 	go a.subscribeEvents(state)
@@ -192,6 +199,7 @@ func (a *Adapter) TerminateSession(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	state.shutdownOnce.Do(func() { close(state.shutdown) })
 	_ = a.requestJSON(ctx, state, http.MethodPost, "/session/"+url.PathEscape(id)+"/abort", nil, map[string]any{}, nil)
 	return a.stop(state)
 }
@@ -414,12 +422,18 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 		go func() { _ = a.stop(state) }()
 	}
 	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return
+	}
 	state.history = append(state.history, native)
 	state.mu.Unlock()
-	select {
-	case state.events <- native:
-	default:
-	}
+	protocol.EmitNativeEvent(protocol.EmitOptions{
+		Events:          state.events,
+		Shutdown:        state.shutdown,
+		Mu:              &state.mu,
+		DroppedProgress: &state.droppedProgress,
+	}, native)
 	if value.Type == "session.idle" {
 		state.finishOnce.Do(func() { close(state.resultReady) })
 	}
@@ -506,6 +520,7 @@ func (a *Adapter) requestJSON(ctx context.Context, state *sessionState, method, 
 }
 
 func (a *Adapter) stop(state *sessionState) error {
+	state.shutdownOnce.Do(func() { close(state.shutdown) })
 	err := state.process.Terminate(context.Background())
 	_ = state.process.CloseInput()
 	return err
@@ -529,7 +544,13 @@ func (a *Adapter) watchExit(state *sessionState) {
 		state.mu.Unlock()
 		close(state.resultReady)
 	})
-	state.closeEvents.Do(func() { close(state.events) })
+	state.shutdownOnce.Do(func() { close(state.shutdown) })
+	state.closeEvents.Do(func() {
+		state.mu.Lock()
+		state.closed = true
+		state.mu.Unlock()
+		close(state.events)
+	})
 }
 
 func (a *Adapter) requireSession(id string) (*sessionState, error) {

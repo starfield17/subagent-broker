@@ -27,26 +27,29 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu            sync.Mutex
-	process       *transport.Process
-	threadID      string
-	turnID        string
-	workerID      string
-	events        chan adapter.NativeEvent
-	resultReady   chan struct{}
-	resultOnce    sync.Once
-	closeEvents   sync.Once
-	history       []adapter.NativeEvent
-	final         []byte
-	output        strings.Builder
-	resultError   string
-	usage         adapter.Usage
-	diff          []string
-	closed        bool
-	nextID        int64
-	pending       map[int64]chan rpcMessage
-	serverRequest map[string]struct{}
-	agentPhases   map[string]string
+	mu              sync.Mutex
+	process         *transport.Process
+	threadID        string
+	turnID          string
+	workerID        string
+	events          chan adapter.NativeEvent
+	resultReady     chan struct{}
+	resultOnce      sync.Once
+	closeEvents     sync.Once
+	shutdown        chan struct{}
+	shutdownOnce    sync.Once
+	history         []adapter.NativeEvent
+	final           []byte
+	output          strings.Builder
+	resultError     string
+	usage           adapter.Usage
+	diff            []string
+	closed          bool
+	droppedProgress uint64
+	nextID          int64
+	pending         map[int64]chan rpcMessage
+	serverRequest   map[string]struct{}
+	agentPhases     map[string]string
 }
 
 type rpcMessage struct {
@@ -114,8 +117,8 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 	}
 	state := &sessionState{
 		process: p, workerID: req.WorkerID, events: make(chan adapter.NativeEvent, 256),
-		resultReady: make(chan struct{}), pending: map[int64]chan rpcMessage{},
-		serverRequest: map[string]struct{}{}, agentPhases: map[string]string{},
+		resultReady: make(chan struct{}), shutdown: make(chan struct{}),
+		pending: map[int64]chan rpcMessage{}, serverRequest: map[string]struct{}{}, agentPhases: map[string]string{},
 	}
 	go a.readProcess(state)
 	if err := a.initialize(ctx, state); err != nil {
@@ -241,6 +244,7 @@ func (a *Adapter) TerminateSession(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	state.shutdownOnce.Do(func() { close(state.shutdown) })
 	if err := state.process.Terminate(ctx); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		_ = state.process.CloseInput()
 		return err
@@ -409,7 +413,13 @@ func (a *Adapter) respondServerRequest(ctx context.Context, state *sessionState,
 }
 
 func (a *Adapter) readProcess(state *sessionState) {
-	defer state.closeEvents.Do(func() { close(state.events) })
+	defer state.shutdownOnce.Do(func() { close(state.shutdown) })
+	defer state.closeEvents.Do(func() {
+		state.mu.Lock()
+		state.closed = true
+		state.mu.Unlock()
+		close(state.events)
+	})
 	defer state.resultOnce.Do(func() { close(state.resultReady) })
 	for line := range state.process.Lines() {
 		a.handleLine(state, line)
@@ -573,14 +583,20 @@ func (a *Adapter) notificationEvent(state *sessionState, method string, params j
 
 func (a *Adapter) recordEvent(state *sessionState, native adapter.NativeEvent) {
 	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return
+	}
 	state.history = append(state.history, native)
 	state.mu.Unlock()
-	select {
-	case state.events <- native:
-	default:
-		// Backpressure must not deadlock protocol responses. The complete raw
-		// history remains available through ReadHistory.
-	}
+	// Critical lifecycle events block under backpressure; progress may drop.
+	// Shutdown unblocks producers so adapter exit cannot deadlock.
+	protocol.EmitNativeEvent(protocol.EmitOptions{
+		Events:          state.events,
+		Shutdown:        state.shutdown,
+		Mu:              &state.mu,
+		DroppedProgress: &state.droppedProgress,
+	}, native)
 }
 
 func (a *Adapter) removePending(state *sessionState, id int64) {

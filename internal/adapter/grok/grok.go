@@ -26,22 +26,26 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu            sync.Mutex
-	process       *transport.Process
-	acpSessionID  string
-	workerID      string
-	events        chan adapter.NativeEvent
-	resultReady   chan struct{}
-	resultOnce    sync.Once
-	closeEvents   sync.Once
-	history       []adapter.NativeEvent
-	output        strings.Builder
-	final         []byte
-	resultError   string
-	usage         adapter.Usage
-	nextID        int64
-	pending       map[int64]chan rpcMessage
-	serverRequest map[string]struct{}
+	mu              sync.Mutex
+	process         *transport.Process
+	acpSessionID    string
+	workerID        string
+	events          chan adapter.NativeEvent
+	resultReady     chan struct{}
+	resultOnce      sync.Once
+	closeEvents     sync.Once
+	shutdown        chan struct{}
+	shutdownOnce    sync.Once
+	history         []adapter.NativeEvent
+	output          strings.Builder
+	final           []byte
+	resultError     string
+	usage           adapter.Usage
+	droppedProgress uint64
+	closed          bool
+	nextID          int64
+	pending         map[int64]chan rpcMessage
+	serverRequest   map[string]struct{}
 }
 
 type rpcMessage struct {
@@ -109,7 +113,8 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 	}
 	state := &sessionState{
 		process: p, workerID: req.WorkerID, events: make(chan adapter.NativeEvent, 256),
-		resultReady: make(chan struct{}), pending: map[int64]chan rpcMessage{}, serverRequest: map[string]struct{}{},
+		resultReady: make(chan struct{}), shutdown: make(chan struct{}),
+		pending: map[int64]chan rpcMessage{}, serverRequest: map[string]struct{}{},
 	}
 	go a.readProcess(state)
 	if _, err := a.request(ctx, state, "initialize", map[string]any{
@@ -196,6 +201,7 @@ func (a *Adapter) TerminateSession(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	state.shutdownOnce.Do(func() { close(state.shutdown) })
 	if err := state.process.Terminate(ctx); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		_ = state.process.CloseInput()
 		return err
@@ -354,7 +360,13 @@ func (a *Adapter) respondServerRequest(_ context.Context, state *sessionState, r
 }
 
 func (a *Adapter) readProcess(state *sessionState) {
-	defer state.closeEvents.Do(func() { close(state.events) })
+	defer state.shutdownOnce.Do(func() { close(state.shutdown) })
+	defer state.closeEvents.Do(func() {
+		state.mu.Lock()
+		state.closed = true
+		state.mu.Unlock()
+		close(state.events)
+	})
 	defer state.resultOnce.Do(func() { close(state.resultReady) })
 	for line := range state.process.Lines() {
 		a.handleLine(state, line)
@@ -441,12 +453,18 @@ func (a *Adapter) handleLine(state *sessionState, line []byte) {
 
 func (a *Adapter) recordEvent(state *sessionState, native adapter.NativeEvent) {
 	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return
+	}
 	state.history = append(state.history, native)
 	state.mu.Unlock()
-	select {
-	case state.events <- native:
-	default:
-	}
+	protocol.EmitNativeEvent(protocol.EmitOptions{
+		Events:          state.events,
+		Shutdown:        state.shutdown,
+		Mu:              &state.mu,
+		DroppedProgress: &state.droppedProgress,
+	}, native)
 }
 
 func (a *Adapter) removePending(state *sessionState, id int64) {
