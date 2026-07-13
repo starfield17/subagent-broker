@@ -100,10 +100,14 @@ func (s *Service) setRunStatus(status domain.RunStatus, reason string) error {
 
 // setWaveStatus commits the current Wave status transition.
 func (s *Service) setWaveStatus(status domain.WaveStatus) error {
+	return s.setWaveStatusReason(status, "")
+}
+
+func (s *Service) setWaveStatusReason(status domain.WaveStatus, reason string) error {
 	before := s.Snapshot()
 	from := before.Wave.Status
 	waveID := before.Wave.WaveID
-	if from == status {
+	if from == status && (reason == "" || before.Wave.FailureReason == reason) {
 		return nil
 	}
 	return s.commitMutate(context.Background(), event.Input{
@@ -112,11 +116,14 @@ func (s *Service) setWaveStatus(status domain.WaveStatus) error {
 			"wave_id": string(waveID),
 			"from":    string(from),
 			"to":      string(status),
-			"reason":  "",
+			"reason":  reason,
 		},
 	}, func(candidate *Snapshot) error {
 		now := time.Now().UTC()
 		candidate.Wave.Status = status
+		if reason != "" {
+			candidate.Wave.FailureReason = reason
+		}
 		if status == domain.WaveRunning {
 			candidate.Wave.StartedAt = &now
 		}

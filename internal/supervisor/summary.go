@@ -35,6 +35,7 @@ type RunSummary struct {
 type WaveSummaryEntry struct {
 	WaveID          string               `json:"wave_id"`
 	Status          domain.WaveStatus    `json:"status"`
+	FailureReason   string               `json:"failure_reason,omitempty"`
 	BarrierResult   domain.BarrierResult `json:"barrier_result,omitempty"`
 	BarrierAccepted bool                 `json:"barrier_accepted,omitempty"`
 	AcceptReason    string               `json:"accept_reason,omitempty"`
@@ -95,6 +96,7 @@ func (s *Service) buildRunSummary(baseline verify.WorkspaceSnapshot) (RunSummary
 	for _, w := range snap.Waves {
 		entry := WaveSummaryEntry{
 			WaveID: string(w.WaveID), Status: w.Status,
+			FailureReason: w.FailureReason,
 			BarrierResult: w.BarrierResult, BarrierAccepted: w.BarrierAccepted, AcceptReason: w.BarrierReason,
 		}
 		paths := s.wavePaths(w.WaveID)
@@ -170,6 +172,9 @@ func renderAggregatedSummary(summary RunSummary) string {
 	b.WriteString("## Waves\n\n")
 	for _, w := range summary.Waves {
 		fmt.Fprintf(&b, "- `%s`: %s", w.WaveID, w.Status)
+		if w.FailureReason != "" {
+			fmt.Fprintf(&b, " failure=%q", w.FailureReason)
+		}
 		if w.BarrierResult != "" {
 			fmt.Fprintf(&b, " barrier=`%s`", w.BarrierResult)
 		}

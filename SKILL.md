@@ -48,6 +48,8 @@ Workers may read the project, but may only write within the approved scope. When
 - Events are append-only and Run-sequenced.
 - Formal Markdown is atomically published only after validation.
 - `report.md` means a valid report exists, not that verification succeeded.
+- A durably recorded Task execution failure must terminalize its Wave and Run before the Supervisor exits normally.
+- Only Tasks that actually started are Worker recovery candidates. Never-started Tasks retain their pre-start state.
 - Waiting for user, permission, or scope is not a stall.
 - Suspected stall is not an automatic kill condition.
 - Git describes code changes; it is not the control protocol or liveness oracle.

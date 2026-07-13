@@ -783,7 +783,9 @@ func (s *Service) applyResultEnvelope(runtime *TaskState, result report.Envelope
 			if err := s.transitionTask(runtime, state.TaskVerificationFailed); err != nil {
 				return err
 			}
-			_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"})
+			if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"}); eventErr != nil {
+				return joinFatalSupervisorError(fmt.Errorf("task validation failed"), eventErr)
+			}
 			return fmt.Errorf("task validation failed")
 		}
 		if err := s.transitionTask(runtime, state.TaskVerifiedSuccess); err != nil {
@@ -802,7 +804,9 @@ func (s *Service) applyResultEnvelope(runtime *TaskState, result report.Envelope
 			if err := s.transitionTask(runtime, state.TaskVerificationFailed); err != nil {
 				return err
 			}
-			_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"})
+			if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"}); eventErr != nil {
+				return joinFatalSupervisorError(fmt.Errorf("task validation failed"), eventErr)
+			}
 			return fmt.Errorf("task validation failed")
 		}
 		return s.markPartial(runtime, result.Status)

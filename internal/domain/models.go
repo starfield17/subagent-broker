@@ -125,6 +125,7 @@ type Wave struct {
 	BarrierResult     BarrierResult       `json:"barrier_result,omitempty"`
 	BarrierAccepted   bool                `json:"barrier_accepted,omitempty"`
 	BarrierReason     string              `json:"barrier_acceptance_reason,omitempty"`
+	FailureReason     string              `json:"failure_reason,omitempty"`
 }
 
 type Task struct {

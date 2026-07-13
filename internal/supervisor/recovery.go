@@ -21,6 +21,7 @@ const (
 	RecoveryPIDReused          RecoveryClass = "pid_reused"
 	RecoveryExitedResumable    RecoveryClass = "exited_resumable"
 	RecoveryExitedUnresumable  RecoveryClass = "exited_unresumable"
+	RecoveryNeverStarted       RecoveryClass = "never_started"
 	RecoveryMissingIdentity    RecoveryClass = "missing_identity"
 	RecoveryIdentityIncomplete RecoveryClass = "identity_incomplete"
 	RecoveryInspectUnknown     RecoveryClass = "inspect_unknown"
@@ -46,6 +47,11 @@ func ClassifyRecovery(runtime TaskState, inspect process.Identity, inspectErr er
 	if recoveryTaskTerminal(runtime) {
 		decision.Class = RecoveryAlreadyTerminal
 		decision.Reason = "task is already terminal"
+		return decision
+	}
+	if recoveryTaskNeverStarted(runtime) {
+		decision.Class = RecoveryNeverStarted
+		decision.Reason = "task is planned with no execution evidence"
 		return decision
 	}
 	w := runtime.Worker
@@ -93,6 +99,21 @@ func ClassifyRecovery(runtime TaskState, inspect process.Identity, inspectErr er
 	return decision
 }
 
+func recoveryTaskNeverStarted(runtime TaskState) bool {
+	if runtime.Worker != nil || runtime.ActiveAttempt != 0 || len(runtime.Attempts) != 0 || runtime.Task.Status != state.TaskPlanned {
+		return false
+	}
+	// A queued or unset process dimension is compatible with a planned Task.
+	// Any started-derived process state is execution evidence even if the
+	// Worker projection is missing.
+	switch runtime.Dimensions.Process {
+	case "", state.ProcessQueued:
+		return true
+	default:
+		return false
+	}
+}
+
 func exitedDecision(decision RecoveryDecision, w *domain.WorkerSession, supportsResume bool, reason string) RecoveryDecision {
 	decision.Process = state.ProcessExited
 	if w.NativeSessionID != "" && supportsResume {
@@ -120,6 +141,9 @@ func recoveryTaskTerminal(runtime TaskState) bool {
 }
 
 func (s *Service) reconcileRecovery(ctx context.Context) error {
+	if runTerminal(s.Snapshot().Run.Status) {
+		return nil
+	}
 	if err := s.setRunStatus(domain.RunRecovering, ""); err != nil {
 		return err
 	}
@@ -153,6 +177,10 @@ func (s *Service) reconcileRecovery(ctx context.Context) error {
 			return err
 		}
 		switch d.Class {
+		case RecoveryAlreadyTerminal:
+			if runtime, ok := s.taskState(d.TaskID); ok && unsuccessfulTaskTerminal(runtime) {
+				hasFailedWorker = true
+			}
 		case RecoveryAliveOrphaned:
 			hasOrphan = true
 		case RecoveryInspectUnknown, RecoveryIdentityIncomplete, RecoveryPIDReused:
@@ -167,20 +195,29 @@ func (s *Service) reconcileRecovery(ctx context.Context) error {
 	case hasOrphan || hasUnknown:
 		return s.setRunStatus(domain.RunDegraded, "recovery finished with unknown or orphaned worker processes")
 	case hasFailedWorker:
-		return s.setRunStatus(domain.RunFailed, "recovery finished with unrecoverable workers")
+		return s.finishRun(domain.RunFailed, "recovery finished with unrecoverable workers")
 	default:
 		return s.setRunStatus(domain.RunRunning, "recovery finished")
 	}
 }
 
 func (s *Service) applyRecoveryDecision(ctx context.Context, d RecoveryDecision) error {
+	severity := "warning"
+	if d.Class == RecoveryNeverStarted {
+		severity = "info"
+	}
 	_ = s.appendEvent(event.Input{
-		TaskID: string(d.TaskID), WorkerID: d.WorkerID, Source: "recovery", Type: event.RecoveryClassified, Severity: "warning",
+		TaskID: string(d.TaskID), WorkerID: d.WorkerID, Source: "recovery", Type: event.RecoveryClassified, Severity: severity,
 		Payload: map[string]any{"class": string(d.Class), "reason": d.Reason, "from": "", "to": string(d.Class)},
 	})
 
 	switch d.Class {
 	case RecoveryAlreadyTerminal:
+		return nil
+
+	case RecoveryNeverStarted:
+		// Planned Tasks have no execution identity or attempt history. Keep
+		// their Task and process dimensions untouched for a future run.
 		return nil
 
 	case RecoveryAliveOrphaned:

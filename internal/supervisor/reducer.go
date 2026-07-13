@@ -85,6 +85,9 @@ func ApplyEvent(snapshot Snapshot, ev event.Event) (Snapshot, error) {
 				}
 				if reason != "select_wave" && reason != "barrier_result" {
 					w.Status = domain.WaveStatus(to)
+					if reason != "" && w.Status == domain.WaveFailed {
+						w.FailureReason = reason
+					}
 				}
 			}
 			if br, ok := payload["barrier_result"].(string); ok && br != "" {

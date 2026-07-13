@@ -72,6 +72,27 @@ Supervisor-level integration coverage (`internal/supervisor/phase4_integration_t
 
 A simple historical `StartSession`/`CollectFinalResult` smoke is **not** treated as evidence for permission, resume, next-turn, or cancellation claims.
 
+## Patch A runtime/recovery invariants
+
+- A durably recorded Task execution failure must terminalize its Wave and Run before the Supervisor exits normally.
+- Only Tasks that actually started are Worker recovery candidates. Never-started Tasks retain their pre-start state.
+
+## Patch A validation
+
+Executed on 2026-07-13:
+
+```bash
+gofmt -w .
+test -z "$(gofmt -l .)"
+go test ./...
+go test -race ./...
+go test -race ./internal/supervisor/... -count=10
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Results: formatting check, all tests, race tests, Supervisor race stress, vet, and build passed. No live authenticated Harness smoke was run for Patch A.
+
 ## Phase 4 PR 8.7 — native permission wire protocols
 
 Executed on 2026-07-13 after aligning Grok ACP and OpenCode 1.17.15 permission responses:

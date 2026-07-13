@@ -36,6 +36,65 @@ const SchemaVersion = "v1alpha1"
 // Barrier or pending Main Agent decision pauses progression.
 var errAwaitingDecision = errors.New("supervisor is awaiting a decision")
 
+// waveExecutionResult keeps ordinary Task failures distinct from failures of
+// the Supervisor's persistence or control plane. It remains an error so callers
+// that execute a Wave directly still observe every Task error.
+type waveExecutionResult struct {
+	TaskFailures []error
+	FatalErrors  []error
+}
+
+func (r *waveExecutionResult) joined() error {
+	if r == nil {
+		return nil
+	}
+	return errors.Join(append(append([]error(nil), r.TaskFailures...), r.FatalErrors...)...)
+}
+
+func (r *waveExecutionResult) Error() string {
+	if err := r.joined(); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func (r *waveExecutionResult) Unwrap() error {
+	return r.joined()
+}
+
+// fatalSupervisorError marks a Task error that was accompanied by a failure
+// to durably record the Task failure or its terminal artifacts.
+type fatalSupervisorError struct {
+	err error
+}
+
+func (e *fatalSupervisorError) Error() string {
+	if e == nil || e.err == nil {
+		return "fatal Supervisor failure"
+	}
+	return "fatal Supervisor failure: " + e.err.Error()
+}
+
+func (e *fatalSupervisorError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func joinFatalSupervisorError(original error, extra ...error) error {
+	errs := make([]error, 0, len(extra)+1)
+	if original != nil {
+		errs = append(errs, original)
+	}
+	for _, err := range extra {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return &fatalSupervisorError{err: errors.Join(errs...)}
+}
+
 type Config struct {
 	BrokerHome        string        `json:"broker_home"`
 	Harness           string        `json:"harness"`
@@ -656,6 +715,18 @@ func (s *Service) Start(ctx context.Context) error {
 	s.mu.Lock()
 	status := s.snapshot.Run.Status
 	s.mu.Unlock()
+	// Keep this as a final safety net for fatal execution paths that returned
+	// before execute could terminalize the Run. Ordinary Task failures are
+	// terminalized inside execute and therefore do not reach this branch.
+	if err != nil && !runTerminal(status) {
+		terminalErr := s.finishRun(domain.RunFailed, "supervisor execution failed: "+err.Error())
+		if terminalErr != nil {
+			err = errors.Join(err, terminalErr)
+		}
+		s.mu.Lock()
+		status = s.snapshot.Run.Status
+		s.mu.Unlock()
+	}
 	// Final identity write while lease is still held; IPC cleanup runs via defer
 	// before lease release.
 	_ = s.writeSupervisorIdentity(shutdownReason(err, status))
@@ -954,6 +1025,24 @@ func (s *Service) execute(ctx context.Context) error {
 			return err
 		}
 		if err := s.executeWave(ctx, planned); err != nil {
+			var result *waveExecutionResult
+			if errors.As(err, &result) && len(result.TaskFailures) > 0 && len(result.FatalErrors) == 0 {
+				// Every Task error in this branch is already represented by an
+				// unsuccessful terminal Task state. Preserve the joined errors in
+				// the Wave/Run reason while completing the control-plane lifecycle.
+				reason := errors.Join(result.TaskFailures...).Error()
+				if terminalErr := s.finishRun(domain.RunFailed, reason); terminalErr != nil {
+					return errors.Join(err, terminalErr)
+				}
+				return nil
+			}
+
+			// A fatal Wave result means the Supervisor could not prove that all
+			// failures were durably recorded. Try to fail the current Wave/Run,
+			// but retain the original error if that terminalization also fails.
+			if terminalErr := s.finishRun(domain.RunFailed, err.Error()); terminalErr != nil {
+				return errors.Join(err, terminalErr)
+			}
 			return err
 		}
 		if s.isCancelled() || ctx.Err() != nil {
@@ -1034,7 +1123,7 @@ func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) erro
 	sem := make(chan struct{}, s.config.MaxConcurrency)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var errs []error
+	result := &waveExecutionResult{}
 	for _, taskID := range taskIDs(planned.Tasks) {
 		runtime, ok := s.taskState(taskID)
 		// Never re-run terminal, orphaned, or unknown-process tasks.
@@ -1057,21 +1146,56 @@ func (s *Service) executeWave(ctx context.Context, planned domain.WavePlan) erro
 			defer func() { <-sem }()
 			// executeTask owns final Task persistence; do not saveRuntime a stale local copy.
 			if err := s.executeTask(ctx, &runtime); err != nil {
+				taskErr := fmt.Errorf("task %s: %w", runtime.Task.TaskID, err)
+				latest, ok := s.taskState(runtime.Task.TaskID)
+				ordinary := ok && unsuccessfulTaskTerminal(latest) && !isFatalTaskExecutionError(err) && s.AcceptingWork()
 				mu.Lock()
-				errs = append(errs, fmt.Errorf("task %s: %w", runtime.Task.TaskID, err))
+				if ordinary {
+					result.TaskFailures = append(result.TaskFailures, taskErr)
+				} else {
+					result.FatalErrors = append(result.FatalErrors, taskErr)
+				}
 				mu.Unlock()
 			}
 		}(runtime)
 	}
 	wg.Wait()
 	if !s.AcceptingWork() {
-		joined := errors.Join(errs...)
-		if joined != nil {
-			return joined
+		if joined := result.joined(); joined != nil {
+			return result
 		}
 		return fmt.Errorf("supervisor is not accepting work after a fatal persistence failure")
 	}
-	return errors.Join(errs...)
+	if result.joined() == nil {
+		return nil
+	}
+	return result
+}
+
+func unsuccessfulTaskTerminal(runtime TaskState) bool {
+	if !recoveryTaskTerminal(runtime) {
+		return false
+	}
+	switch runtime.Task.Status {
+	case state.TaskVerificationFailed, state.TaskFailed, state.TaskCancelled:
+		return true
+	case state.TaskBlocked:
+		return runtime.BlockKind == BlockKindFinal
+	default:
+		return false
+	}
+}
+
+func isFatalTaskExecutionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var fatalErr *fatalSupervisorError
+	if errors.As(err, &fatalErr) {
+		return true
+	}
+	var commitErr *CommitError
+	return errors.As(err, &commitErr)
 }
 
 func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, native adapter.NativeEvent, workerID string) {
@@ -1966,25 +2090,35 @@ func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
 	}
 	if runtime.Task.Status != state.TaskFailed && runtime.Task.Status != state.TaskCancelled {
 		if transitionErr := s.transitionTask(runtime, state.TaskFailed); transitionErr != nil {
-			return transitionErr
+			return joinFatalSupervisorError(err, fmt.Errorf("terminalize Task %s: %w", runtime.Task.TaskID, transitionErr))
 		}
 	}
+	var durabilityErrs []error
 	if expireErr := s.onTaskTerminalMessages(string(runtime.Task.TaskID), "task failed: "+stage); expireErr != nil {
 		// Fail-closed: terminal cleanup persistence errors must surface.
-		return fmt.Errorf("task failed (%s): %w; also expire messages: %v", stage, err, expireErr)
+		durabilityErrs = append(durabilityErrs, fmt.Errorf("expire messages: %w", expireErr))
 	}
 	if stage != "result" && stage != "result_validation" && runtime.ReportPath == "" {
 		failed := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusFailed, Summary: "Worker execution failed", NoFilesChangedReason: "No verified file list was available after the failure", ValidationNotRunReason: "validation was not reached", FailureStage: stage, ErrorSummary: err.Error(), WorkspaceState: "Workspace was left in place; no rollback was performed", HandoffNotes: []string{"Main Agent should inspect the workspace before retrying."}}
 		attemptNumber := reportAttemptNumber(runtime)
 		if publishErr := report.Publish(s.taskDir(runtime.Task), failed, attemptNumber, time.Now().UTC()); publishErr == nil {
 			runtime.ReportPath = filepath.Join(s.taskDir(runtime.Task), "report.md")
-			_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.ReportPublished, Severity: "error"})
+			if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.ReportPublished, Severity: "error"}); eventErr != nil {
+				durabilityErrs = append(durabilityErrs, fmt.Errorf("record failed report event: %w", eventErr))
+			}
+		} else {
+			durabilityErrs = append(durabilityErrs, fmt.Errorf("publish failed report: %w", publishErr))
 		}
 	}
 	if saveErr := s.saveRuntime(*runtime); saveErr != nil {
-		return saveErr
+		durabilityErrs = append(durabilityErrs, fmt.Errorf("save failed Task state: %w", saveErr))
 	}
-	_ = s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.TurnFailed, Severity: "error", Payload: map[string]string{"stage": stage, "error": err.Error()}})
+	if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.TurnFailed, Severity: "error", Payload: map[string]string{"stage": stage, "error": err.Error()}}); eventErr != nil {
+		durabilityErrs = append(durabilityErrs, fmt.Errorf("record Task failure event: %w", eventErr))
+	}
+	if len(durabilityErrs) > 0 {
+		return joinFatalSupervisorError(err, durabilityErrs...)
+	}
 	return err
 }
 
@@ -2037,7 +2171,7 @@ func (s *Service) finishRun(status domain.RunStatus, reason string) error {
 		}
 	}
 	if status == domain.RunFailed {
-		if err := s.setWaveStatus(domain.WaveFailed); err != nil {
+		if err := s.setWaveStatusReason(domain.WaveFailed, reason); err != nil {
 			return err
 		}
 	} else if status == domain.RunCancelled {
@@ -2048,10 +2182,13 @@ func (s *Service) finishRun(status domain.RunStatus, reason string) error {
 	// Aggregate durable summary before terminal status.
 	if summary, err := s.buildRunSummary(s.runBaseline); err == nil {
 		summary.RunStatus = status
-		if writeErr := s.writeRunSummary(summary); writeErr != nil && status == domain.RunCompleted {
+		if reason != "" {
+			summary.LastError = reason
+		}
+		if writeErr := s.writeRunSummary(summary); writeErr != nil && (status == domain.RunCompleted || status == domain.RunFailed) {
 			return writeErr
 		}
-	} else if status == domain.RunCompleted {
+	} else {
 		return fmt.Errorf("build run summary: %w", err)
 	}
 	if err := s.setRunStatus(status, reason); err != nil {
