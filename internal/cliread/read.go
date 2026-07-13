@@ -350,6 +350,10 @@ func snapshotResult(result any) (supervisor.Snapshot, error) {
 
 // CallIPC is the shared mutation client. Barrier accept/reject callers use it
 // so they cannot bypass the Supervisor by writing artifacts themselves.
+//
+// Authentication is fail-closed: missing, unreadable, empty, or whitespace-only
+// control tokens never produce a socket request. The raw token is never logged,
+// printed, or returned in errors.
 func CallIPC(runDir, method string, params any) (supervisor.Response, error) {
 	info := inspectSupervisor(runDir)
 	if !info.Alive || info.Status != IdentityValid {
@@ -358,16 +362,15 @@ func CallIPC(runDir, method string, params any) (supervisor.Response, error) {
 	return callIPC(runDir, info.Endpoint, method, params)
 }
 
+// ErrControlCredentialUnavailable is returned when the operator control token
+// cannot be loaded. Error strings must never include the token value or file
+// contents.
+var ErrControlCredentialUnavailable = errors.New("control credential unavailable")
+
 func callIPC(runDir, endpoint, method string, params any) (supervisor.Response, error) {
 	if endpoint == "" {
 		endpoint = supervisor.SocketPath(runDir)
 	}
-	conn, err := net.DialTimeout("unix", endpoint, 2*time.Second)
-	if err != nil {
-		return supervisor.Response{}, err
-	}
-	defer conn.Close()
-
 	data, err := os.ReadFile(filepath.Join(runDir, "run.json"))
 	if err != nil {
 		return supervisor.Response{}, err
@@ -377,7 +380,17 @@ func callIPC(runDir, endpoint, method string, params any) (supervisor.Response, 
 		return supervisor.Response{}, err
 	}
 	// Control credential is operator-only; never embedded in Worker configuration.
-	controlToken, _ := supervisor.LoadControlCredential(runDir)
+	// Fail closed before dialing when the token cannot be loaded.
+	controlToken, err := supervisor.LoadControlCredential(runDir)
+	if err != nil || strings.TrimSpace(controlToken) == "" {
+		return supervisor.Response{}, ErrControlCredentialUnavailable
+	}
+	conn, err := net.DialTimeout("unix", endpoint, 2*time.Second)
+	if err != nil {
+		return supervisor.Response{}, err
+	}
+	defer conn.Close()
+
 	request := supervisor.Request{
 		SchemaVersion: supervisor.SchemaVersion,
 		RequestID:     fmt.Sprintf("cli-%d", time.Now().UnixNano()),
