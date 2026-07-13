@@ -47,6 +47,18 @@ type sessionState struct {
 	pending       map[int64]chan rpcMessage
 	serverRequest map[string]struct{}
 	agentPhases   map[string]string
+	// terminalCommitted is true after exactly one terminal boundary has been
+	// recorded in history (ResultSubmitted or TurnFailed). Prevents double commit
+	// when process EOF races with a protocol terminal notification.
+	terminalCommitted bool
+}
+
+// codexNotification separates ordinary stream events from terminal boundaries.
+// Terminal notifications use recordTerminalEvent so history is committed before
+// resultReady unblocks CollectFinalResult / GetUsage.
+type codexNotification struct {
+	Event    adapter.NativeEvent
+	Terminal bool
 }
 
 type rpcMessage struct {
@@ -416,7 +428,9 @@ func (a *Adapter) respondServerRequest(ctx context.Context, state *sessionState,
 
 func (a *Adapter) readProcess(state *sessionState) {
 	defer state.shutdownOnce.Do(func() { close(state.shutdown) })
-	defer state.resultOnce.Do(func() { close(state.resultReady) })
+	// Fail-safe EOF unblock: if no terminal protocol event arrived, commit an
+	// explicit failure once. Never double-commit after a protocol terminal.
+	defer a.ensureResultReadyOnEOF(state)
 	// Single producer (this reader): graceful close after protocol EOF.
 	defer func() {
 		if state.stream != nil {
@@ -460,15 +474,19 @@ func (a *Adapter) handleLine(state *sessionState, line []byte) {
 	if message.Method == "" {
 		return
 	}
-	native := a.notificationEvent(state, message.Method, message.Params)
-	a.recordEvent(state, native)
+	note := a.notificationEvent(state, message.Method, message.Params)
+	if note.Terminal {
+		a.recordTerminalEvent(state, note.Event)
+		return
+	}
+	a.recordEvent(state, note.Event)
 }
 
-func (a *Adapter) notificationEvent(state *sessionState, method string, params json.RawMessage) adapter.NativeEvent {
+func (a *Adapter) notificationEvent(state *sessionState, method string, params json.RawMessage) codexNotification {
 	now := time.Now().UTC()
 	switch method {
 	case "thread/started", "thread/resumed":
-		return adapter.NativeEvent{Kind: event.SessionStarted, Timestamp: now, Payload: params}
+		return codexNotification{Event: adapter.NativeEvent{Kind: event.SessionStarted, Timestamp: now, Payload: params}}
 	case "turn/started":
 		var value struct {
 			Turn struct {
@@ -484,7 +502,7 @@ func (a *Adapter) notificationEvent(state *sessionState, method string, params j
 			state.turnID = value.TurnID
 		}
 		state.mu.Unlock()
-		return adapter.NativeEvent{Kind: event.TurnStarted, Timestamp: now, Payload: params}
+		return codexNotification{Event: adapter.NativeEvent{Kind: event.TurnStarted, Timestamp: now, Payload: params}}
 	case "item/started":
 		var value struct {
 			Item struct {
@@ -499,7 +517,7 @@ func (a *Adapter) notificationEvent(state *sessionState, method string, params j
 			state.agentPhases[value.Item.ID] = value.Item.Phase
 			state.mu.Unlock()
 		}
-		return adapter.NativeEvent{Kind: "codex.item/started", Timestamp: now, Payload: params}
+		return codexNotification{Event: adapter.NativeEvent{Kind: "codex.item/started", Timestamp: now, Payload: params}}
 	case "item/agentMessage/delta":
 		var value struct {
 			Delta  string `json:"delta"`
@@ -512,7 +530,7 @@ func (a *Adapter) notificationEvent(state *sessionState, method string, params j
 			state.output.WriteString(value.Delta)
 		}
 		state.mu.Unlock()
-		return adapter.NativeEvent{Kind: event.ModelOutputDelta, Timestamp: now, Payload: params}
+		return codexNotification{Event: adapter.NativeEvent{Kind: event.ModelOutputDelta, Timestamp: now, Payload: params}}
 	case "item/agentMessage/completed", "item/completed":
 		var value struct {
 			Item struct {
@@ -554,8 +572,9 @@ func (a *Adapter) notificationEvent(state *sessionState, method string, params j
 			}
 		}
 		state.mu.Unlock()
-		return adapter.NativeEvent{Kind: event.ModelMessageCompleted, Timestamp: now, Payload: params}
+		return codexNotification{Event: adapter.NativeEvent{Kind: event.ModelMessageCompleted, Timestamp: now, Payload: params}}
 	case "turn/completed":
+		// Terminal freeze happens in recordTerminalEvent so history precedes readiness.
 		var value struct {
 			Usage struct {
 				InputTokens  int64   `json:"inputTokens"`
@@ -564,22 +583,85 @@ func (a *Adapter) notificationEvent(state *sessionState, method string, params j
 			} `json:"usage"`
 		}
 		_ = json.Unmarshal(params, &value)
+		// Stash usage on state under lock; recordTerminalEvent freezes final+history.
 		state.mu.Lock()
 		state.usage = adapter.Usage{InputTokens: value.Usage.InputTokens, OutputTokens: value.Usage.OutputTokens, Cost: value.Usage.Cost, Currency: "USD"}
 		state.final = []byte(state.output.String())
 		state.mu.Unlock()
-		state.resultOnce.Do(func() { close(state.resultReady) })
-		go func() { _ = state.process.CloseInput() }()
-		return adapter.NativeEvent{Kind: event.ResultSubmitted, Timestamp: now, Payload: params}
+		return codexNotification{
+			Event:    adapter.NativeEvent{Kind: event.ResultSubmitted, Timestamp: now, Payload: params},
+			Terminal: true,
+		}
 	case "turn/failed", "turn/cancelled":
 		state.mu.Lock()
 		state.resultError = string(params)
 		state.mu.Unlock()
-		state.resultOnce.Do(func() { close(state.resultReady) })
-		go func() { _ = state.process.CloseInput() }()
-		return adapter.NativeEvent{Kind: event.TurnFailed, Timestamp: now, Payload: params}
+		return codexNotification{
+			Event:    adapter.NativeEvent{Kind: event.TurnFailed, Timestamp: now, Payload: params},
+			Terminal: true,
+		}
 	default:
-		return adapter.NativeEvent{Kind: "codex." + method, Timestamp: now, Payload: params}
+		return codexNotification{Event: adapter.NativeEvent{Kind: "codex." + method, Timestamp: now, Payload: params}}
+	}
+}
+
+// recordTerminalEvent commits terminal state and history before unblocking
+// resultReady. Order:
+//  1. Freeze final / usage / resultError (already applied by caller where needed)
+//  2. Append terminal event to history
+//  3. Signal resultReady exactly once
+//  4. Publish to EventStream (without holding state.mu)
+//  5. Close process input asynchronously
+func (a *Adapter) recordTerminalEvent(state *sessionState, native adapter.NativeEvent) {
+	state.mu.Lock()
+	if state.terminalCommitted {
+		state.mu.Unlock()
+		return
+	}
+	// Ensure success path has frozen final from output if still empty.
+	if native.Kind == event.ResultSubmitted && len(state.final) == 0 && state.output.Len() > 0 {
+		state.final = []byte(state.output.String())
+	}
+	state.history = append(state.history, native)
+	state.terminalCommitted = true
+	state.mu.Unlock()
+
+	state.resultOnce.Do(func() { close(state.resultReady) })
+
+	if state.stream != nil {
+		_ = state.stream.Publish(native)
+	}
+	if state.process != nil {
+		go func() { _ = state.process.CloseInput() }()
+	}
+}
+
+// ensureResultReadyOnEOF is the process-EOF fail-safe. If a protocol terminal
+// already committed, only ensures readiness is signaled (no second history event).
+// Otherwise commits an explicit unexpected-EOF failure — never false success.
+func (a *Adapter) ensureResultReadyOnEOF(state *sessionState) {
+	state.mu.Lock()
+	if state.terminalCommitted {
+		state.mu.Unlock()
+		state.resultOnce.Do(func() { close(state.resultReady) })
+		return
+	}
+	if state.resultError == "" {
+		state.resultError = "unexpected protocol EOF"
+	}
+	// Do not claim ResultSubmitted on EOF without a terminal notification.
+	native := adapter.NativeEvent{
+		Kind:      event.TurnFailed,
+		Timestamp: time.Now().UTC(),
+		Payload:   json.RawMessage(`{"error":"unexpected protocol EOF"}`),
+	}
+	state.history = append(state.history, native)
+	state.terminalCommitted = true
+	state.mu.Unlock()
+
+	state.resultOnce.Do(func() { close(state.resultReady) })
+	if state.stream != nil {
+		_ = state.stream.Publish(native)
 	}
 }
 

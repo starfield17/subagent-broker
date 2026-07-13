@@ -261,6 +261,47 @@ type Service struct {
 	// ipcPrepared tracks whether this owner created control/worker sockets so
 	// early-return cleanup only removes sockets created under this lease.
 	ipcPrepared bool
+
+	// Test-only hooks for deterministic decision-setup races. Production nil.
+	// afterDecisionEnqueue runs after Router enqueue, before decisionOpLock.
+	// afterDecisionOpLock runs after the op lock is acquired, before publication.
+	decisionHookMu       sync.Mutex
+	afterDecisionEnqueue func(messageID string)
+	afterDecisionOpLock  func(messageID string)
+}
+
+// SetAfterDecisionEnqueueHook installs a test hook after Router enqueue and
+// before the Service decision-operation lock is acquired. Production must not use.
+func (s *Service) SetAfterDecisionEnqueueHook(fn func(messageID string)) {
+	s.decisionHookMu.Lock()
+	s.afterDecisionEnqueue = fn
+	s.decisionHookMu.Unlock()
+}
+
+// SetAfterDecisionOpLockHook installs a test hook after the decision-operation
+// lock is acquired. Production must not use.
+func (s *Service) SetAfterDecisionOpLockHook(fn func(messageID string)) {
+	s.decisionHookMu.Lock()
+	s.afterDecisionOpLock = fn
+	s.decisionHookMu.Unlock()
+}
+
+func (s *Service) fireAfterDecisionEnqueue(messageID string) {
+	s.decisionHookMu.Lock()
+	fn := s.afterDecisionEnqueue
+	s.decisionHookMu.Unlock()
+	if fn != nil {
+		fn(messageID)
+	}
+}
+
+func (s *Service) fireAfterDecisionOpLock(messageID string) {
+	s.decisionHookMu.Lock()
+	fn := s.afterDecisionOpLock
+	s.decisionHookMu.Unlock()
+	if fn != nil {
+		fn(messageID)
+	}
 }
 
 type activeWorker struct {

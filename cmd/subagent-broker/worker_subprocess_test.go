@@ -93,6 +93,10 @@ func TestMCPWorkerEnvIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
@@ -108,15 +112,34 @@ func TestMCPWorkerEnvIdentity(t *testing.T) {
 		}
 	}
 
+	stdoutReader := bufio.NewReader(stdout)
 	// Minimal MCP initialize so the server starts its loop; then tools/call ask.
-	// WorkerServer.Run reads JSON-RPC from stdin.
-	init := map[string]any{
+	initReq := map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "initialize",
 		"params": map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
 	}
-	if err := json.NewEncoder(stdin).Encode(init); err != nil {
+	if err := json.NewEncoder(stdin).Encode(initReq); err != nil {
 		t.Fatal(err)
 	}
+	initLine, err := stdoutReader.ReadBytes('\n')
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("initialize response: %v stderr=%s", err, stderr.String())
+	}
+	var initResp map[string]any
+	if err := json.Unmarshal(initLine, &initResp); err != nil {
+		t.Fatalf("initialize JSON: %v body=%s", err, initLine)
+	}
+	if fmt.Sprint(initResp["id"]) != "1" && !jsonRawIDEquals(initResp["id"], 1) {
+		t.Fatalf("initialize id mismatch: %v", initResp["id"])
+	}
+	if initResp["error"] != nil {
+		t.Fatalf("initialize error: %v", initResp["error"])
+	}
+	if initResp["result"] == nil {
+		t.Fatalf("initialize missing result: %s", initLine)
+	}
+
 	// tools/call ask_main_agent
 	call := map[string]any{
 		"jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -130,7 +153,6 @@ func TestMCPWorkerEnvIdentity(t *testing.T) {
 	if err := json.NewEncoder(stdin).Encode(call); err != nil {
 		t.Fatal(err)
 	}
-	_ = stdin.Close()
 
 	select {
 	case s := <-got:
@@ -161,13 +183,37 @@ func TestMCPWorkerEnvIdentity(t *testing.T) {
 		t.Fatalf("timeout waiting for worker socket connect; stderr=%s", stderr.String())
 	}
 
+	callLine, err := stdoutReader.ReadBytes('\n')
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("tools/call response: %v stderr=%s", err, stderr.String())
+	}
+	var callResp map[string]any
+	if err := json.Unmarshal(callLine, &callResp); err != nil {
+		t.Fatalf("tools/call JSON: %v body=%s", err, callLine)
+	}
+	if !jsonRawIDEquals(callResp["id"], 2) {
+		t.Fatalf("tools/call id mismatch: %v", callResp["id"])
+	}
+	if callResp["error"] != nil {
+		t.Fatalf("tools/call error: %v", callResp["error"])
+	}
+	result, _ := callResp["result"].(map[string]any)
+	if result == nil {
+		t.Fatalf("tools/call missing result: %s", callLine)
+	}
+	if isErr, _ := result["isError"].(bool); isErr {
+		t.Fatalf("tools/call isError=true: %v", result)
+	}
+
+	_ = stdin.Close()
+
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
 		if err != nil {
-			// MCP server may exit non-zero after one call depending on stdin EOF; allow.
-			t.Logf("mcp-worker exit: %v stderr=%s", err, stderr.String())
+			t.Fatalf("mcp-worker must exit 0 after valid initialize+tools/call+EOF: %v stderr=%s", err, stderr.String())
 		}
 	case <-time.After(5 * time.Second):
 		_ = cmd.Process.Kill()
@@ -175,6 +221,22 @@ func TestMCPWorkerEnvIdentity(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), token) {
 		t.Fatal("token appeared in stderr")
+	}
+}
+
+func jsonRawIDEquals(id any, want int) bool {
+	switch v := id.(type) {
+	case float64:
+		return int(v) == want
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n) == want
+	case string:
+		return v == fmt.Sprintf("%d", want)
+	default:
+		// json.RawMessage decoded as nested number via encoding/json default.
+		b, _ := json.Marshal(id)
+		return string(b) == fmt.Sprintf("%d", want)
 	}
 }
 
