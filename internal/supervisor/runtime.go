@@ -944,10 +944,8 @@ func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, nati
 			Payload: map[string]any{"reason": "protocol or output progress resumed", "evidence": []string{"new protocol/output event"}},
 		})
 	}
-	if native.Kind == event.TurnCompleted || native.Kind == event.ResultSubmitted ||
-		worker.StatusDimensions.Protocol == state.ProtocolIdleBetweenTurns {
-		_ = s.FlushInstructionOutbox(context.Background(), string(runtime.Task.TaskID), "turn_boundary")
-	}
+	// Turn-boundary outbox decisions are owned by runWorkerSession so a queued
+	// next turn cannot start and then be terminated by the same ResultSubmitted.
 }
 
 func (s *Service) updateProgress(runtime *TaskState, now time.Time) {

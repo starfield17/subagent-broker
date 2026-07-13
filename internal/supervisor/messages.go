@@ -365,7 +365,81 @@ func (s *Service) deliverInstruction(ctx context.Context, queued message.Message
 	}
 }
 
+// startNextTurnAtBoundary starts at most one queued next_turn instruction after
+// a successful ResultSubmitted. FIFO uses Router.PendingInstructions order.
+// processExited forces failure of any attempt to send on a dead session.
+func (s *Service) startNextTurnAtBoundary(ctx context.Context, taskID string, processExited bool) TurnBoundaryResult {
+	if s.router == nil {
+		return TurnBoundaryResult{}
+	}
+	if runtime, ok := s.taskState(domain.TaskID(taskID)); ok && recoveryTaskTerminal(runtime) {
+		return TurnBoundaryResult{}
+	}
+	pending := s.router.PendingInstructions(taskID, message.DeliveryNextTurn)
+	if len(pending) == 0 {
+		return TurnBoundaryResult{}
+	}
+	// Exactly one instruction per boundary (oldest first).
+	item := pending[0]
+	if !message.IsDeliveryPending(item) {
+		return TurnBoundaryResult{}
+	}
+	text := instructionText(item)
+
+	if processExited {
+		cause := fmt.Errorf("process already exited; cannot start in-process next turn: %w", adapter.ErrUnsupported)
+		failed, tErr := s.router.RecordDeliveryAttempt(item.MessageID, message.Failed, cause)
+		if tErr == nil {
+			_ = s.CommitMessageProjection(ctx, failed, event.MessageFailed)
+		}
+		return TurnBoundaryResult{}
+	}
+
+	s.mu.Lock()
+	active, isActive := s.active[taskID]
+	s.mu.Unlock()
+	if !isActive {
+		// Not live: reclassify to resume or fail; never claim next turn started.
+		if err := s.handleInactiveQueuedInstruction(ctx, item); err != nil {
+			// handleInactive may convert to resume; still not an in-process next turn.
+			_ = err
+		}
+		return TurnBoundaryResult{}
+	}
+
+	// Accept prompt first; only then record Delivered (durable ordering).
+	_, sendErr := active.adapter.SendMessage(ctx, active.sessionID, text)
+	if sendErr != nil {
+		failed, tErr := s.router.RecordDeliveryAttempt(item.MessageID, message.Failed, sendErr)
+		if tErr == nil {
+			_ = s.CommitMessageProjection(ctx, failed, event.MessageFailed)
+		}
+		// First result remains final; do not claim next turn started.
+		return TurnBoundaryResult{}
+	}
+	delivered, tErr := s.router.RecordDeliveryAttempt(item.MessageID, message.Delivered, nil)
+	if tErr != nil {
+		return TurnBoundaryResult{}
+	}
+	if cErr := s.CommitMessageProjection(ctx, delivered, event.MessageDelivered); cErr != nil {
+		return TurnBoundaryResult{}
+	}
+	_ = s.appendEvent(event.Input{
+		TaskID: taskID, WorkerID: active.workerID, Source: "message-router",
+		Type: event.InstructionFlushed, Severity: "info",
+		Payload: map[string]any{
+			"message_id":        item.MessageID,
+			"trigger":           "turn_boundary",
+			"started_next_turn": true,
+			"delivery_mode":     string(message.DeliveryNextTurn),
+		},
+	})
+	return TurnBoundaryResult{StartedNextTurn: true, MessageID: item.MessageID}
+}
+
 // FlushInstructionOutbox delivers queued next_turn/resume instructions for a task.
+// turn_boundary next_turn starts are owned by startNextTurnAtBoundary via runWorkerSession;
+// this path still supports active_session immediate flushes and resume delivery.
 func (s *Service) FlushInstructionOutbox(ctx context.Context, taskID, trigger string) error {
 	if s.router == nil {
 		return nil
@@ -378,7 +452,31 @@ func (s *Service) FlushInstructionOutbox(ctx context.Context, taskID, trigger st
 	}
 
 	switch trigger {
-	case "turn_boundary", "active_session":
+	case "turn_boundary":
+		// Lifecycle-owned by runWorkerSession.startNextTurnAtBoundary; avoid double-start.
+		// Immediate-only residual flush (steer leftovers).
+		pending := s.router.PendingInstructions(taskID, message.DeliveryImmediate)
+		var firstErr error
+		for _, item := range pending {
+			if message.IsTerminal(item.Status) || !message.IsDeliveryPending(item) {
+				continue
+			}
+			text := instructionText(item)
+			if _, err := s.deliverInstruction(ctx, item, text); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				if !s.AcceptingWork() {
+					return err
+				}
+				continue
+			}
+			if err := s.appendEvent(event.Input{TaskID: taskID, Source: "message-router", Type: event.InstructionFlushed, Severity: "info", Payload: map[string]any{"message_id": item.MessageID, "trigger": trigger}}); err != nil {
+				return err
+			}
+		}
+		return firstErr
+	case "active_session":
 		pending := s.router.PendingInstructions(taskID, message.DeliveryNextTurn, message.DeliveryImmediate)
 		var firstErr error
 		for _, item := range pending {
@@ -391,7 +489,6 @@ func (s *Service) FlushInstructionOutbox(ctx context.Context, taskID, trigger st
 			case message.DeliveryImmediate:
 				_, err = s.deliverInstruction(ctx, item, text)
 			case message.DeliveryNextTurn:
-				// Physical send at the turn boundary — never re-enter the next_turn no-op.
 				err = s.deliverQueuedToActiveSession(ctx, item, text)
 			default:
 				continue

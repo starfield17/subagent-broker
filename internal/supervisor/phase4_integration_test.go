@@ -77,8 +77,9 @@ func TestPhase4NextTurnDeliveryIntegration(t *testing.T) {
 		t.Fatalf("status=%s", got.Status)
 	}
 
-	if err := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary"); err != nil {
-		t.Fatal(err)
+	boundary := service.startNextTurnAtBoundary(context.Background(), "task-a", false)
+	if !boundary.StartedNextTurn {
+		t.Fatal("expected next turn start")
 	}
 	if len(harness.SentMessages) != 1 || harness.SentMessages[0] != "queued-during-turn" {
 		t.Fatalf("sent=%v", harness.SentMessages)
@@ -88,9 +89,9 @@ func TestPhase4NextTurnDeliveryIntegration(t *testing.T) {
 		t.Fatalf("after boundary: %+v", got)
 	}
 
-	// Exactly-once: second flush is a no-op.
-	if err := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary"); err != nil {
-		t.Fatal(err)
+	// Exactly-once: second boundary is a no-op with empty queue.
+	if service.startNextTurnAtBoundary(context.Background(), "task-a", false).StartedNextTurn {
+		t.Fatal("double delivery")
 	}
 	if len(harness.SentMessages) != 1 {
 		t.Fatalf("double delivery: %v", harness.SentMessages)
