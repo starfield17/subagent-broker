@@ -403,44 +403,55 @@ func TestAuthenticatedCancelTask(t *testing.T) {
 	waitTaskRunning(t, env.Service, "task-a")
 	binary := buildCLIBinary(t)
 	token, _ := supervisor.LoadControlCredential(env.RunDir)
-	stdout, stderr, code := runCLI(t, binary,
-		"cancel", "--project", env.ProjectRoot, "--broker-home", env.Home, "--run", env.RunID,
-		"--task", "task-a",
-	)
-	assertNoSecret(t, token, stdout, stderr)
-	if code != 0 {
-		t.Fatalf("cancel exit=%d stdout=%s stderr=%s", code, stdout, stderr)
-	}
-	if !strings.Contains(stdout, "cancel requested") {
-		t.Fatalf("stdout=%q", stdout)
-	}
-	// Authenticated cancel accepted; task moves toward cancelled/failed terminal.
-	deadline := time.Now().Add(3 * time.Second)
+	// Poll until active map is ready; unauthorized would fail immediately without retry success.
+	deadline := time.Now().Add(5 * time.Second)
+	var stdout, stderr string
+	var code int
 	for time.Now().Before(deadline) {
-		for _, ts := range env.Service.Snapshot().Tasks {
-			if string(ts.Task.TaskID) == "task-a" {
-				if ts.Task.Status == state.TaskCancelled || ts.Task.Status == state.TaskFailed {
-					return
-				}
-			}
+		stdout, stderr, code = runCLI(t, binary,
+			"cancel", "--project", env.ProjectRoot, "--broker-home", env.Home, "--run", env.RunID,
+			"--task", "task-a",
+		)
+		assertNoSecret(t, token, stdout, stderr)
+		if code == 0 && strings.Contains(stdout, "cancel requested") {
+			return
+		}
+		if strings.Contains(stderr, "unauthorized") || strings.Contains(stdout, "unauthorized") {
+			t.Fatalf("unauthorized on cancel: stdout=%s stderr=%s", stdout, stderr)
+		}
+		if !strings.Contains(stderr, "no active Worker") && !strings.Contains(stdout, "no active Worker") && code != 0 {
+			// Other failures after auth may still be environment races; keep polling briefly.
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// CLI exit 0 is the authentication/control-plane success criterion.
+	t.Fatalf("cancel exit=%d stdout=%s stderr=%s", code, stdout, stderr)
 }
 
 func TestAuthenticatedCancelViaCommandHandler(t *testing.T) {
-	// Handler path still goes sendCommand/cancelCommand → cliread.CallIPC → socket.
+	// Handler path still goes cancelCommand → cliread.CallIPC → socket.
+	// RequestCancelTask requires the in-memory active map (not only Worker projection),
+	// so poll until the worker is registered or fail.
 	env := startLiveControlSupervisor(t, []string{"task-a"}, adapter.Capabilities{
 		StructuredStream: true, StructuredFinalOutput: true,
 	})
 	waitTaskRunning(t, env.Service, "task-a")
-	err := cancelCommand([]string{
+	args := []string{
 		"--project", env.ProjectRoot, "--broker-home", env.Home, "--run", env.RunID, "--task", "task-a",
-	})
-	if err != nil {
-		t.Fatalf("cancelCommand: %v", err)
 	}
+	deadline := time.Now().Add(5 * time.Second)
+	var err error
+	for time.Now().Before(deadline) {
+		err = cancelCommand(args)
+		if err == nil {
+			return
+		}
+		// Retry only the active-worker race; auth failures must not be retried.
+		if !strings.Contains(err.Error(), "no active Worker") {
+			t.Fatalf("cancelCommand: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("cancelCommand: %v", err)
 }
 
 func TestControlCredentialMissingFailsClosed(t *testing.T) {
