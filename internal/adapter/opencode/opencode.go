@@ -33,29 +33,28 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu              sync.Mutex
-	process         *transport.Process
-	baseURL         string
-	directory       string
-	sessionID       string
-	workerID        string
-	events          chan adapter.NativeEvent
-	resultReady     chan struct{}
-	resultOnce      sync.Once
-	finishOnce      sync.Once
-	closeEvents     sync.Once
-	shutdown        chan struct{}
-	shutdownOnce    sync.Once
-	history         []adapter.NativeEvent
-	final           []byte
-	resultError     string
-	usage           adapter.Usage
-	droppedProgress uint64
-	closed          bool
-	generation      uint64
-	promptInFlight  bool
-	promptGen       uint64
-	resultSignaled  bool
+	mu             sync.Mutex
+	process        *transport.Process
+	baseURL        string
+	directory      string
+	sessionID      string
+	workerID       string
+	stream         *protocol.EventStream
+	resultReady    chan struct{}
+	resultOnce     sync.Once
+	finishOnce     sync.Once
+	shutdown       chan struct{}
+	shutdownOnce   sync.Once
+	history        []adapter.NativeEvent
+	final          []byte
+	resultError    string
+	usage          adapter.Usage
+	generation     uint64
+	promptInFlight bool
+	promptGen      uint64
+	resultSignaled bool
+	// SSE producer coordination with watchExit.
+	sseDone chan struct{}
 }
 
 type sseEvent struct {
@@ -135,7 +134,9 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 	}
 	state := &sessionState{
 		process: p, baseURL: baseURL, directory: req.ProjectRoot, workerID: req.WorkerID,
-		events: make(chan adapter.NativeEvent, 256), resultReady: make(chan struct{}), shutdown: make(chan struct{}),
+		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 256, ProgressQueueLimit: 256}),
+		resultReady: make(chan struct{}), shutdown: make(chan struct{}),
+		sseDone: make(chan struct{}),
 	}
 	go a.drainServerOutput(p)
 	go a.watchExit(state)
@@ -204,6 +205,9 @@ func (a *Adapter) TerminateSession(ctx context.Context, id string) error {
 		return err
 	}
 	state.shutdownOnce.Do(func() { close(state.shutdown) })
+	if state.stream != nil {
+		go state.stream.Abort()
+	}
 	_ = a.requestJSON(ctx, state, http.MethodPost, "/session/"+url.PathEscape(id)+"/abort", nil, map[string]any{}, nil)
 	return a.stop(state)
 }
@@ -413,17 +417,39 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 }
 
 func (a *Adapter) subscribeEvents(state *sessionState) {
+	defer close(state.sseDone)
+	// SSE producer is the graceful closer of the EventStream after it exits.
+	defer func() {
+		if state.stream != nil {
+			state.stream.CloseGracefully()
+		}
+	}()
 	request, err := http.NewRequest(http.MethodGet, state.baseURL+"/event?directory="+url.QueryEscape(state.directory), nil)
 	if err != nil {
 		return
 	}
-	response, err := (&http.Client{}).Do(request)
+	// Bound the SSE client so shutdown can progress.
+	client := &http.Client{}
+	response, err := client.Do(request)
 	if err != nil {
 		return
 	}
 	defer response.Body.Close()
+	// Close body when session shuts down so Scan unblocks.
+	go func() {
+		select {
+		case <-state.shutdown:
+			_ = response.Body.Close()
+		case <-state.sseDone:
+		}
+	}()
 	scanner := bufio.NewScanner(response.Body)
 	for scanner.Scan() {
+		select {
+		case <-state.shutdown:
+			return
+		default:
+		}
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
 			continue
@@ -471,18 +497,11 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 		}
 	}
 	state.mu.Lock()
-	if state.closed {
-		state.mu.Unlock()
-		return
-	}
 	state.history = append(state.history, native)
 	state.mu.Unlock()
-	protocol.EmitNativeEvent(protocol.EmitOptions{
-		Events:          state.events,
-		Shutdown:        state.shutdown,
-		Mu:              &state.mu,
-		DroppedProgress: &state.droppedProgress,
-	}, native)
+	if state.stream != nil {
+		_ = state.stream.Publish(native)
+	}
 	if value.Type == "session.idle" {
 		state.mu.Lock()
 		if !state.resultSignaled {
@@ -584,6 +603,9 @@ func (a *Adapter) requestJSON(ctx context.Context, state *sessionState, method, 
 
 func (a *Adapter) stop(state *sessionState) error {
 	state.shutdownOnce.Do(func() { close(state.shutdown) })
+	if state.stream != nil {
+		go state.stream.Abort()
+	}
 	err := state.process.Terminate(context.Background())
 	_ = state.process.CloseInput()
 	return err
@@ -604,16 +626,25 @@ func (a *Adapter) watchExit(state *sessionState) {
 		if status.Code != 0 && len(state.final) == 0 {
 			state.resultError = status.Error
 		}
+		signaled := state.resultSignaled
+		if !signaled {
+			state.resultSignaled = true
+		}
 		state.mu.Unlock()
-		close(state.resultReady)
+		if !signaled {
+			close(state.resultReady)
+		}
 	})
+	// Stop SSE and let subscribeEvents gracefully close the EventStream.
 	state.shutdownOnce.Do(func() { close(state.shutdown) })
-	state.closeEvents.Do(func() {
-		state.mu.Lock()
-		state.closed = true
-		state.mu.Unlock()
-		close(state.events)
-	})
+	// If SSE is stalled, Abort unblocks the stream owner.
+	if state.stream != nil {
+		select {
+		case <-state.sseDone:
+		case <-time.After(2 * time.Second):
+			state.stream.Abort()
+		}
+	}
 }
 
 func (a *Adapter) requireSession(id string) (*sessionState, error) {
@@ -628,5 +659,9 @@ func (a *Adapter) requireSession(id string) (*sessionState, error) {
 
 func sessionFromState(state *sessionState) adapter.Session {
 	i := state.process.Identity()
-	return adapter.Session{NativeSessionID: state.sessionID, PID: i.PID, ProcessStartToken: i.StartToken, Events: state.events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
+	var events <-chan adapter.NativeEvent
+	if state.stream != nil {
+		events = state.stream.Events()
+	}
+	return adapter.Session{NativeSessionID: state.sessionID, PID: i.PID, ProcessStartToken: i.StartToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
 }

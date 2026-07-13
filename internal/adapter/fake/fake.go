@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
+	"github.com/vnai/subagent-broker/internal/adapter/protocol"
 	"github.com/vnai/subagent-broker/internal/event"
 	"github.com/vnai/subagent-broker/internal/report"
 )
@@ -32,17 +33,18 @@ type Scenario struct {
 
 type sessionState struct {
 	session         adapter.Session
-	events          chan adapter.NativeEvent
+	stream          *protocol.EventStream
 	done            chan struct{}
 	history         []adapter.NativeEvent
 	final           *report.Envelope
 	diff            []string
 	usage           adapter.Usage
-	closed          bool
 	followUpBatches [][]adapter.NativeEvent
 	followUpFinals  []*report.Envelope
 	followUpIndex   int
 	promptInFlight  bool
+	producers       sync.WaitGroup
+	readerExited    bool
 }
 
 type Adapter struct {
@@ -111,21 +113,14 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	}
 	n := a.counter.Add(1)
 	id := fmt.Sprintf("fake-session-%d", n)
-	buf := len(scenario.Events) + 1
-	for _, batch := range scenario.FollowUpBatches {
-		buf += len(batch) + 1
-	}
-	if buf < 16 {
-		buf = 16
-	}
-	channel := make(chan adapter.NativeEvent, buf)
+	stream := protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 64, ProgressQueueLimit: 256})
 	exited := make(chan adapter.ExitStatus, 1)
 	// Synthetic process identity: PID is chosen so it does not refer to a live
 	// process. Supervisor fills ProcessGroupToken; Controller then confirms
 	// "tree gone" after Exited (Inspect returns not-found).
 	fakePID := int(1_000_000_000 + n)
 	session := adapter.Session{
-		NativeSessionID: id, NativeTurnID: "turn-1", Events: channel, Exited: exited,
+		NativeSessionID: id, NativeTurnID: "turn-1", Events: stream.Events(), Exited: exited,
 		PID: fakePID, ProcessStartToken: "fake-start-" + id,
 	}
 	final := cloneEnvelope(scenario.Final)
@@ -138,7 +133,7 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 		}
 	}
 	state := &sessionState{
-		session: session, events: channel, done: make(chan struct{}), final: final,
+		session: session, stream: stream, done: make(chan struct{}), final: final,
 		diff: append([]string(nil), scenario.Diff...), usage: scenario.Usage,
 		followUpBatches: append([][]adapter.NativeEvent(nil), scenario.FollowUpBatches...),
 		followUpFinals:  append([]*report.Envelope(nil), scenario.FollowUpFinals...),
@@ -148,14 +143,24 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 
 	go func() {
 		defer func() {
+			a.mu.Lock()
+			state.readerExited = true
+			a.mu.Unlock()
+			state.producers.Wait()
+			// Prefer graceful drain; abort if the public consumer is absent/stalled.
+			finished := make(chan struct{})
+			go func() {
+				stream.CloseGracefully()
+				close(finished)
+			}()
+			select {
+			case <-finished:
+			case <-time.After(250 * time.Millisecond):
+				stream.Abort()
+				<-finished
+			}
 			exited <- adapter.ExitStatus{Code: scenario.ExitCode}
 			close(exited)
-			a.mu.Lock()
-			if !state.closed {
-				close(channel)
-				state.closed = true
-			}
-			a.mu.Unlock()
 		}()
 		for _, native := range scenario.Events {
 			select {
@@ -163,11 +168,9 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 				return
 			case <-state.done:
 				return
-			case channel <- native:
-				a.mu.Lock()
-				state.history = append(state.history, native)
-				a.mu.Unlock()
+			default:
 			}
+			a.publishFake(state, native)
 		}
 		if scenario.KeepOpen {
 			select {
@@ -177,6 +180,18 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 		}
 	}()
 	return session, nil
+}
+
+func (a *Adapter) publishFake(state *sessionState, native adapter.NativeEvent) {
+	if native.Timestamp.IsZero() {
+		native.Timestamp = time.Now().UTC()
+	}
+	a.mu.Lock()
+	state.history = append(state.history, native)
+	a.mu.Unlock()
+	if state.stream != nil {
+		_ = state.stream.Publish(native)
+	}
 }
 
 func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) (adapter.Session, error) {
@@ -191,7 +206,7 @@ func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) 
 	}
 	// Open a fresh event/exit stream for the resumed turn so callers can drive a
 	// full Worker Session lifecycle (Events → result → Exited).
-	channel := make(chan adapter.NativeEvent, 8)
+	stream := protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 16, ProgressQueueLimit: 64})
 	exited := make(chan adapter.ExitStatus, 1)
 	// Keep PID/start-token so supervisor can form a complete process identity.
 	pid := state.session.PID
@@ -203,7 +218,7 @@ func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) 
 	session := adapter.Session{
 		NativeSessionID:   req.NativeSessionID,
 		NativeTurnID:      "turn-resume",
-		Events:            channel,
+		Events:            stream.Events(),
 		Exited:            exited,
 		PID:               pid,
 		ProcessStartToken: startTok,
@@ -226,9 +241,9 @@ func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) 
 		}
 	}
 	state.session = session
-	state.events = channel
-	state.closed = false
+	state.stream = stream
 	state.done = make(chan struct{})
+	state.readerExited = false
 	a.mu.Unlock()
 
 	now := time.Now().UTC()
@@ -239,14 +254,23 @@ func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) 
 	}
 	go func() {
 		defer func() {
+			a.mu.Lock()
+			state.readerExited = true
+			a.mu.Unlock()
+			state.producers.Wait()
+			finished := make(chan struct{})
+			go func() {
+				stream.CloseGracefully()
+				close(finished)
+			}()
+			select {
+			case <-finished:
+			case <-time.After(250 * time.Millisecond):
+				stream.Abort()
+				<-finished
+			}
 			exited <- adapter.ExitStatus{Code: 0}
 			close(exited)
-			a.mu.Lock()
-			if !state.closed {
-				close(channel)
-				state.closed = true
-			}
-			a.mu.Unlock()
 		}()
 		for _, native := range events {
 			select {
@@ -254,11 +278,14 @@ func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) 
 				return
 			case <-state.done:
 				return
-			case channel <- native:
-				a.mu.Lock()
-				state.history = append(state.history, native)
-				a.mu.Unlock()
+			default:
 			}
+			a.publishFake(state, native)
+		}
+		// Stay open until TerminateSession so resume outbox flush can SendMessage.
+		select {
+		case <-ctx.Done():
+		case <-state.done:
 		}
 	}()
 	return session, nil
@@ -276,6 +303,10 @@ func (a *Adapter) SendMessage(_ context.Context, id, message string) (adapter.De
 		return adapter.DeliveryResult{}, err
 	}
 	a.mu.Lock()
+	if state.readerExited {
+		a.mu.Unlock()
+		return adapter.DeliveryResult{}, fmt.Errorf("fake session closed")
+	}
 	if state.promptInFlight {
 		a.mu.Unlock()
 		return adapter.DeliveryResult{}, fmt.Errorf("fake prompt already in flight")
@@ -297,23 +328,21 @@ func (a *Adapter) SendMessage(_ context.Context, id, message string) (adapter.De
 		state.followUpIndex++
 	}
 	state.promptInFlight = len(batch) > 0
-	eventsCh := state.events
+	if len(batch) > 0 {
+		state.producers.Add(1)
+	}
 	a.mu.Unlock()
 
 	if len(batch) > 0 {
 		go func() {
+			defer state.producers.Done()
 			for _, native := range batch {
-				if native.Timestamp.IsZero() {
-					native.Timestamp = time.Now().UTC()
-				}
 				select {
 				case <-state.done:
 					return
-				case eventsCh <- native:
-					a.mu.Lock()
-					state.history = append(state.history, native)
-					a.mu.Unlock()
+				default:
 				}
+				a.publishFake(state, native)
 			}
 			a.mu.Lock()
 			if nextFinal != nil {
@@ -346,17 +375,21 @@ func (a *Adapter) InterruptTurn(_ context.Context, id string) error {
 
 func (a *Adapter) TerminateSession(_ context.Context, id string) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	state, ok := a.sessions[id]
 	if !ok {
+		a.mu.Unlock()
 		return fmt.Errorf("unknown session %q", id)
 	}
-	if !state.closed {
-		select {
-		case <-state.done:
-		default:
-			close(state.done)
-		}
+	select {
+	case <-state.done:
+	default:
+		close(state.done)
+	}
+	stream := state.stream
+	a.mu.Unlock()
+	if stream != nil {
+		// Abort unblocks owner if consumer is stalled; graceful path also runs from producer exit.
+		go stream.Abort()
 	}
 	return nil
 }
