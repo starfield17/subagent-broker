@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/vnai/subagent-broker/internal/adapter"
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/event"
 	"github.com/vnai/subagent-broker/internal/process"
@@ -129,8 +128,6 @@ func (s *Service) reconcileRecovery(ctx context.Context) error {
 	}
 
 	snapshot := s.Snapshot()
-	harness, harnessOK := s.registry.Get(adapter.HarnessName(s.config.Harness))
-	supportsResume := harnessOK && harness.Descriptor().Capabilities.ResumeSession
 
 	// Classify every Task first — never return after the first Worker.
 	decisions := make([]RecoveryDecision, 0, len(snapshot.Tasks))
@@ -141,6 +138,8 @@ func (s *Service) reconcileRecovery(ctx context.Context) error {
 		if w != nil && w.PID > 0 && w.ProcessStartToken != "" {
 			identity, inspectErr = process.Inspect(ctx, w.PID)
 		}
+		harness, harnessOK := s.adapterForTask(runtime.Task, w)
+		supportsResume := harnessOK && harness.Descriptor().Capabilities.ResumeSession
 		// Missing PID/token is classified as identity_incomplete inside ClassifyRecovery;
 		// do not invent os.ErrNotExist (that would falsely allow Resume).
 		decisions = append(decisions, ClassifyRecovery(runtime, identity, inspectErr, supportsResume))

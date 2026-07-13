@@ -2,7 +2,7 @@
 
 ## Status
 
-This repository is a **Phase 3 runtime**. It executes ordered Waves of same-checkout Tasks through Claude Code and provides Barrier verification plus a persistent Main Agent/Worker message path.
+This repository is a **Phase 4 runtime**. It executes ordered Waves of same-checkout Tasks through four native Harness Adapters and provides Barrier verification plus a persistent Main Agent/Worker message path.
 
 ## Main Agent responsibilities
 
@@ -52,7 +52,7 @@ Workers may read the project, but may only write within the approved scope. When
 
 ## Operator workflow
 
-Build and probe the Claude adapter before dispatching:
+Build and probe all available Harnesses before dispatching:
 
 ```bash
 go build -o /tmp/subagent-broker ./cmd/subagent-broker
@@ -70,7 +70,7 @@ Dispatch accepts the legacy Task array as one Wave or an ordered plan containing
   --model sonnet
 ```
 
-The command starts a detached Supervisor and prints the Run ID. The Supervisor is the only writer of Run state and owns the Claude process group. Inspect or control the Run with:
+The command starts a detached Supervisor and prints the Run ID. The Supervisor is the only writer of Run state and owns each Harness process/session. Inspect or control the Run with:
 
 ```bash
 /tmp/subagent-broker status --project /path/to/project --run <run-id>
@@ -84,4 +84,4 @@ The command starts a detached Supervisor and prints the Run ID. The Supervisor i
 
 If the Supervisor itself stops before the Run is terminal, start reconciliation with `recover`. Recovery never treats a reused PID as the original Worker without a matching process start token.
 
-Phase 3 supports the `claude-code` runtime only. Questions and scope requests use Broker-provided MCP tools; permission requests use a run-local Claude PreToolUse gate. The Fake Harness remains the deterministic lifecycle test adapter for unit and race tests.
+Phase 4 supports `claude-code`, `codex`, `grok-build`, and `opencode` at runtime. Put `harness_preference` on a Task to override the Run default; mixed Harnesses in one Run are supported. Claude questions/scope requests use Broker-provided MCP tools, while permission, steering, history, diff, and usage are routed through each native protocol where available. The Fake Harness remains the deterministic lifecycle test adapter for unit and race tests.

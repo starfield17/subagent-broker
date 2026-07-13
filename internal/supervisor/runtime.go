@@ -1067,21 +1067,22 @@ func (s *Service) preflightWave(ctx context.Context, planned domain.WavePlan) er
 		Executable:     s.config.Executable,
 		ProbeTimeout:   10 * time.Second,
 		PermissionMode: s.config.PermissionMode,
-		// Permission hooks are only mandatory for Claude sessions that claim broker-mediated tools.
-		RequirePermissionHooks: !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode) &&
-			adapter.RequiresPermissionRouting(s.config.PermissionMode, false),
-		SafeMode: s.config.SafeMode,
+		// Permission hooks are only mandatory for Claude tasks that claim broker-mediated tools.
+		RequirePermissionHooks: !s.config.SafeMode && adapter.RequiresPermissionRouting(s.config.PermissionMode, false),
+		SafeMode:               s.config.SafeMode,
 	})
-	// Reject wave when Claude permission routing is required but would not be effective.
-	if !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode) &&
-		adapter.RequiresPermissionRouting(s.config.PermissionMode, false) {
-		for name := range result.Harnesses {
-			if harness, ok := s.registry.Get(adapter.HarnessName(name)); ok {
-				set := s.computeSessionCapabilities(harness, domain.Task{})
+	// Re-check session-level Claude hook installation only for Claude tasks.
+	if !s.config.SafeMode && adapter.RequiresPermissionRouting(s.config.PermissionMode, false) {
+		for _, item := range tasks {
+			if item.HarnessPreference != string(adapter.HarnessClaudeCode) {
+				continue
+			}
+			if harness, ok := s.registry.Get(adapter.HarnessClaudeCode); ok {
+				set := s.computeSessionCapabilities(harness, item)
 				if !set.Effective.PermissionEvents {
 					result.Issues = append(result.Issues, wave.Issue{
-						Kind: wave.IssueHarnessProbeFailed, Severity: wave.SeverityError, Tasks: []string{name},
-						Details: fmt.Sprintf("harness %s permission_events not effective (hooks not installed or safe mode); downgrades: %v", name, set.Downgrades),
+						Kind: wave.IssueHarnessProbeFailed, Severity: wave.SeverityError, Tasks: []string{string(item.TaskID)},
+						Details: fmt.Sprintf("harness %s permission_events not effective (hooks not installed or safe mode); downgrades: %v", item.HarnessPreference, set.Downgrades),
 					})
 					result.Allowed = false
 				}
@@ -1622,12 +1623,31 @@ func capabilityMap(value adapter.Capabilities) map[string]bool {
 	return adapter.CapabilityMap(value)
 }
 
+// harnessNameForTask is the single routing rule used after a Run is loaded:
+// the persisted Worker is authoritative during recovery, then the Task
+// preference, then the Run default.
+func (s *Service) harnessNameForTask(task domain.Task, worker *domain.WorkerSession) string {
+	if worker != nil && strings.TrimSpace(worker.Harness) != "" {
+		return strings.TrimSpace(worker.Harness)
+	}
+	if strings.TrimSpace(task.HarnessPreference) != "" {
+		return strings.TrimSpace(task.HarnessPreference)
+	}
+	return strings.TrimSpace(s.config.Harness)
+}
+
+func (s *Service) adapterForTask(task domain.Task, worker *domain.WorkerSession) (adapter.Adapter, bool) {
+	return s.registry.Get(adapter.HarnessName(s.harnessNameForTask(task, worker)))
+}
+
 // computeSessionCapabilities derives EffectiveCapabilities for a Task session.
 func (s *Service) computeSessionCapabilities(harness adapter.Adapter, task domain.Task) adapter.CapabilitySet {
 	declared := harness.Descriptor().Capabilities
 	probeCaps := declared
 	// Best-effort probe; failures leave probe=declared (unverified probe does not invent support).
-	if probe, err := harness.Probe(context.Background(), adapter.ProbeRequest{Executable: s.config.Executable}); err == nil && probe.Installed {
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelProbe()
+	if probe, err := harness.Probe(probeCtx, adapter.ProbeRequest{Executable: s.config.Executable}); err == nil && probe.Installed {
 		// Use declared∩probe.Capabilities when probe returns capability bits.
 		if probe.Capabilities != (adapter.Capabilities{}) {
 			probeCaps = probe.Capabilities
@@ -1641,15 +1661,17 @@ func (s *Service) computeSessionCapabilities(harness adapter.Adapter, task domai
 	type factProvider interface {
 		SessionConfigFact(adapter.StartRequest) adapter.SessionConfigFact
 	}
+	harnessName := strings.TrimSpace(task.HarnessPreference)
+	if harnessName == "" {
+		harnessName = string(harness.Descriptor().Name)
+	}
 	if fp, ok := harness.(factProvider); ok {
 		req := adapter.StartRequest{
 			Options: map[string]string{
 				"permission_mode": s.config.PermissionMode,
 				"safe_mode":       fmt.Sprintf("%v", s.config.SafeMode),
 			},
-			Interaction: adapter.InteractionConfig{
-				Enabled: !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode),
-			},
+			Interaction: adapter.InteractionConfig{Enabled: !s.config.SafeMode && harnessName == string(adapter.HarnessClaudeCode)},
 		}
 		fact = fp.SessionConfigFact(req)
 	} else {

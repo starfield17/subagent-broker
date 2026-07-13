@@ -33,16 +33,19 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		return fmt.Errorf("task %s has unknown process state; resume and fresh retry are forbidden until process tree is confirmed", runtime.Task.TaskID)
 	}
 
-	harness, ok := s.registry.Get(adapter.HarnessName(s.config.Harness))
-	if !ok {
-		return fmt.Errorf("adapter %q is not registered", s.config.Harness)
-	}
-
 	// Load latest task state for attempt history.
 	if latest, ok := s.taskState(runtime.Task.TaskID); ok {
 		*runtime = latest
 	}
 	migrateAttempts(runtime)
+	harnessName := strings.TrimSpace(runtime.Task.HarnessPreference)
+	if harnessName == "" {
+		harnessName = s.config.Harness
+	}
+	harness, ok := s.registry.Get(adapter.HarnessName(harnessName))
+	if !ok {
+		return fmt.Errorf("adapter %q is not registered", harnessName)
+	}
 
 	mode := workerpkg.AttemptFresh
 	if len(runtime.Attempts) > 0 {
@@ -57,7 +60,7 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	workerID := fmt.Sprintf("worker-%d", time.Now().UTC().UnixNano())
 	capSet := s.computeSessionCapabilities(harness, runtime.Task)
 	seed := domain.WorkerSession{
-		WorkerID: domain.WorkerID(workerID), TaskID: runtime.Task.TaskID, Harness: s.config.Harness,
+		WorkerID: domain.WorkerID(workerID), TaskID: runtime.Task.TaskID, Harness: harnessName,
 		AdapterVersion: harness.Descriptor().AdapterVersion, StartedAt: time.Now().UTC(),
 		LastEventAt: time.Now().UTC(), LastProgressAt: time.Now().UTC(),
 		Capabilities:           adapter.CapabilityMap(capSet.Effective),
@@ -160,7 +163,7 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		runtime.PendingInstruction = ""
 	}
 	executable, _ := os.Executable()
-	interaction := adapter.InteractionConfig{Enabled: !s.config.SafeMode && s.config.Harness == string(adapter.HarnessClaudeCode), BrokerExecutable: executable, RunDir: s.runDir}
+	interaction := adapter.InteractionConfig{Enabled: !s.config.SafeMode && harnessName == string(adapter.HarnessClaudeCode), BrokerExecutable: executable, RunDir: s.runDir}
 	request := adapter.StartRequest{RunID: string(runID), TaskID: string(runtime.Task.TaskID), WorkerID: workerID, ProjectRoot: runtime.Task.ProjectRoot, Contract: prompt, Model: model, Scenario: s.config.Scenario, Options: options, Interaction: interaction}
 
 	var session adapter.Session

@@ -18,14 +18,8 @@ func TestFourHarnessesDeclareCapabilitiesIndependently(t *testing.T) {
 			t.Fatalf("duplicate descriptor %s", d.Name)
 		}
 		seen[d.Name] = true
-		if d.Name == adapter.HarnessClaudeCode {
-			if !d.RuntimeImplemented || d.Compatibility != "verified" {
-				t.Fatalf("Claude adapter must be implemented and verified: %+v", d)
-			}
-		} else {
-			if d.RuntimeImplemented || d.Compatibility != "compatibility_unverified" {
-				t.Fatalf("future adapter %s must remain unimplemented", d.Name)
-			}
+		if !d.RuntimeImplemented || d.Compatibility != "verified" {
+			t.Fatalf("Phase 4 adapter must be implemented and verified: %+v", d)
 		}
 	}
 	if !codex.Descriptor().Capabilities.SteerActiveTurn || !claude.Descriptor().Capabilities.SteerActiveTurn {

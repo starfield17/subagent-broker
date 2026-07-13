@@ -1,6 +1,6 @@
-# subagent-broker — Phase 3 Runtime
+# subagent-broker — Phase 4 Runtime
 
-This repository implements the architecture skeleton and the Phase 1 through Phase 3 runtime slices from the Multi-Harness Parallel Subagent Skill manual.
+This repository implements the architecture skeleton and the Phase 1 through Phase 4 runtime slices from the Multi-Harness Parallel Subagent Skill manual.
 
 ## Included
 
@@ -13,18 +13,19 @@ This repository implements the architecture skeleton and the Phase 1 through Pha
 - Append-only event store with monotonic Run sequence and incomplete-tail recovery.
 - Result/question semantic validation and atomic Markdown publication.
 - Claude Code stream-json Adapter with structured results, normalized events, stderr capture, and session identity.
+- Native Codex App Server, Grok ACP, and OpenCode Server Adapters with protocol-specific lifecycle, event, permission, usage, diff, and Result Envelope handling.
 - Detached run-scoped Supervisor with process-group control, Unix-socket IPC, persistence, timeout handling, and recovery reconciliation.
 - Ordered multi-Wave plans with concurrent same-Wave Claude Workers and a configurable concurrency limit.
 - Content-based workspace baselines, Run/Wave scope audits, integration checks, Barrier artifacts, and final verification.
 - Persistent inbox, direct instruction delivery, structured question/answer, scope expansion, and permission routing.
 - A production CLI for dispatch, status, events, wait, collect, inbox, send, cancel, recover, and doctor operations.
 - A real Claude smoke fixture in `examples/phase1-smoke-tasks.json`.
-- Twelve accepted Architecture Decision Records (ADRs).
+- Sixteen accepted Architecture Decision Records (ADRs).
 - Unit, contract, race, and real smoke verification.
 
-## Phase 3 boundary
+## Phase 4 boundary
 
-Claude Code remains the only runtime Adapter until Phase 4. Codex, Grok Build, and OpenCode retain descriptor-only capability inventories. Full takeover of a still-running Worker after Supervisor failure remains hardening work. V1 does not create worktrees or nested agents.
+Tasks may select `claude-code`, `codex`, `grok-build`, or `opencode` through `harness_preference`; a Run may contain mixed Harnesses. The Run-level `--harness` flag is the default for Tasks without an explicit preference. A single `--executable` override is accepted only for uniform-Harness Runs; mixed Runs use each Harness's PATH default. Full takeover of a still-running Worker after Supervisor failure remains hardening work. V1 does not create worktrees or nested agents.
 
 ## Verify
 
@@ -69,6 +70,10 @@ Set `BROKER_HOME` or pass `--broker-home` to keep Broker state outside the proje
 - `internal/state`: four orthogonal state dimensions and transitions.
 - `internal/scope`: soft-scope glob matching and overlap checks.
 - `internal/adapter`: Adapter interface, capability model, registry, descriptors.
+- `internal/adapter/claude`: Claude stream-json and hook/MCP bridge.
+- `internal/adapter/codex`: Codex App Server JSONL adapter.
+- `internal/adapter/grok`: Grok ACP stdio adapter.
+- `internal/adapter/opencode`: OpenCode loopback HTTP/SSE adapter.
 - `internal/adapter/fake`: deterministic scripted Fake Harness.
 - `internal/event`: normalized append-only events and replay.
 - `internal/message`: append-only message storage, inbox models, and question publication.
@@ -80,4 +85,4 @@ Set `BROKER_HOME` or pass `--broker-home` to keep Broker state outside the proje
 - `internal/supervisor`: run-scoped Supervisor, persistence, recovery, and IPC.
 - `internal/doctor`: descriptor-level compatibility inventory.
 
-See `docs/phase0-coverage.md` through `docs/phase3-coverage.md` for requirement-to-code matrices.
+See `docs/phase0-coverage.md` through `docs/phase4-coverage.md` for requirement-to-code matrices.

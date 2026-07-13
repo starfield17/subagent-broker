@@ -243,7 +243,7 @@ func (s *Service) selectInstructionRoute(taskID string) (message.DeliveryMode, s
 			}
 			// Recompute from registry if map empty (legacy workers).
 			if len(runtime.Worker.Capabilities) == 0 {
-				if harness, ok := s.registry.Get(adapter.HarnessName(s.config.Harness)); ok {
+				if harness, ok := s.adapterForTask(runtime.Task, runtime.Worker); ok {
 					eff = s.computeSessionCapabilities(harness, runtime.Task).Effective
 					if runtime.Worker.NativeSessionID != "" && !recoveryTaskTerminal(runtime) && eff.ResumeSession {
 						return message.DeliveryResume, workerID, attemptNumber
@@ -856,7 +856,7 @@ func (s *Service) EnsureResumeAndFlushOutbox(ctx context.Context, taskID string)
 		return s.failQueuedResumeInstructions(taskID, adapter.ErrUnsupported, "native session missing")
 	}
 
-	harness, ok := s.registry.Get(adapter.HarnessName(s.config.Harness))
+	harness, ok := s.adapterForTask(runtime.Task, runtime.Worker)
 	if !ok {
 		return s.failQueuedResumeInstructions(taskID, adapter.ErrUnsupported, "adapter not registered")
 	}

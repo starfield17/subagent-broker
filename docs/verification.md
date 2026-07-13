@@ -21,3 +21,16 @@ Phase 2 and Phase 3 were verified against Claude Code 2.1.197:
 - `examples/phase3-permission-plan.json` routed two Bash tool calls through persistent permission requests, continued after approval, and completed successfully.
 
 These smokes are installed-environment checks, not compatibility claims for every Claude Code release or provider configuration.
+
+## Phase 4 local verification
+
+The Phase 4 runtime was verified with the locally installed tools:
+
+- Claude Code `2.1.197`
+- Codex `0.144.1`
+- Grok Build `0.2.99`
+- OpenCode `1.17.15`
+
+`subagent-broker doctor` probes all four Harnesses and reports installed, authenticated, compatible status and capabilities without printing credentials. Scripted Adapter contracts cover Codex App Server JSONL and Grok ACP multiplexing; the native contract smoke completed authenticated `StartSession`/`CollectFinalResult` flows for Claude Code, Codex, Grok Build, and OpenCode. A full Codex dispatch completed through Supervisor, Barrier verification, and report publication; OpenCode also passed a real loopback server health probe.
+
+Capability claims remain protocol-specific: Codex active-turn steering is sent through `turn/steer`; Grok Build and OpenCode expose next-turn/resume delivery rather than immediate steering. Versions outside the tested versions are reported as `compatibility_unverified`.

@@ -12,11 +12,15 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
 	"github.com/vnai/subagent-broker/internal/adapter/claude"
+	"github.com/vnai/subagent-broker/internal/adapter/codex"
+	"github.com/vnai/subagent-broker/internal/adapter/grok"
+	"github.com/vnai/subagent-broker/internal/adapter/opencode"
 	"github.com/vnai/subagent-broker/internal/clioutcome"
 	"github.com/vnai/subagent-broker/internal/cliread"
 	"github.com/vnai/subagent-broker/internal/domain"
@@ -130,7 +134,19 @@ func normalizeCommandError(command string, err error) error {
 func registry(executable string) *adapter.Registry {
 	result := adapter.NewRegistry()
 	_ = result.Register(claude.New(executable))
+	_ = result.Register(codex.New(executable))
+	_ = result.Register(grok.New(executable))
+	_ = result.Register(opencode.New(executable))
 	return result
+}
+
+func supportedHarness(name string) bool {
+	switch adapter.HarnessName(strings.TrimSpace(name)) {
+	case adapter.HarnessClaudeCode, adapter.HarnessCodex, adapter.HarnessGrokBuild, adapter.HarnessOpenCode:
+		return true
+	default:
+		return false
+	}
 }
 
 func dispatch(args []string) error {
@@ -157,8 +173,8 @@ func dispatch(args []string) error {
 	if strings.TrimSpace(*goal) == "" || strings.TrimSpace(*tasksFile) == "" {
 		return clioutcome.New(clioutcome.ExitUsage, "dispatch", "dispatch requires --goal and --tasks", nil)
 	}
-	if *harness != string(adapter.HarnessClaudeCode) {
-		return clioutcome.New(clioutcome.ExitCompatibility, "dispatch", fmt.Sprintf("Phase 3 only implements harness %q", adapter.HarnessClaudeCode), nil)
+	if !supportedHarness(*harness) {
+		return clioutcome.New(clioutcome.ExitCompatibility, "dispatch", fmt.Sprintf("unsupported harness %q", *harness), nil)
 	}
 	home, err := resolveBrokerHome(*brokerHome)
 	if err != nil {
@@ -178,6 +194,7 @@ func dispatch(args []string) error {
 		return err
 	}
 	var tasks []domain.Task
+	requestedHarnesses := map[string]struct{}{}
 	for waveIndex := range plan.Waves {
 		planned := &plan.Waves[waveIndex]
 		for taskIndex := range planned.Tasks {
@@ -194,9 +211,10 @@ func dispatch(args []string) error {
 			}
 			if item.HarnessPreference == "" {
 				item.HarnessPreference = *harness
-			} else if item.HarnessPreference != *harness {
+			} else if !supportedHarness(item.HarnessPreference) {
 				return fmt.Errorf("task %s requests unsupported harness %q", item.TaskID, item.HarnessPreference)
 			}
+			requestedHarnesses[item.HarnessPreference] = struct{}{}
 			if item.Status == "" {
 				item.Status = state.TaskPlanned
 			}
@@ -205,6 +223,9 @@ func dispatch(args []string) error {
 			}
 			tasks = append(tasks, *item)
 		}
+	}
+	if strings.TrimSpace(*executable) != "" && len(requestedHarnesses) > 1 {
+		return clioutcome.New(clioutcome.ExitUsage, "dispatch", "--executable may only be used with a single Harness; mixed Harness runs use PATH defaults", nil)
 	}
 	if err := run.ValidatePlan(plan); err != nil {
 		if strings.Contains(err.Error(), "preflight") {
@@ -1130,29 +1151,61 @@ func recoverCommand(args []string) error {
 func doctorCommand(args []string) error {
 	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	harness := flags.String("harness", string(adapter.HarnessClaudeCode), "harness name")
+	harness := flags.String("harness", "all", "harness name or all")
 	executable := flags.String("executable", "", "harness executable override")
 	if err := flags.Parse(args); err != nil {
 		return usageWrap("doctor", err)
 	}
-	if *harness != string(adapter.HarnessClaudeCode) {
-		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", fmt.Sprintf("Phase 3 doctor only probes harness %q", adapter.HarnessClaudeCode), nil)
+	adapters := registry(*executable)
+	descriptors := adapters.Descriptors()
+	selected := descriptors
+	if *harness != "all" {
+		if !supportedHarness(*harness) {
+			return clioutcome.New(clioutcome.ExitCompatibility, "doctor", fmt.Sprintf("unsupported harness %q", *harness), nil)
+		}
+		selected = nil
+		if value, ok := adapters.Get(adapter.HarnessName(*harness)); ok {
+			selected = []adapter.Descriptor{value.Descriptor()}
+		}
 	}
-	result, err := claude.New(*executable).Probe(context.Background(), adapter.ProbeRequest{Executable: *executable})
-	if err != nil {
-		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", "harness probe failed", err)
+	type doctorItem struct {
+		Harness       adapter.HarnessName  `json:"harness"`
+		Implemented   bool                 `json:"implemented"`
+		Compatibility string               `json:"compatibility"`
+		Installed     bool                 `json:"installed"`
+		Version       string               `json:"version,omitempty"`
+		Authenticated *bool                `json:"authenticated,omitempty"`
+		Capabilities  adapter.Capabilities `json:"capabilities"`
+		Warnings      []string             `json:"warnings,omitempty"`
 	}
+	items := make([]doctorItem, 0, len(selected))
+	failed := false
+	for _, descriptor := range selected {
+		value, ok := adapters.Get(descriptor.Name)
+		if !ok {
+			failed = true
+			continue
+		}
+		probe, probeErr := value.Probe(context.Background(), adapter.ProbeRequest{Executable: *executable})
+		if probeErr != nil {
+			probe.Compatibility = "probe_failed"
+			probe.Warnings = append(probe.Warnings, probeErr.Error())
+		}
+		items = append(items, doctorItem{Harness: descriptor.Name, Implemented: descriptor.RuntimeImplemented, Compatibility: probe.Compatibility, Installed: probe.Installed, Version: probe.Version, Authenticated: probe.Authenticated, Capabilities: probe.Capabilities, Warnings: probe.Warnings})
+		if !probe.Installed || probe.Compatibility == "incompatible" || probe.Compatibility == "probe_failed" || probe.Compatibility == "unavailable" || (probe.Authenticated != nil && !*probe.Authenticated) {
+			failed = true
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Harness < items[j].Harness })
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(result); err != nil {
+	if err := encoder.Encode(struct {
+		Harnesses []doctorItem `json:"harnesses"`
+	}{Harnesses: items}); err != nil {
 		return err
 	}
-	if !result.Installed {
-		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", "Claude Code is not installed", nil)
-	}
-	switch strings.ToLower(strings.TrimSpace(result.Compatibility)) {
-	case "incompatible", "probe_failed", "unavailable":
-		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", fmt.Sprintf("harness compatibility %q", result.Compatibility), nil)
+	if failed {
+		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", "one or more requested Harnesses are unavailable, unauthenticated, or failed probe", nil)
 	}
 	return nil
 }
