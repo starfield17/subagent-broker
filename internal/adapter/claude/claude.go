@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
+	"github.com/vnai/subagent-broker/internal/adapter/protocol"
 	"github.com/vnai/subagent-broker/internal/event"
 	"github.com/vnai/subagent-broker/internal/process"
 	"github.com/vnai/subagent-broker/internal/project"
@@ -374,14 +375,7 @@ func (a *Adapter) CollectFinalResult(ctx context.Context, id string) (report.Env
 		}
 		raw = json.RawMessage(text)
 	}
-	var result report.Envelope
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return report.Envelope{}, fmt.Errorf("decode Result Envelope: %w", err)
-	}
-	if err := report.ValidateEnvelope(result); err != nil {
-		return report.Envelope{}, err
-	}
-	return result, nil
+	return protocol.ParseEnvelope(raw)
 }
 
 func (a *Adapter) requireSession(id string) (*sessionState, error) {

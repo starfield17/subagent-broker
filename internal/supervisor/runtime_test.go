@@ -128,12 +128,12 @@ func TestRequestMessageBlocksUntilResolved(t *testing.T) {
 	if id == "" {
 		t.Fatal("message did not reach inbox")
 	}
-	if err := service.ResolveMessage(id, message.Resolution{Answer: "Use A"}); err != nil {
+	if err := service.ResolveMessage(id, message.NewAnswerResolution("Use A")); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case resolution := <-done:
-		if resolution.Answer != "Use A" {
+		if resolution.Answer == nil || resolution.Answer.Text != "Use A" {
 			t.Fatalf("unexpected answer: %+v", resolution)
 		}
 	case <-time.After(2 * time.Second):
@@ -164,7 +164,7 @@ func TestResolveBeforeWaiterRegistration(t *testing.T) {
 	_ = service.CommitMessageProjection(context.Background(), val, event.MessageQueued)
 
 	// Resolve the message before registering a waiter (simulating the race).
-	if err := service.ResolveMessage(val.MessageID, message.Resolution{Answer: "pre-register"}); err != nil {
+	if err := service.ResolveMessage(val.MessageID, message.NewAnswerResolution("pre-register")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -175,8 +175,8 @@ func TestResolveBeforeWaiterRegistration(t *testing.T) {
 	if checkErr != nil || !ok {
 		t.Fatalf("durable-state recheck failed: err=%v ok=%v", checkErr, ok)
 	}
-	if res.Answer != "pre-register" {
-		t.Fatalf("expected 'pre-register', got %q", res.Answer)
+	if res.Answer == nil || res.Answer.Text != "pre-register" {
+		t.Fatalf("expected 'pre-register', got %+v", res.Answer)
 	}
 	service.unregisterDecisionWaiter(val.MessageID, waiter)
 
@@ -224,12 +224,12 @@ func TestResolveAfterRegistration(t *testing.T) {
 	if id == "" {
 		t.Fatal("message did not reach inbox")
 	}
-	if err := service.ResolveMessage(id, message.Resolution{Answer: "after"}); err != nil {
+	if err := service.ResolveMessage(id, message.NewAnswerResolution("after")); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case resolution := <-done:
-		if resolution.Answer != "after" {
+		if resolution.Answer == nil || resolution.Answer.Text != "after" {
 			t.Fatalf("unexpected answer: %+v", resolution)
 		}
 	case err := <-errCh:

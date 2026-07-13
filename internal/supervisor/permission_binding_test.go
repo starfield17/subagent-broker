@@ -31,9 +31,7 @@ func TestPermissionBindingHarnessMismatch(t *testing.T) {
 		cancel: func() {}, taskID: "task-a", workerID: "worker-a", attempt: 1,
 	}
 	pending := service.router.PendingDecisions("task-a")
-	err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true},
-	})
+	err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(true, "", false))
 	if err == nil {
 		t.Fatal("expected harness mismatch")
 	}
@@ -58,9 +56,7 @@ func TestPermissionBindingSessionMismatch(t *testing.T) {
 	active.sessionID = "different-session"
 	service.active["task-a"] = active
 	pending := service.router.PendingDecisions("task-a")
-	err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true},
-	})
+	err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(true, "", false))
 	if err == nil {
 		t.Fatal("expected session mismatch")
 	}
@@ -85,9 +81,7 @@ func TestPermissionBindingAttemptMismatch(t *testing.T) {
 	if pending[0].AttemptNumber != 1 {
 		t.Fatalf("message attempt=%d", pending[0].AttemptNumber)
 	}
-	err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true},
-	})
+	err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(true, "", false))
 	if err == nil {
 		t.Fatal("expected attempt mismatch")
 	}
@@ -172,9 +166,7 @@ func TestPermissionLegacyAttemptZeroNotWildcard(t *testing.T) {
 		},
 		acceptingWork: true, fatalPersistence: make(chan error, 1),
 	}
-	err = service.ResolveMessage(msg.MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true},
-	})
+	err = service.ResolveMessage(msg.MessageID, message.NewDecisionResolution(true, "", false))
 	if err == nil {
 		t.Fatal("attempt 0 must not wildcard-match attempt 3")
 	}

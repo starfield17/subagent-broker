@@ -378,9 +378,7 @@ func TestRunWorkerSessionSecondTurnPermissionNoDeadlock(t *testing.T) {
 	if len(harness.SentMessages) != 1 {
 		t.Fatalf("expected SendMessage completed, sent=%v", harness.SentMessages)
 	}
-	if err := service.ResolveMessage(permID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true, Reason: "ok"},
-	}); err != nil {
+	if err := service.ResolveMessage(permID, message.NewDecisionResolution(true, "ok", false)); err != nil {
 		t.Fatal(err)
 	}
 	if len(harness.PermissionResponses) != 1 || !harness.PermissionResponses[0].Allowed {

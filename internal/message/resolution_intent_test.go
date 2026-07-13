@@ -21,7 +21,7 @@ func TestRecordResolutionIntentIdempotentAndConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, _ := json.Marshal(Resolution{Decision: DecisionPayload{Allowed: true, Reason: "ok"}})
+	res, _ := json.Marshal(NewDecisionResolution(true, "ok", false))
 	frozen, err := router.RecordResolutionIntent(msg.MessageID, res)
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestRecordResolutionIntentIdempotentAndConflict(t *testing.T) {
 		t.Fatal("intent must not increment attempts")
 	}
 	// Conflict.
-	deny, _ := json.Marshal(Resolution{Decision: DecisionPayload{Allowed: false}})
+	deny, _ := json.Marshal(NewDecisionResolution(false, "no", false))
 	if _, err := router.RecordResolutionIntent(msg.MessageID, deny); err == nil {
 		t.Fatal("expected conflict")
 	}

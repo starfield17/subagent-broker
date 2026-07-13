@@ -89,9 +89,32 @@ func RenderContract(task domain.Task, runID domain.RunID) (string, error) {
 	}
 	b.WriteString("\n## Scope expansion\n\nIf an out-of-scope edit is required, stop that edit and submit a scope expansion request with paths, reason, consequences, current modifications, dependencies, and a recommended decision.\n\n")
 	b.WriteString("## Prohibited operations\n\n- Do not use `git reset --hard`, `git clean`, `git stash`, branch switching, or broad restore/checkout operations.\n- Do not revert or clean changes owned by other tasks.\n- Do not run whole-repository formatters or generators.\n- Do not commit all workspace changes.\n- Do not delete unknown untracked files.\n- Do not create or invoke nested subagents or another orchestrator.\n\n")
-	b.WriteString("## Final report\n\nSubmit a structured Result Envelope covering status, summary, completed work, changed files, validation, remaining work, blockers, scope expansion, risks, and handoff notes.\n")
+	b.WriteString("## Final report\n\nSubmit the Result Envelope in this shape:\n\n~~~json\n" + resultEnvelopeExample + "\n~~~\n\n`scope_expansion` must be `null` when no expansion is requested; when present it must be an object with `paths`, `reason`, and `consequence`. Never emit an array for this field.\n")
 	return b.String(), nil
 }
+
+const resultEnvelopeExample = `{
+  "schema_version": "v1alpha1",
+  "task_id": "task-example",
+  "worker_id": "worker-example",
+  "status": "succeeded",
+  "summary": "Implemented the requested change.",
+  "work_completed": ["Implemented the requested change."],
+  "files_changed": ["internal/example/example.go"],
+  "no_files_changed_reason": "",
+  "validation": [{"command": "go test ./...", "passed": true, "details": "All tests passed."}],
+  "validation_not_run_reason": "",
+  "remaining_work": [],
+  "blocking_issues": [],
+  "stop_reason": "",
+  "failure_stage": "",
+  "error_summary": "",
+  "workspace_state": "",
+  "scope_expansion": null,
+  "scope_violations_self_reported": [],
+  "risks": [],
+  "handoff_notes": ["No additional handoff required."]
+}`
 
 func writeList(b *strings.Builder, title string, items []string) {
 	fmt.Fprintf(b, "## %s\n\n", title)

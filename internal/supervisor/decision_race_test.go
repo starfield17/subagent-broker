@@ -26,7 +26,7 @@ func TestResolveMessageTerminalNotAnswered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = service.ResolveMessage(val.MessageID, message.Resolution{Answer: "yes"})
+	err = service.ResolveMessage(val.MessageID, message.NewAnswerResolution("yes"))
 	var term *message.ErrMessageTerminalNotAnswered
 	if !errors.As(err, &term) {
 		t.Fatalf("expected ErrMessageTerminalNotAnswered, got %v", err)
@@ -40,14 +40,14 @@ func TestResolveMessageAnsweredIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res := message.Resolution{Answer: "yes"}
+	res := message.NewAnswerResolution("yes")
 	if err := service.ResolveMessage(val.MessageID, res); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.ResolveMessage(val.MessageID, res); err != nil {
 		t.Fatalf("identical Answered retry must succeed: %v", err)
 	}
-	if err := service.ResolveMessage(val.MessageID, message.Resolution{Answer: "no"}); err == nil {
+	if err := service.ResolveMessage(val.MessageID, message.NewAnswerResolution("no")); err == nil {
 		t.Fatal("conflicting answer must fail")
 	}
 }
@@ -59,7 +59,7 @@ func TestExpireFrozenResolutionReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resJSON, _ := json.Marshal(message.Resolution{Decision: message.DecisionPayload{Allowed: true}})
+	resJSON, _ := json.Marshal(message.NewDecisionResolution(true, "", false))
 	if _, _, err := service.router.FreezeResolution(val.MessageID, resJSON); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestRequestMessageResolverWinsBeforeOpLock(t *testing.T) {
 		for time.Now().Before(deadline) {
 			pending := service.router.PendingDecisions("task-a")
 			if len(pending) > 0 {
-				_ = service.ResolveMessage(pending[0].MessageID, message.Resolution{Answer: "from-resolver"})
+				_ = service.ResolveMessage(pending[0].MessageID, message.NewAnswerResolution("from-resolver"))
 				return
 			}
 			time.Sleep(2 * time.Millisecond)
@@ -117,7 +117,7 @@ func TestRequestMessageResolverWinsBeforeOpLock(t *testing.T) {
 	if service.router.HasPendingDecisions("task-a") {
 		// Ensure resolve completed.
 		for _, p := range service.router.PendingDecisions("task-a") {
-			_ = service.ResolveMessage(p.MessageID, message.Resolution{Answer: "from-resolver"})
+			_ = service.ResolveMessage(p.MessageID, message.NewAnswerResolution("from-resolver"))
 		}
 	}
 	if service.router.HasPendingDecisions("task-a") {
@@ -148,7 +148,7 @@ func TestRequestMessageDoesNotLeaveBlockedAfterAnswer(t *testing.T) {
 	if err := service.setTaskWaiting("task-a", message.Question); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.ResolveMessage(val.MessageID, message.Resolution{Answer: "yes"}); err != nil {
+	if err := service.ResolveMessage(val.MessageID, message.NewAnswerResolution("yes")); err != nil {
 		t.Fatal(err)
 	}
 	if service.router.HasPendingDecisions("task-a") {

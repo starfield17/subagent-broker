@@ -58,7 +58,7 @@ func scriptedHarness(t *testing.T) string {
 read input
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"session-script"}'
 printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
-printf '%s\n' '{"type":"result","subtype":"success","result":{"schema_version":"v1alpha1","task_id":"task-script","worker_id":"worker-script","status":"succeeded","summary":"script completed","work_completed":["scripted work"],"files_changed":[],"no_files_changed_reason":"script only","validation":[{"command":"script-check","passed":true}],"remaining_work":[],"blocking_issues":[],"risks":[],"handoff_notes":[]}}'
+printf '%s\n' '{"type":"result","subtype":"success","result":{"schema_version":"v1alpha1","task_id":"task-script","worker_id":"worker-script","status":"succeeded","summary":"script completed","work_completed":["scripted work"],"files_changed":[],"no_files_changed_reason":"script only","validation":[{"command":"script-check","passed":true}],"remaining_work":[],"blocking_issues":[],"scope_expansion":[],"risks":[],"handoff_notes":[]}}'
 `
 	if err := os.WriteFile(path, []byte(strings.TrimSpace(script)+"\n"), 0o700); err != nil {
 		t.Fatal(err)

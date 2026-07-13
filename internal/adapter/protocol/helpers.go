@@ -3,6 +3,7 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,10 @@ func ParseVersion(output []byte) string {
 
 func ParseEnvelope(raw []byte) (report.Envelope, error) {
 	trimmed, err := envelopeJSON(raw)
+	if err != nil {
+		return report.Envelope{}, err
+	}
+	trimmed, err = normalizeExternalEnvelopeJSON(trimmed)
 	if err != nil {
 		return report.Envelope{}, err
 	}
@@ -53,6 +58,56 @@ func ParseEnvelope(raw []byte) (report.Envelope, error) {
 		}
 	}
 	return report.Envelope{}, fmt.Errorf("decode Result Envelope: %w", canonicalErr)
+}
+
+// normalizeExternalEnvelopeJSON is the single compatibility boundary for
+// external harness Result Envelope data. The internal report.Envelope remains
+// strict and never needs to represent the historical array form.
+func normalizeExternalEnvelopeJSON(raw []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("decode Result Envelope object: %w", err)
+	}
+	if fields == nil {
+		return nil, fmt.Errorf("Result Envelope must be a JSON object")
+	}
+
+	scopeRaw, ok := fields["scope_expansion"]
+	if ok {
+		scopeRaw = bytes.TrimSpace(scopeRaw)
+		switch {
+		case bytes.Equal(scopeRaw, []byte("null")):
+			delete(fields, "scope_expansion")
+		case len(scopeRaw) > 0 && scopeRaw[0] == '[':
+			var values []json.RawMessage
+			if err := json.Unmarshal(scopeRaw, &values); err != nil {
+				return nil, fmt.Errorf("invalid scope_expansion array: %w", err)
+			}
+			if len(values) == 0 {
+				delete(fields, "scope_expansion")
+			} else {
+				return nil, fmt.Errorf("scope_expansion must not be a non-empty array")
+			}
+		case len(scopeRaw) > 0 && scopeRaw[0] == '{':
+			var value map[string]json.RawMessage
+			if err := json.Unmarshal(scopeRaw, &value); err != nil {
+				return nil, fmt.Errorf("invalid scope_expansion object: %w", err)
+			}
+			if len(value) == 0 {
+				delete(fields, "scope_expansion")
+			} else {
+				fields["scope_expansion"] = append(json.RawMessage(nil), scopeRaw...)
+			}
+		default:
+			return nil, fmt.Errorf("scope_expansion must be null, an object, or an empty array")
+		}
+	}
+
+	normalized, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("normalize Result Envelope: %w", err)
+	}
+	return normalized, nil
 }
 
 func envelopeJSON(raw []byte) ([]byte, error) {

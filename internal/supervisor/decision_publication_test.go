@@ -32,7 +32,7 @@ func TestDecisionPublicationResolverBeforeOpLock(t *testing.T) {
 		default:
 		}
 		// Resolve while RequestMessage is paused before op lock.
-		_ = service.ResolveMessage(id, message.Resolution{Answer: "from-resolver"})
+		_ = service.ResolveMessage(id, message.NewAnswerResolution("from-resolver"))
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -44,7 +44,7 @@ func TestDecisionPublicationResolverBeforeOpLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequestMessage: %v id=%s", err, id)
 	}
-	if res.Answer != "from-resolver" {
+	if res.Answer == nil || res.Answer.Text != "from-resolver" {
 		t.Fatalf("expected durable answer, got %+v", res)
 	}
 	if mid == "" {
@@ -89,7 +89,7 @@ func TestDecisionPublicationNormalEventOrder(t *testing.T) {
 			pending := service.router.PendingDecisions("task-a")
 			if len(pending) > 0 {
 				mid = pending[0].MessageID
-				_ = service.ResolveMessage(mid, message.Resolution{Answer: "yes"})
+				_ = service.ResolveMessage(mid, message.NewAnswerResolution("yes"))
 				return
 			}
 			time.Sleep(2 * time.Millisecond)
@@ -104,7 +104,7 @@ func TestDecisionPublicationNormalEventOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequestMessage: %v", err)
 	}
-	if res.Answer != "yes" {
+	if res.Answer == nil || res.Answer.Text != "yes" {
 		t.Fatalf("res=%+v", res)
 	}
 	if mid == "" {
@@ -131,9 +131,7 @@ func TestNativePermissionSetupResolverWinsBeforeOpLock(t *testing.T) {
 
 	service.SetAfterDecisionEnqueueHook(func(id string) {
 		// Resolve immediately after enqueue, before bridge op lock / waiting setup.
-		_ = service.ResolveMessage(id, message.Resolution{
-			Decision: message.DecisionPayload{Allowed: true, Reason: "ok"},
-		})
+		_ = service.ResolveMessage(id, message.NewDecisionResolution(true, "ok", false))
 	})
 
 	service.bridgeNativePermission(runtime, harness, adapter.NativeEvent{
@@ -203,9 +201,7 @@ func TestNativePermissionSetupHoldsOpLockBeforeResolve(t *testing.T) {
 			resolveDone <- context.DeadlineExceeded
 			return
 		}
-		resolveDone <- service.ResolveMessage(mid, message.Resolution{
-			Decision: message.DecisionPayload{Allowed: true, Reason: "ok"},
-		})
+		resolveDone <- service.ResolveMessage(mid, message.NewDecisionResolution(true, "ok", false))
 	}()
 
 	// Allow setup to finish waiting-state installation.

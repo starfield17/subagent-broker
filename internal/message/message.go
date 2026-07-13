@@ -234,9 +234,17 @@ type DecisionPayload struct {
 	AllowPublicInterfaceChange bool   `json:"allow_public_interface_change,omitempty"`
 }
 
+type ResolutionKind string
+
+const (
+	ResolutionKindAnswer   ResolutionKind = "answer"
+	ResolutionKindDecision ResolutionKind = "decision"
+)
+
 type Resolution struct {
-	Answer   string          `json:"answer,omitempty"`
-	Decision DecisionPayload `json:"decision,omitempty"`
+	Kind     ResolutionKind   `json:"kind"`
+	Answer   *AnswerPayload   `json:"answer,omitempty"`
+	Decision *DecisionPayload `json:"decision,omitempty"`
 }
 
 type QuestionEnvelope struct {

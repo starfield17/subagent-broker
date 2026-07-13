@@ -44,9 +44,10 @@ type ScopeInput struct {
 }
 
 type ToolOutput struct {
-	MessageID string                  `json:"message_id"`
-	Answer    string                  `json:"answer,omitempty"`
-	Decision  message.DecisionPayload `json:"decision,omitempty"`
+	MessageID string                   `json:"message_id"`
+	Kind      message.ResolutionKind   `json:"kind"`
+	Answer    *message.AnswerPayload   `json:"answer,omitempty"`
+	Decision  *message.DecisionPayload `json:"decision,omitempty"`
 }
 
 func (w WorkerServer) Run(ctx context.Context) error {
@@ -93,13 +94,17 @@ func (w WorkerServer) call(ctx context.Context, messageType message.Type, catego
 		return ToolOutput{}, err
 	}
 	var wrapper struct {
-		MessageID  string             `json:"message_id"`
-		Resolution message.Resolution `json:"resolution"`
+		MessageID  string          `json:"message_id"`
+		Resolution json.RawMessage `json:"resolution"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err != nil {
 		return ToolOutput{}, err
 	}
-	return ToolOutput{MessageID: wrapper.MessageID, Answer: wrapper.Resolution.Answer, Decision: wrapper.Resolution.Decision}, nil
+	resolution, err := message.DecodeResolutionForType(messageType, wrapper.Resolution)
+	if err != nil {
+		return ToolOutput{}, err
+	}
+	return ToolOutput{MessageID: wrapper.MessageID, Kind: resolution.Kind, Answer: resolution.Answer, Decision: resolution.Decision}, nil
 }
 
 type rpcRequest struct {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,5 +47,46 @@ func TestSucceededIsNotAllowedToHideRemainingWork(t *testing.T) {
 	e.RemainingWork = []string{"integration"}
 	if err := ValidateEnvelope(e); err == nil {
 		t.Fatal("succeeded with remaining work must be rejected")
+	}
+}
+
+func TestScopeExpansionRequiresCompleteMeaningfulObject(t *testing.T) {
+	cases := []Envelope{
+		func() Envelope {
+			e := validSuccess()
+			e.ScopeExpansion = &ScopeExpansion{Paths: []string{"x"}, Consequence: "what"}
+			return e
+		}(),
+		func() Envelope {
+			e := validSuccess()
+			e.ScopeExpansion = &ScopeExpansion{Paths: []string{"x"}, Reason: "why"}
+			return e
+		}(),
+		func() Envelope {
+			e := validSuccess()
+			e.ScopeExpansion = &ScopeExpansion{Paths: []string{"", "x"}, Reason: "why", Consequence: "what"}
+			return e
+		}(),
+	}
+	for _, envelope := range cases {
+		if err := ValidateEnvelope(envelope); err == nil {
+			t.Fatalf("invalid scope expansion accepted: %+v", envelope.ScopeExpansion)
+		}
+	}
+
+	valid := validSuccess()
+	valid.ScopeExpansion = &ScopeExpansion{Paths: []string{"x"}, Reason: "why", Consequence: "what"}
+	if err := ValidateEnvelope(valid); err != nil {
+		t.Fatalf("valid scope expansion rejected: %v", err)
+	}
+}
+
+func TestCanonicalEnvelopeNeverEmitsEmptyScopeArray(t *testing.T) {
+	data, err := CanonicalEnvelopeJSON(validSuccess())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"scope_expansion":[]`) {
+		t.Fatalf("unexpected canonical envelope: %s", data)
 	}
 }

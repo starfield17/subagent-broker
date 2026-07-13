@@ -25,7 +25,7 @@ func TestFreezeResolutionIdenticalRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res := message.Resolution{Decision: message.DecisionPayload{Allowed: true}}
+	res := message.NewDecisionResolution(true, "", false)
 	resJSON, _ := json.Marshal(res)
 
 	// First freeze.
@@ -60,8 +60,8 @@ func TestFreezeResolutionConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	allow := message.Resolution{Answer: "allow"}
-	deny := message.Resolution{Answer: "deny"}
+	allow := message.NewAnswerResolution("allow")
+	deny := message.NewAnswerResolution("deny")
 	allowJSON, _ := json.Marshal(allow)
 	denyJSON, _ := json.Marshal(deny)
 
@@ -99,14 +99,14 @@ func TestResolutionConflictRejectsLosingSideEffect(t *testing.T) {
 	}
 
 	// Freeze a deny decision.
-	denyJSON, _ := json.Marshal(message.Resolution{Decision: message.DecisionPayload{Allowed: false, Reason: "not needed"}})
+	denyJSON, _ := json.Marshal(message.NewDecisionResolution(false, "not needed", false))
 	_, result, err := service.router.FreezeResolution(val.MessageID, denyJSON)
 	if err != nil || result != message.ResolutionFrozen {
 		t.Fatalf("deny freeze should succeed: err=%v result=%d", err, result)
 	}
 
 	// Allow after deny freeze must conflict.
-	allowJSON, _ := json.Marshal(message.Resolution{Decision: message.DecisionPayload{Allowed: true}})
+	allowJSON, _ := json.Marshal(message.NewDecisionResolution(true, "", false))
 	_, result, err = service.router.FreezeResolution(val.MessageID, allowJSON)
 	if err == nil {
 		t.Fatal("allow after deny freeze should conflict")
@@ -133,8 +133,8 @@ func TestScopeExpansionResolutionIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	allowJSON, _ := json.Marshal(message.Resolution{Decision: message.DecisionPayload{Allowed: true}})
-	denyJSON, _ := json.Marshal(message.Resolution{Decision: message.DecisionPayload{Allowed: false, Reason: "no"}})
+	allowJSON, _ := json.Marshal(message.NewDecisionResolution(true, "", false))
+	denyJSON, _ := json.Marshal(message.NewDecisionResolution(false, "no", false))
 
 	// First freeze allow.
 	_, result, err := service.router.FreezeResolution(val.MessageID, allowJSON)
@@ -211,8 +211,8 @@ func TestNativePermissionAnsweredIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	allowJSON, _ := json.Marshal(message.Resolution{Decision: message.DecisionPayload{Allowed: true}})
-	denyJSON, _ := json.Marshal(message.Resolution{Decision: message.DecisionPayload{Allowed: false, Reason: "no"}})
+	allowJSON, _ := json.Marshal(message.NewDecisionResolution(true, "", false))
+	denyJSON, _ := json.Marshal(message.NewDecisionResolution(false, "no", false))
 
 	// Freeze allow, then transition to Answered (simulating successful delivery).
 	frozen, _, err := service.router.FreezeResolution(val.MessageID, allowJSON)

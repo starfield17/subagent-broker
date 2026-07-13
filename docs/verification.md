@@ -288,3 +288,37 @@ go build ./cmd/subagent-broker
 * No live authenticated smoke claim unless actually executed.
 
 **No live authenticated harness smoke was performed.**
+
+## Result envelope and resolution protocol invariants
+
+- External Harness output is normalized at the Adapter protocol boundary before entering the canonical Result Envelope model.
+- Question answers and permission/scope decisions are disjoint resolution types.
+- Absence of a decision must never be interpreted as denial.
+
+Use these message-resolution commands:
+
+```bash
+subagent-broker send ... --message <question-id> --answer "..."
+subagent-broker send ... --message <permission-id> --approve
+subagent-broker send ... --message <permission-id> --deny --reason "..."
+subagent-broker send ... --message <scope-id> --approve
+subagent-broker send ... --message <scope-id> --deny --reason "..."
+```
+
+The Adapter boundary accepts omitted, `null`, empty-array, and empty-object no-expansion forms from external Harness output and canonicalizes them to a nil internal `ScopeExpansion`. Non-empty arrays, scalars, malformed JSON, and incomplete expansion objects are rejected. No live authenticated Harness smoke is claimed by this protocol update.
+
+## Patch B verification — 2026-07-13
+
+Executed:
+
+```bash
+gofmt -w .
+test -z "$(gofmt -l .)"
+go test ./...
+go test -race ./...
+go test -race ./internal/adapter/... ./internal/message/... ./internal/supervisor/... -count=10
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Formatting, the full test suite, the full race suite, `go vet`, and the build passed. The repeated race matrix exited after the pre-existing `internal/adapter/codex.TestCodexUnexpectedEOF` fixture timed out; the Patch B changed-surface repetition (`internal/adapter/protocol`, `internal/message`, and `internal/supervisor`, `-count=10`) passed. No live authenticated Harness smoke was performed.

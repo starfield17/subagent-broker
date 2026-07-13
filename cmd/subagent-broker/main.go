@@ -983,19 +983,7 @@ func inboxCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	runValue, err := readRun(runDir)
-	if err != nil {
-		return err
-	}
-	paths, err := storage.NewLayout(mustHome(*brokerHome))
-	if err != nil {
-		return err
-	}
-	runPaths, err := paths.RunPaths(string(runValue.ProjectID), string(runValue.RunID))
-	if err != nil {
-		return err
-	}
-	index, err := message.Replay(runPaths.Messages)
+	index, err := loadRunMessages(runDir)
 	if err != nil {
 		return err
 	}
@@ -1057,6 +1045,14 @@ func sendCommand(args []string) error {
 	if *messageID == "" {
 		return fmt.Errorf("send requires either --task with --text or --message with a resolution")
 	}
+	index, err := loadRunMessages(runDir)
+	if err != nil {
+		return err
+	}
+	value, ok := index[*messageID]
+	if !ok {
+		return fmt.Errorf("message %q was not found", *messageID)
+	}
 	actions := 0
 	if *answer != "" {
 		actions++
@@ -1070,12 +1066,23 @@ func sendCommand(args []string) error {
 	if actions != 1 {
 		return fmt.Errorf("message resolution requires exactly one of --answer, --approve, or --deny")
 	}
-	resolution := message.Resolution{Answer: *answer}
-	if *approve || *deny {
-		resolution.Decision = message.DecisionPayload{Allowed: *approve, Reason: *reason, AllowPublicInterfaceChange: *allowInterface}
+	var resolution message.Resolution
+	switch value.Type {
+	case message.Question:
+		if *approve || *deny {
+			return fmt.Errorf("question requires --answer; --approve/--deny are invalid")
+		}
+		resolution = message.NewAnswerResolution(*answer)
+	case message.PermissionRequest, message.ScopeExpansionRequest:
+		if *answer != "" {
+			return fmt.Errorf("%s requires --approve or --deny; --answer is invalid", value.Type)
+		}
 		if *deny && strings.TrimSpace(*reason) == "" {
 			return fmt.Errorf("--deny requires --reason")
 		}
+		resolution = message.NewDecisionResolution(*approve, *reason, *allowInterface)
+	default:
+		return fmt.Errorf("message type %s is not resolvable", value.Type)
 	}
 	response, err := cliread.CallIPC(runDir, "resolve_message", map[string]any{"message_id": *messageID, "resolution": resolution})
 	if err != nil {
@@ -1086,6 +1093,10 @@ func sendCommand(args []string) error {
 	}
 	fmt.Println("message resolved")
 	return nil
+}
+
+func loadRunMessages(runDir string) (map[string]message.Message, error) {
+	return message.Replay(filepath.Join(runDir, "messages.jsonl"))
 }
 
 func cancelCommand(args []string) error {

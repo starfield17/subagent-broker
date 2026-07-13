@@ -221,11 +221,11 @@ func (r *Router) FreezeResolution(messageID string, resolution json.RawMessage) 
 			return Message{}, ResolutionConflict,
 				fmt.Errorf("message %q is already terminal (%s) with no resolution", messageID, current.Status)
 		}
-		normalized, err := normalizeResolutionJSON(resolution)
+		normalized, err := normalizeResolutionJSON(current.Type, resolution)
 		if err != nil {
 			return Message{}, ResolutionConflict, err
 		}
-		existing, err := normalizeResolutionJSON(current.Resolution)
+		existing, err := normalizeResolutionJSON(current.Type, current.Resolution)
 		if err != nil {
 			return Message{}, ResolutionConflict, err
 		}
@@ -241,12 +241,12 @@ func (r *Router) FreezeResolution(messageID string, resolution json.RawMessage) 
 			fmt.Errorf("freeze resolution requires queued status (status=%s)", current.Status)
 	}
 
-	normalized, err := normalizeResolutionJSON(resolution)
+	normalized, err := normalizeResolutionJSON(current.Type, resolution)
 	if err != nil {
 		return Message{}, ResolutionConflict, err
 	}
 	if len(current.Resolution) > 0 {
-		existing, err := normalizeResolutionJSON(current.Resolution)
+		existing, err := normalizeResolutionJSON(current.Type, current.Resolution)
 		if err != nil {
 			return Message{}, ResolutionConflict, err
 		}
@@ -465,8 +465,8 @@ func (r *Router) GetAnsweredResolution(messageID string) (Resolution, bool, erro
 	if len(value.Resolution) == 0 {
 		return Resolution{}, false, fmt.Errorf("message %q is answered but has no resolution", messageID)
 	}
-	var res Resolution
-	if err := json.Unmarshal(value.Resolution, &res); err != nil {
+	res, err := DecodeResolutionForType(value.Type, value.Resolution)
+	if err != nil {
 		return Resolution{}, false, err
 	}
 	return res, true, nil
@@ -608,32 +608,6 @@ func decisionPriority(t Type) int {
 	default:
 		return 3
 	}
-}
-
-// ResolutionsEqual reports whether two resolution payloads are semantically equal.
-func ResolutionsEqual(a, b json.RawMessage) bool {
-	na, errA := normalizeResolutionJSON(a)
-	nb, errB := normalizeResolutionJSON(b)
-	if errA != nil || errB != nil {
-		return false
-	}
-	return bytesEqualJSON(na, nb)
-}
-
-func normalizeResolutionJSON(raw json.RawMessage) (json.RawMessage, error) {
-	if len(raw) == 0 {
-		return nil, fmt.Errorf("empty resolution")
-	}
-	var value Resolution
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return nil, fmt.Errorf("invalid resolution: %w", err)
-	}
-	// Canonical encode so formatting differences do not create false conflicts.
-	out, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func bytesEqualJSON(a, b json.RawMessage) bool {

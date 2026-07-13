@@ -265,7 +265,7 @@ func TestAuthenticatedSendAnswerResolvesBlockedWorker(t *testing.T) {
 		if got.err != nil {
 			t.Fatalf("RequestMessage: %v", got.err)
 		}
-		if got.res.Answer != "approved" {
+		if got.res.Answer == nil || got.res.Answer.Text != "approved" {
 			t.Fatalf("answer=%+v", got.res)
 		}
 	case <-time.After(3 * time.Second):
@@ -280,6 +280,10 @@ func TestAuthenticatedSendAnswerResolvesBlockedWorker(t *testing.T) {
 			if item.Status != message.Answered {
 				t.Fatalf("status=%s", item.Status)
 			}
+			resolved, err := message.DecodeResolutionForType(item.Type, item.Resolution)
+			if err != nil || resolved.Kind != message.ResolutionKindAnswer || resolved.Answer == nil || resolved.Answer.Text != "approved" {
+				t.Fatalf("resolution=%+v err=%v", resolved, err)
+			}
 		}
 	}
 	if !found {
@@ -290,6 +294,68 @@ func TestAuthenticatedSendAnswerResolvesBlockedWorker(t *testing.T) {
 			t.Fatalf("task left blocked: %+v", ts)
 		}
 	}
+}
+
+func TestSendRejectsResolutionFlagForActualMessageTypeBeforeIPC(t *testing.T) {
+	t.Run("permission with answer", func(t *testing.T) {
+		env := startLiveControlSupervisor(t, []string{"task-a"}, adapter.Capabilities{
+			StructuredStream: true, StructuredFinalOutput: true, BidirectionalStream: true,
+		})
+		waitTaskRunning(t, env.Service, "task-a")
+		binary := buildCLIBinary(t)
+		done := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _, err := env.Service.RequestMessage(ctx, "task-a", "worker-a", message.PermissionRequest, message.Permission,
+				message.PermissionRequestPayload{ToolName: "Bash", Input: json.RawMessage(`{"command":"ls"}`)})
+			done <- err
+		}()
+		messageID := waitPendingMessage(t, env.Service)
+		_, stderr, code := runCLI(t, binary,
+			"send", "--project", env.ProjectRoot, "--broker-home", env.Home, "--run", env.RunID,
+			"--message", messageID, "--answer", "invalid",
+		)
+		if code == 0 || !strings.Contains(stderr, "permission_request requires --approve or --deny; --answer is invalid") {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		if err := env.Service.ResolveMessage(messageID, message.NewDecisionResolution(true, "ok", false)); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("RequestMessage: %v", err)
+		}
+	})
+
+	t.Run("question with approval", func(t *testing.T) {
+		env := startLiveControlSupervisor(t, []string{"task-a"}, adapter.Capabilities{
+			StructuredStream: true, StructuredFinalOutput: true, BidirectionalStream: true,
+		})
+		waitTaskRunning(t, env.Service, "task-a")
+		binary := buildCLIBinary(t)
+		done := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _, err := env.Service.RequestMessage(ctx, "task-a", "worker-a", message.Question, message.Decision,
+				message.QuestionEnvelope{SchemaVersion: supervisor.SchemaVersion, Question: "Q", Reason: "R", CurrentScope: []string{"output.txt"}, WorkspaceState: "unchanged"})
+			done <- err
+		}()
+		messageID := waitPendingMessage(t, env.Service)
+		_, stderr, code := runCLI(t, binary,
+			"send", "--project", env.ProjectRoot, "--broker-home", env.Home, "--run", env.RunID,
+			"--message", messageID, "--approve",
+		)
+		if code == 0 || !strings.Contains(stderr, "question requires --answer; --approve/--deny are invalid") {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		if err := env.Service.ResolveMessage(messageID, message.NewAnswerResolution("correct")); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatalf("RequestMessage: %v", err)
+		}
+	})
 }
 
 func TestAuthenticatedSendApproveAndDeny(t *testing.T) {
@@ -323,7 +389,7 @@ func TestAuthenticatedSendApproveAndDeny(t *testing.T) {
 	}
 	select {
 	case res := <-done:
-		if !res.Decision.Allowed {
+		if res.Decision == nil || !res.Decision.Allowed {
 			t.Fatalf("approve resolution=%+v", res)
 		}
 	case <-time.After(3 * time.Second):
@@ -351,7 +417,7 @@ func TestAuthenticatedSendApproveAndDeny(t *testing.T) {
 	}
 	select {
 	case res := <-done2:
-		if res.Decision.Allowed {
+		if res.Decision != nil && res.Decision.Allowed {
 			t.Fatalf("deny must not allow: %+v", res)
 		}
 	case <-time.After(3 * time.Second):
@@ -429,8 +495,8 @@ func TestAuthenticatedSendScopeExpansionApprove(t *testing.T) {
 		if got.err != nil {
 			t.Fatalf("RequestMessage: %v", got.err)
 		}
-		if !got.res.Decision.Allowed {
-			t.Fatalf("Allowed=%v resolution=%+v", got.res.Decision.Allowed, got.res)
+		if got.res.Decision == nil || !got.res.Decision.Allowed {
+			t.Fatalf("Allowed=%v resolution=%+v", got.res.Decision != nil && got.res.Decision.Allowed, got.res)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("RequestMessage did not resume after CLI --approve (possible deadlock)")

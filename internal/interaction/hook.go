@@ -49,16 +49,21 @@ func RunPermissionHookWithIdentity(ctx context.Context, id WorkerProcessIdentity
 	}
 	data, _ := json.Marshal(response.Result)
 	var wrapper struct {
-		Resolution message.Resolution `json:"resolution"`
+		Resolution json.RawMessage `json:"resolution"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err != nil {
 		return err
 	}
-	hookOutput := map[string]any{"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": wrapper.Resolution.Decision.Reason}
-	if wrapper.Resolution.Decision.Allowed {
+	resolution, err := message.DecodeResolutionForType(message.PermissionRequest, wrapper.Resolution)
+	if err != nil {
+		return err
+	}
+	decision := resolution.Decision
+	hookOutput := map[string]any{"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": decision.Reason}
+	if decision.Allowed {
 		var original any
 		_ = json.Unmarshal(hook.ToolInput, &original)
-		hookOutput = map[string]any{"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": wrapper.Resolution.Decision.Reason, "updatedInput": original}
+		hookOutput = map[string]any{"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": decision.Reason, "updatedInput": original}
 	}
 	return json.NewEncoder(output).Encode(map[string]any{"hookSpecificOutput": hookOutput})
 }

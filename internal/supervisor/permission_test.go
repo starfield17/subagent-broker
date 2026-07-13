@@ -128,9 +128,7 @@ func TestNativePermissionAllowReachesAdapter(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("pending=%d", len(pending))
 	}
-	if err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true, Reason: "ok"},
-	}); err != nil {
+	if err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(true, "ok", false)); err != nil {
 		t.Fatal(err)
 	}
 	if len(harness.PermissionResponses) != 1 {
@@ -156,9 +154,7 @@ func TestNativePermissionDenyReachesAdapter(t *testing.T) {
 	service.bridgeNativePermission(runtime, harness, adapter.NativeEvent{Kind: event.PermissionRequested, Payload: payload}, "worker-a")
 
 	pending := service.router.PendingDecisions("task-a")
-	if err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: false, Reason: "no"},
-	}); err != nil {
+	if err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(false, "no", false)); err != nil {
 		t.Fatal(err)
 	}
 	if len(harness.PermissionResponses) != 1 || harness.PermissionResponses[0].Allowed {
@@ -183,9 +179,7 @@ func TestNativePermissionAdapterFailureRemainsPending(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatal("expected pending permission")
 	}
-	err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true, Reason: "ok"},
-	})
+	err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(true, "ok", false))
 	if err == nil {
 		t.Fatal("expected delivery error")
 	}
@@ -223,7 +217,7 @@ func TestNativePermissionIdenticalRetrySucceeds(t *testing.T) {
 	payload, _ := json.Marshal(map[string]any{"id": "retry-1", "tool_name": "Bash"})
 	service.bridgeNativePermission(runtime, harness, adapter.NativeEvent{Kind: event.PermissionRequested, Payload: payload}, "worker-a")
 	pending := service.router.PendingDecisions("task-a")
-	res := message.Resolution{Decision: message.DecisionPayload{Allowed: true, Reason: "ok"}}
+	res := message.NewDecisionResolution(true, "ok", false)
 	if err := service.ResolveMessage(pending[0].MessageID, res); err == nil {
 		t.Fatal("expected first failure")
 	}
@@ -256,15 +250,11 @@ func TestNativePermissionConflictingRetryRejected(t *testing.T) {
 	payload, _ := json.Marshal(map[string]any{"id": "conflict-1", "tool_name": "Bash"})
 	service.bridgeNativePermission(runtime, harness, adapter.NativeEvent{Kind: event.PermissionRequested, Payload: payload}, "worker-a")
 	pending := service.router.PendingDecisions("task-a")
-	if err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true, Reason: "ok"},
-	}); err == nil {
+	if err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(true, "ok", false)); err == nil {
 		t.Fatal("expected first failure")
 	}
 	calls := len(harness.PermissionResponses)
-	err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: false, Reason: "no"},
-	})
+	err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(false, "no", false))
 	if err == nil {
 		t.Fatal("expected conflict error")
 	}
@@ -277,7 +267,7 @@ func TestNativePermissionConflictingRetryRejected(t *testing.T) {
 	}
 	var frozen message.Resolution
 	_ = json.Unmarshal(got.Resolution, &frozen)
-	if !frozen.Decision.Allowed {
+	if frozen.Decision == nil || !frozen.Decision.Allowed {
 		t.Fatal("stored allow must remain")
 	}
 }

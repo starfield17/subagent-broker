@@ -57,7 +57,7 @@ func TestResolveOneQuestionKeepsBlockedWhenAnotherPending(t *testing.T) {
 	service.syncMessageProjection(m1)
 	service.syncMessageProjection(m2)
 
-	if err := service.ResolveMessage(m1.MessageID, message.Resolution{Answer: "A1"}); err != nil {
+	if err := service.ResolveMessage(m1.MessageID, message.NewAnswerResolution("A1")); err != nil {
 		t.Fatal(err)
 	}
 	if !service.router.HasPendingDecisions("task-a") {
@@ -75,7 +75,7 @@ func TestResolveOneQuestionKeepsBlockedWhenAnotherPending(t *testing.T) {
 		t.Fatalf("archive missing: %v", err)
 	}
 	// Resolve last → clear waiting.
-	if err := service.ResolveMessage(m2.MessageID, message.Resolution{Answer: "A2"}); err != nil {
+	if err := service.ResolveMessage(m2.MessageID, message.NewAnswerResolution("A2")); err != nil {
 		t.Fatal(err)
 	}
 	if service.router.HasPendingDecisions("task-a") {

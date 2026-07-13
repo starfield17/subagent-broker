@@ -210,14 +210,28 @@ func (s *Service) handleRequest(ctx context.Context, request Request, plane Call
 		response.Result = result
 	case "resolve_message":
 		var params struct {
-			MessageID  string             `json:"message_id"`
-			Resolution message.Resolution `json:"resolution"`
+			MessageID  string          `json:"message_id"`
+			Resolution json.RawMessage `json:"resolution"`
 		}
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			response.Error = err.Error()
 			return response
 		}
-		if err := s.ResolveMessage(params.MessageID, params.Resolution); err != nil {
+		if s.router == nil {
+			response.Error = "message router is not initialized"
+			return response
+		}
+		value, found := s.router.Get(params.MessageID)
+		if !found {
+			response.Error = fmt.Sprintf("message %q was not found", params.MessageID)
+			return response
+		}
+		resolution, err := message.DecodeResolutionForType(value.Type, params.Resolution)
+		if err != nil {
+			response.Error = err.Error()
+			return response
+		}
+		if err := s.ResolveMessage(params.MessageID, resolution); err != nil {
 			response.Error = err.Error()
 			return response
 		}

@@ -271,6 +271,13 @@ func (s *Service) findPermissionByIdentity(taskID, harness, sessionID, nativeID,
 // Per-message delivery serialization ensures concurrent identical/conflicting
 // resolutions are linearizable without holding Router locks during adapter I/O.
 func (s *Service) resolveNativePermission(ctx context.Context, value message.Message, resolution message.Resolution) error {
+	if err := message.ValidateResolutionForType(value.Type, resolution); err != nil {
+		return err
+	}
+	resJSON, err := message.CanonicalResolutionJSON(value.Type, resolution)
+	if err != nil {
+		return err
+	}
 	lock := s.deliveryLock(value.MessageID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -282,11 +289,7 @@ func (s *Service) resolveNativePermission(ctx context.Context, value message.Mes
 	if message.IsTerminal(value.Status) {
 		// Only Answered + identical resolution is idempotent success.
 		// Expired/Failed never report resolution success even if resolution matches.
-		resJSON, marshalErr := json.Marshal(resolution)
-		if marshalErr != nil {
-			return marshalErr
-		}
-		if value.Status == message.Answered && message.ResolutionsEqual(value.Resolution, resJSON) {
+		if value.Status == message.Answered && message.ResolutionsEqualForType(value.Type, value.Resolution, resJSON) {
 			return nil
 		}
 		if value.Status == message.Answered {
@@ -304,10 +307,6 @@ func (s *Service) resolveNativePermission(ctx context.Context, value message.Mes
 	}
 
 	// 1) Freeze decision intent before physical delivery.
-	resJSON, err := json.Marshal(resolution)
-	if err != nil {
-		return err
-	}
 	frozen, err := s.router.RecordResolutionIntent(value.MessageID, resJSON)
 	if err != nil {
 		return err
@@ -343,13 +342,14 @@ func (s *Service) resolveNativePermission(ctx context.Context, value message.Mes
 	active := s.active[value.TaskID]
 	s.mu.Unlock()
 
+	decisionPayload := *resolution.Decision
 	decision := adapter.PermissionDecision{
 		RequestID: payload.NativePermissionID,
-		Allowed:   resolution.Decision.Allowed,
-		Reason:    resolution.Decision.Reason,
+		Allowed:   decisionPayload.Allowed,
+		Reason:    decisionPayload.Reason,
 	}
 	if len(payload.NativeOptions) > 0 {
-		optionID, optErr := message.SelectPermissionOptionID(payload.NativeOptions, resolution.Decision.Allowed)
+		optionID, optErr := message.SelectPermissionOptionID(payload.NativeOptions, decisionPayload.Allowed)
 		if optErr != nil {
 			updated, tErr := s.router.RecordDeliveryAttempt(value.MessageID, "", optErr)
 			if tErr == nil {

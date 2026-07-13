@@ -40,9 +40,7 @@ func TestPhase4NativePermissionIntegration(t *testing.T) {
 	if len(inbox) != 1 || inbox[0].Type != message.PermissionRequest {
 		t.Fatalf("inbox=%+v", inbox)
 	}
-	if err := service.ResolveMessage(inbox[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true, Reason: "approved"},
-	}); err != nil {
+	if err := service.ResolveMessage(inbox[0].MessageID, message.NewDecisionResolution(true, "approved", false)); err != nil {
 		t.Fatal(err)
 	}
 	if len(harness.PermissionResponses) != 1 || !harness.PermissionResponses[0].Allowed {
@@ -211,9 +209,7 @@ func TestPhase4PermissionDeliveryFailureHonest(t *testing.T) {
 		Kind: event.PermissionRequested, Payload: payload,
 	}, "worker-a")
 	pending := service.router.PendingDecisions("task-a")
-	err := service.ResolveMessage(pending[0].MessageID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: true},
-	})
+	err := service.ResolveMessage(pending[0].MessageID, message.NewDecisionResolution(true, "", false))
 	if err == nil {
 		t.Fatal("expected delivery failure")
 	}

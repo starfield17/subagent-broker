@@ -212,14 +212,17 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 		}
 	}
 
-	resJSON, err := json.Marshal(resolution)
+	if err := message.ValidateResolutionForType(value.Type, resolution); err != nil {
+		return err
+	}
+	resJSON, err := message.CanonicalResolutionJSON(value.Type, resolution)
 	if err != nil {
 		return err
 	}
 
 	// Terminal semantics: only Answered + identical resolution is idempotent success.
 	if message.IsTerminal(value.Status) {
-		if value.Status == message.Answered && message.ResolutionsEqual(value.Resolution, resJSON) {
+		if value.Status == message.Answered && message.ResolutionsEqualForType(value.Type, value.Resolution, resJSON) {
 			return nil
 		}
 		if value.Status == message.Answered {
@@ -227,10 +230,6 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 		}
 		return &message.ErrMessageTerminalNotAnswered{MessageID: id, Status: value.Status}
 	}
-	if value.Type == message.Question && strings.TrimSpace(resolution.Answer) == "" {
-		return fmt.Errorf("question answer is required")
-	}
-
 	// Native permission: freeze intent, bind exactly, deliver with retryable failures.
 	// Claude hooks (no NativePermissionID) use the Answered + waiter path below.
 	if isNativePermission(value) {
@@ -256,7 +255,7 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 	// 2) For scope expansion: apply expansion only after freeze confirms allow.
 	// Held under the Service op lock so expiration cannot interleave.
 	if value.Type == message.ScopeExpansionRequest && resolution.Decision.Allowed {
-		if err := s.approveScope(frozen, resolution.Decision); err != nil {
+		if err := s.approveScope(frozen, *resolution.Decision); err != nil {
 			return err
 		}
 	}
@@ -266,7 +265,7 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 	if err != nil {
 		// Re-read: may have raced with another path (should not under op lock).
 		if latest, ok := s.router.Get(id); ok && message.IsTerminal(latest.Status) {
-			if latest.Status == message.Answered && message.ResolutionsEqual(latest.Resolution, resJSON) {
+			if latest.Status == message.Answered && message.ResolutionsEqualForType(latest.Type, latest.Resolution, resJSON) {
 				return nil
 			}
 			if latest.Status == message.Answered {

@@ -106,6 +106,24 @@ func ValidateEnvelope(e Envelope) error {
 	if len(e.Validation) == 0 && strings.TrimSpace(e.ValidationNotRunReason) == "" {
 		problems = append(problems, "state validation results or explain why validation was not run")
 	}
+	if e.ScopeExpansion != nil {
+		if len(e.ScopeExpansion.Paths) == 0 {
+			problems = append(problems, "scope_expansion requires at least one path")
+		} else {
+			for _, path := range e.ScopeExpansion.Paths {
+				if strings.TrimSpace(path) == "" {
+					problems = append(problems, "scope_expansion paths cannot be empty or whitespace-only")
+					break
+				}
+			}
+		}
+		if strings.TrimSpace(e.ScopeExpansion.Reason) == "" {
+			problems = append(problems, "scope_expansion reason is required")
+		}
+		if strings.TrimSpace(e.ScopeExpansion.Consequence) == "" {
+			problems = append(problems, "scope_expansion consequence is required")
+		}
+	}
 	switch e.Status {
 	case StatusSucceeded:
 		if len(e.WorkCompleted) == 0 {

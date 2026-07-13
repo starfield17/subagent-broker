@@ -64,7 +64,7 @@ func TestApproveScopeExpansionDoesNotDeadlock(t *testing.T) {
 	}()
 
 	msgID := waitPendingDecision(t, service)
-	resolution := message.Resolution{Decision: message.DecisionPayload{Allowed: true}}
+	resolution := message.NewDecisionResolution(true, "", false)
 
 	// Bounded deadline: deadlock regression must fail promptly, not hang the suite.
 	done := make(chan error, 1)
@@ -85,7 +85,7 @@ func TestApproveScopeExpansionDoesNotDeadlock(t *testing.T) {
 		if got.err != nil {
 			t.Fatalf("RequestMessage: %v", got.err)
 		}
-		if !got.res.Decision.Allowed {
+		if got.res.Decision == nil || !got.res.Decision.Allowed {
 			t.Fatalf("expected Allowed=true, got %+v", got.res)
 		}
 		if got.id != msgID {
@@ -168,9 +168,7 @@ func TestApproveScopeExpansionDoesNotDeadlock(t *testing.T) {
 	}
 
 	// Conflicting deny after allow must reject without rolling back scope.
-	denyErr := service.ResolveMessage(msgID, message.Resolution{
-		Decision: message.DecisionPayload{Allowed: false, Reason: "conflict"},
-	})
+	denyErr := service.ResolveMessage(msgID, message.NewDecisionResolution(false, "conflict", false))
 	if denyErr == nil {
 		t.Fatal("conflicting deny must fail")
 	}

@@ -48,6 +48,9 @@ Workers may read the project, but may only write within the approved scope. When
 - Events are append-only and Run-sequenced.
 - Formal Markdown is atomically published only after validation.
 - `report.md` means a valid report exists, not that verification succeeded.
+- External Harness output is normalized at the Adapter protocol boundary before entering the canonical Result Envelope model.
+- Question answers and permission/scope decisions are disjoint resolution types.
+- Absence of a decision must never be interpreted as denial.
 - A durably recorded Task execution failure must terminalize its Wave and Run before the Supervisor exits normally.
 - Only Tasks that actually started are Worker recovery candidates. Never-started Tasks retain their pre-start state.
 - Waiting for user, permission, or scope is not a stall.
@@ -86,8 +89,14 @@ The command starts a detached Supervisor and prints the Run ID. The Supervisor i
 /tmp/subagent-broker events --project /path/to/project --run <run-id>
 /tmp/subagent-broker cancel --project /path/to/project --run <run-id>
 /tmp/subagent-broker inbox --project /path/to/project --run <run-id>
-/tmp/subagent-broker send --project /path/to/project --run <run-id> --message <message-id> --answer "answer"
+subagent-broker send ... --message <question-id> --answer "..."
+subagent-broker send ... --message <permission-id> --approve
+subagent-broker send ... --message <permission-id> --deny --reason "..."
+subagent-broker send ... --message <scope-id> --approve
+subagent-broker send ... --message <scope-id> --deny --reason "..."
 ```
+
+Result Envelope output uses `scope_expansion: null` when no expansion is requested. When present, it is an object with `paths`, `reason`, and `consequence`; it is never an array. Resolution JSON uses a tagged `answer` or `decision` union, and a missing decision is not a denial.
 
 If the Supervisor itself stops before the Run is terminal, start reconciliation with `recover`. Recovery never treats a reused PID as the original Worker without a matching process start token.
 
