@@ -559,21 +559,17 @@ func waitTaskRunning(t *testing.T, service *supervisor.Service, taskID string) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, ts := range service.Snapshot().Tasks {
-			if string(ts.Task.TaskID) == taskID {
-				switch ts.Task.Status {
-				case state.TaskRunning, state.TaskBlocked:
-					return
-				}
+			if string(ts.Task.TaskID) != taskID {
+				continue
+			}
+			// Require an active worker projection so cancel/send paths are valid.
+			if ts.Worker != nil && (ts.Task.Status == state.TaskRunning || ts.Task.Status == state.TaskBlocked) {
+				return
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// stalled scenario may still be starting; allow proceed if run is live.
-	snap := service.Snapshot()
-	if snap.Run.Status == domain.RunRunning || snap.Run.Status == domain.RunStarting {
-		return
-	}
-	t.Fatalf("task %s not running: %+v", taskID, snap.Tasks)
+	t.Fatalf("task %s has no active worker: %+v", taskID, service.Snapshot().Tasks)
 }
 
 func waitPendingMessage(t *testing.T, service *supervisor.Service) string {
