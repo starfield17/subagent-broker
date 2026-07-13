@@ -1124,6 +1124,47 @@ func (s *Service) syncMessageProjection(value message.Message) {
 	_ = s.CommitMessageProjection(context.Background(), value, "")
 }
 
+// scopeExpansionPaths resolves Task and Wave storage paths from immutable run
+// identity values. It must not inspect mutable Supervisor state or acquire s.mu.
+// Commit mutation callbacks use these precomputed paths so they never re-enter
+// the non-reentrant Service mutex.
+func scopeExpansionPaths(brokerHome, projectID, runID, waveID, taskID string) (storage.TaskPaths, storage.WavePaths, error) {
+	layout, err := storage.NewLayout(brokerHome)
+	if err != nil {
+		return storage.TaskPaths{}, storage.WavePaths{}, err
+	}
+	taskPaths, err := layout.TaskPaths(projectID, runID, taskID)
+	if err != nil {
+		return storage.TaskPaths{}, storage.WavePaths{}, err
+	}
+	wavePaths, err := layout.WavePaths(projectID, runID, waveID)
+	if err != nil {
+		return storage.TaskPaths{}, storage.WavePaths{}, err
+	}
+	return taskPaths, wavePaths, nil
+}
+
+// scopeExpansionIdentity captures BrokerHome/ProjectID/RunID/WaveID under s.mu
+// and returns them so approveScope can compute storage paths before Commit.
+// These values are run/task identity and are not mutated by scope expansion.
+func (s *Service) scopeExpansionIdentity(taskID string) (brokerHome, projectID, runID, waveID string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	brokerHome = s.config.BrokerHome
+	projectID = string(s.snapshot.Run.ProjectID)
+	runID = string(s.snapshot.Run.RunID)
+	for _, ts := range s.snapshot.Tasks {
+		if string(ts.Task.TaskID) == taskID {
+			waveID = string(ts.Task.WaveID)
+			if waveID == "" {
+				return "", "", "", "", fmt.Errorf("task %q has empty WaveID", taskID)
+			}
+			return brokerHome, projectID, runID, waveID, nil
+		}
+	}
+	return "", "", "", "", fmt.Errorf("task %q not found for scope expansion", taskID)
+}
+
 func (s *Service) approveScope(value message.Message, decision message.DecisionPayload) error {
 	var request message.ScopeRequestPayload
 	if err := json.Unmarshal(value.Payload, &request); err != nil {
@@ -1132,6 +1173,19 @@ func (s *Service) approveScope(value message.Message, decision message.DecisionP
 	if len(request.RequestedScope) == 0 {
 		return fmt.Errorf("scope request has no requested paths")
 	}
+
+	// Compute all storage paths before commitMutate. Commit holds s.mu across
+	// the mutation callback; any helper that re-locks s.mu (Snapshot, wavePaths,
+	// taskState, projectRoot, AcceptingWork, …) would self-deadlock.
+	brokerHome, projectID, runID, waveID, err := s.scopeExpansionIdentity(value.TaskID)
+	if err != nil {
+		return err
+	}
+	taskPaths, wavePaths, err := scopeExpansionPaths(brokerHome, projectID, runID, waveID, value.TaskID)
+	if err != nil {
+		return err
+	}
+
 	return s.commitMutate(context.Background(), event.Input{
 		TaskID: value.TaskID, Source: "message-router", Type: event.ScopeExpansionResolved, Severity: "info",
 		Payload: map[string]any{"message_id": value.MessageID, "allowed": true, "paths": request.RequestedScope},
@@ -1144,8 +1198,8 @@ func (s *Service) approveScope(value message.Message, decision message.DecisionP
 
 		// Idempotency: track which scopes are already present.
 		existing := map[string]bool{}
-		for _, s := range target.Task.WriteScope {
-			existing[s] = true
+		for _, entry := range target.Task.WriteScope {
+			existing[entry] = true
 		}
 		alreadyExpanded := true
 		for _, requested := range request.RequestedScope {
@@ -1194,12 +1248,10 @@ func (s *Service) approveScope(value message.Message, decision message.DecisionP
 		if err != nil {
 			return err
 		}
-		layout, _ := storage.NewLayout(s.config.BrokerHome)
-		paths, _ := layout.TaskPaths(string(candidate.Run.ProjectID), string(candidate.Run.RunID), value.TaskID)
-		if err := storage.AtomicWriteFile(paths.Contract, []byte(contract), 0o600); err != nil {
+		if err := storage.AtomicWriteFile(taskPaths.Contract, []byte(contract), 0o600); err != nil {
 			return err
 		}
-		if err := storage.AtomicWriteJSON(s.wavePaths(target.Task.WaveID).Preflight, result, 0o600); err != nil {
+		if err := storage.AtomicWriteJSON(wavePaths.Preflight, result, 0o600); err != nil {
 			return err
 		}
 		candidate.UpdatedAt = time.Now().UTC()

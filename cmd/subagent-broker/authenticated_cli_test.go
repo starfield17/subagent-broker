@@ -294,8 +294,7 @@ func TestAuthenticatedSendAnswerResolvesBlockedWorker(t *testing.T) {
 
 func TestAuthenticatedSendApproveAndDeny(t *testing.T) {
 	// Permission requests exercise --approve/--deny over the authenticated control
-	// path without the scope-expansion side-effect commit (pre-existing mu re-entry
-	// in approveScope is out of scope for this hotfix).
+	// path. Scope-expansion approve is covered by TestAuthenticatedSendScopeExpansionApprove.
 	env := startLiveControlSupervisor(t, []string{"task-a"}, adapter.Capabilities{
 		StructuredStream: true, StructuredFinalOutput: true, BidirectionalStream: true,
 	})
@@ -357,6 +356,146 @@ func TestAuthenticatedSendApproveAndDeny(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("deny did not resume waiter")
+	}
+}
+
+// TestAuthenticatedSendScopeExpansionApprove exercises the real authenticated
+// resolve_message IPC path for ScopeExpansionRequest --approve. This is the
+// regression for the approveScope / Commit mutex re-entry deadlock.
+func TestAuthenticatedSendScopeExpansionApprove(t *testing.T) {
+	env := startLiveControlSupervisor(t, []string{"task-a"}, adapter.Capabilities{
+		StructuredStream: true, StructuredFinalOutput: true, BidirectionalStream: true,
+	})
+	waitTaskRunning(t, env.Service, "task-a")
+	binary := buildCLIBinary(t)
+	token, err := supervisor.LoadControlCredential(env.RunDir)
+	if err != nil || token == "" {
+		t.Fatal("control credential missing")
+	}
+
+	requested := "cli-expanded-scope.txt"
+	type reqResult struct {
+		res message.Resolution
+		id  string
+		err error
+	}
+	done := make(chan reqResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		res, id, err := env.Service.RequestMessage(ctx, "task-a", "worker-a",
+			message.ScopeExpansionRequest, message.Scope,
+			message.ScopeRequestPayload{
+				RequestedScope:       []string{requested},
+				Reason:               "CLI scope expansion approve path",
+				Consequence:          "worker cannot continue without expanded write scope",
+				PartialModifications: "none",
+			})
+		done <- reqResult{res: res, id: id, err: err}
+	}()
+
+	msgID := waitPendingMessage(t, env.Service)
+	// Ensure the pending decision is the scope-expansion request, not a substitute.
+	pendingFound := false
+	for _, item := range env.Service.Inbox(false) {
+		if item.MessageID == msgID {
+			pendingFound = true
+			if item.Type != message.ScopeExpansionRequest {
+				t.Fatalf("expected ScopeExpansionRequest, got %s", item.Type)
+			}
+		}
+	}
+	if !pendingFound {
+		t.Fatal("pending scope expansion message missing from inbox")
+	}
+
+	cliArgs := []string{
+		"send", "--project", env.ProjectRoot, "--broker-home", env.Home, "--run", env.RunID,
+		"--message", msgID, "--approve",
+	}
+	stdout, stderr, code := runCLI(t, binary, cliArgs...)
+	// Control credential must never appear in argv, stdout, stderr, or failure text.
+	assertNoSecret(t, token, stdout, stderr, strings.Join(cliArgs, " "), strings.Join(os.Args, " "))
+	if code != 0 {
+		assertNoSecret(t, token, stdout, stderr)
+		t.Fatalf("CLI exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "message resolved") {
+		t.Fatalf("stdout missing successful resolution: %q", stdout)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("RequestMessage: %v", got.err)
+		}
+		if !got.res.Decision.Allowed {
+			t.Fatalf("Allowed=%v resolution=%+v", got.res.Decision.Allowed, got.res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RequestMessage did not resume after CLI --approve (possible deadlock)")
+	}
+
+	// Durable message is Answered.
+	items := env.Service.Inbox(true)
+	answered := false
+	for _, item := range items {
+		if item.MessageID != msgID {
+			continue
+		}
+		answered = true
+		if item.Status != message.Answered {
+			t.Fatalf("status=%s want Answered", item.Status)
+		}
+	}
+	if !answered {
+		t.Fatal("answered scope expansion message missing from inbox(includeResolved)")
+	}
+
+	// Requested scope exists exactly once in the Snapshot; task not blocked on decision.
+	snap := env.Service.Snapshot()
+	scopeCount := 0
+	for _, ts := range snap.Tasks {
+		if string(ts.Task.TaskID) != "task-a" {
+			continue
+		}
+		for _, entry := range ts.Task.WriteScope {
+			if entry == requested {
+				scopeCount++
+			}
+		}
+		if ts.Task.Status == state.TaskBlocked && ts.BlockKind == supervisor.BlockKindWaitingMessage {
+			t.Fatalf("task left blocked on decision: %+v", ts)
+		}
+	}
+	if scopeCount != 1 {
+		t.Fatalf("requested scope count=%d want 1 in snapshot", scopeCount)
+	}
+
+	// Generated Task contract contains the new scope.
+	contractPath := filepath.Join(env.RunDir, "tasks", "task-a", "contract.md")
+	contractRaw, err := os.ReadFile(contractPath)
+	if err != nil {
+		t.Fatalf("read contract: %v", err)
+	}
+	assertNoSecret(t, token, string(contractRaw))
+	if !strings.Contains(string(contractRaw), requested) {
+		t.Fatalf("contract missing expanded scope %q", requested)
+	}
+
+	// Control plane remains responsive after approval (global mutex not left locked).
+	ok, respErr := rawControlCall(t, env.RunDir, env.RunID, "ping", token)
+	assertNoSecret(t, token, respErr)
+	if !ok {
+		t.Fatalf("post-approve ping failed: %s", respErr)
+	}
+	// CLI status also exercises the authenticated control path after approve.
+	statusOut, statusErr, statusCode := runCLI(t, binary,
+		"status", "--project", env.ProjectRoot, "--broker-home", env.Home, "--run", env.RunID,
+	)
+	assertNoSecret(t, token, statusOut, statusErr)
+	if statusCode != 0 {
+		t.Fatalf("post-approve status exit=%d stdout=%s stderr=%s", statusCode, statusOut, statusErr)
 	}
 }
 
