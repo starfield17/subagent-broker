@@ -261,10 +261,18 @@ func validateMessageStatusFields(value Message) error {
 		return err
 	}
 	switch value.Status {
-	case Created, Validated, Queued, Delivered:
-		// Final resolution must not appear before Answered.
+	case Created, Validated, Delivered:
+		// Final resolution must not appear before Answered, except native
+		// permission frozen intent which is stored on Queued pending delivery.
 		if len(value.Resolution) > 0 {
 			return fmt.Errorf("status %s must not carry resolution", value.Status)
+		}
+	case Queued:
+		// Native permission decisions may freeze Resolution while remaining
+		// non-terminal Queued until Adapter.RespondPermission succeeds.
+		// Other types must not carry resolution before Answered.
+		if len(value.Resolution) > 0 && value.Type != PermissionRequest {
+			return fmt.Errorf("status queued must not carry resolution for type %s", value.Type)
 		}
 	case Answered:
 		if len(value.Resolution) == 0 {

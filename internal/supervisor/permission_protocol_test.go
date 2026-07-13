@@ -229,8 +229,9 @@ func TestResolveGrokMissingOptionNotAnswered(t *testing.T) {
 	if got.Status == message.Answered {
 		t.Fatal("must not record Answered when option selection fails")
 	}
-	if got.Status != message.Failed {
-		t.Fatalf("status=%s", got.Status)
+	// Option construction failure freezes decision and keeps pending for reconciliation.
+	if got.Status != message.Queued {
+		t.Fatalf("status=%s want queued", got.Status)
 	}
 	if len(inner.PermissionResponses) != 0 {
 		t.Fatal("adapter must not be called when option selection fails")
@@ -292,6 +293,10 @@ func TestAdapterDeliveryFailureNotAnswered(t *testing.T) {
 	harness := &namedAdapter{name: adapter.HarnessGrokBuild, Adapter: inner}
 	service := newNativePermissionService(t, harness)
 	service.snapshot.Tasks[0].Worker.Harness = string(adapter.HarnessGrokBuild)
+	service.active["task-a"] = activeWorker{
+		adapter: harness, sessionID: service.active["task-a"].sessionID,
+		cancel: func() {}, taskID: "task-a", workerID: "worker-a", attempt: 1,
+	}
 	runtime := &service.snapshot.Tasks[0]
 	service.bridgeNativePermission(runtime, harness, adapter.NativeEvent{
 		Kind: event.PermissionRequested, Payload: json.RawMessage(acpPermissionRequestNumeric),
@@ -306,5 +311,8 @@ func TestAdapterDeliveryFailureNotAnswered(t *testing.T) {
 	got, _ := service.router.Get(pending[0].MessageID)
 	if got.Status == message.Answered {
 		t.Fatal("must not Answered after delivery failure")
+	}
+	if got.Status != message.Queued || len(got.Resolution) == 0 {
+		t.Fatalf("want queued with frozen resolution: %+v", got)
 	}
 }

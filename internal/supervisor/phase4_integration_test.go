@@ -221,8 +221,12 @@ func TestPhase4PermissionDeliveryFailureHonest(t *testing.T) {
 	if got.Status == message.Answered {
 		t.Fatal("must not record answered after adapter failure")
 	}
-	if got.Status != message.Failed {
-		t.Fatalf("status=%s", got.Status)
+	// Retryable: remain Queued with frozen decision and delivery error.
+	if got.Status != message.Queued {
+		t.Fatalf("status=%s want queued", got.Status)
+	}
+	if len(got.Resolution) == 0 || got.Error == "" {
+		t.Fatalf("want frozen resolution and error: %+v", got)
 	}
 }
 

@@ -189,6 +189,8 @@ type PermissionRequestPayload struct {
 	Harness            string `json:"harness,omitempty"`
 	NativeSessionID    string `json:"native_session_id,omitempty"`
 	NativePermissionID string `json:"native_permission_id,omitempty"`
+	// NativeTurnID is optional; validated when both stored and active values exist.
+	NativeTurnID string `json:"native_turn_id,omitempty"`
 	// NativeOptions carries protocol options (ACP) needed to form a valid response.
 	// Omitted for Claude hooks and Codex; old journals without this field still decode.
 	NativeOptions []PermissionOption `json:"native_options,omitempty"`
