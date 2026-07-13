@@ -188,8 +188,14 @@ func LoadRunID(runDir string) (string, error) {
 }
 
 func callSupervisor(ctx context.Context, runDir, runID, method string, params any) (supervisor.Response, error) {
+	// Worker plane socket + per-attempt token from environment (never argv).
+	endpoint := os.Getenv("BROKER_WORKER_SOCKET")
+	if endpoint == "" {
+		endpoint = supervisor.WorkerSocketPath(runDir)
+	}
+	token := os.Getenv("BROKER_WORKER_TOKEN")
 	dialer := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.DialContext(ctx, "unix", supervisor.SocketPath(runDir))
+	conn, err := dialer.DialContext(ctx, "unix", endpoint)
 	if err != nil {
 		return supervisor.Response{}, err
 	}
@@ -198,7 +204,12 @@ func callSupervisor(ctx context.Context, runDir, runID, method string, params an
 	if err != nil {
 		return supervisor.Response{}, err
 	}
-	request := supervisor.Request{SchemaVersion: supervisor.SchemaVersion, RequestID: fmt.Sprintf("worker-%d", time.Now().UnixNano()), RunID: runID, Method: method, Params: raw}
+	request := supervisor.Request{
+		SchemaVersion: supervisor.SchemaVersion,
+		RequestID:     fmt.Sprintf("worker-%d", time.Now().UnixNano()),
+		RunID:         runID, Method: method, Params: raw,
+		AuthToken: token,
+	}
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
 		return supervisor.Response{}, err
 	}

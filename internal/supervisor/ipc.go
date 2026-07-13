@@ -15,12 +15,16 @@ import (
 	"github.com/vnai/subagent-broker/internal/state"
 )
 
+// domain is used for TaskID cast in credential staleness checks.
+
 type Request struct {
-	SchemaVersion string          `json:"schema_version"`
-	RequestID     string          `json:"request_id"`
-	RunID         string          `json:"run_id"`
-	Method        string          `json:"method"`
-	Params        json.RawMessage `json:"params,omitempty"`
+	SchemaVersion string `json:"schema_version"`
+	RequestID     string `json:"request_id"`
+	RunID         string `json:"run_id"`
+	Method        string `json:"method"`
+	// AuthToken is the control or worker credential. Never log or echo this field.
+	AuthToken string          `json:"auth_token,omitempty"`
+	Params    json.RawMessage `json:"params,omitempty"`
 }
 
 type Response struct {
@@ -51,24 +55,28 @@ type EventsResult struct {
 	SnapshotTime   time.Time     `json:"snapshot_time,omitempty"`
 }
 
-func (s *Service) handleConnection(ctx context.Context, conn net.Conn) {
+func (s *Service) handleConnection(ctx context.Context, conn net.Conn, plane CallerRole) {
 	defer conn.Close()
 	decoder := bufio.NewScanner(conn)
+	// Allow large worker payloads without unbounded growth from secrets in errors.
+	buf := make([]byte, 0, 64*1024)
+	decoder.Buffer(buf, 1024*1024)
 	encoder := json.NewEncoder(conn)
 	for decoder.Scan() {
 		var request Request
 		if err := json.Unmarshal(decoder.Bytes(), &request); err != nil {
-			_ = encoder.Encode(Response{SchemaVersion: SchemaVersion, OK: false, Error: fmt.Sprintf("invalid request: %v", err)})
+			_ = encoder.Encode(Response{SchemaVersion: SchemaVersion, OK: false, Error: "invalid request"})
 			continue
 		}
-		response := s.handleRequest(ctx, request)
+		response := s.handleRequest(ctx, request, plane)
+		// Never echo auth material.
 		if err := encoder.Encode(response); err != nil {
 			return
 		}
 	}
 }
 
-func (s *Service) handleRequest(ctx context.Context, request Request) Response {
+func (s *Service) handleRequest(ctx context.Context, request Request, plane CallerRole) Response {
 	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID}
 	if request.SchemaVersion != SchemaVersion {
 		response.Error = "unsupported IPC schema version"
@@ -78,6 +86,28 @@ func (s *Service) handleRequest(ctx context.Context, request Request) Response {
 		response.Error = "request Run ID does not match Supervisor"
 		return response
 	}
+
+	// Authenticate and authorize by plane + method. Fail closed without leaking secrets.
+	role, workerBinding, authErr := s.authenticateRequest(request, plane)
+	if authErr != nil {
+		response.Error = "unauthorized"
+		return response
+	}
+	if err := Authorize(role, request.Method); err != nil {
+		response.Error = "unauthorized"
+		return response
+	}
+	// Worker plane hard-limit: only worker_request (Authorize already checks).
+	if plane == CallerWorker && request.Method != "worker_request" {
+		response.Error = "unauthorized"
+		return response
+	}
+	if plane == CallerControl && request.Method == "worker_request" {
+		// Control socket must not accept worker_request (use worker socket).
+		response.Error = "unauthorized"
+		return response
+	}
+
 	switch request.Method {
 	case "ping", "status":
 		response.OK = true
@@ -255,6 +285,10 @@ func (s *Service) handleRequest(ctx context.Context, request Request) Response {
 		response.OK = true
 		response.Result = s.Snapshot()
 	case "worker_request":
+		if workerBinding == nil {
+			response.Error = "unauthorized"
+			return response
+		}
 		var params struct {
 			TaskID   string           `json:"task_id"`
 			WorkerID string           `json:"worker_id"`
@@ -266,12 +300,21 @@ func (s *Service) handleRequest(ctx context.Context, request Request) Response {
 			response.Error = err.Error()
 			return response
 		}
+		// Authoritative identity comes from the credential, not caller-supplied fields.
+		if params.TaskID != "" && params.TaskID != workerBinding.TaskID {
+			response.Error = "unauthorized"
+			return response
+		}
+		if params.WorkerID != "" && params.WorkerID != workerBinding.WorkerID {
+			response.Error = "unauthorized"
+			return response
+		}
 		var payload any
 		if err := json.Unmarshal(params.Payload, &payload); err != nil {
 			response.Error = err.Error()
 			return response
 		}
-		resolution, id, err := s.RequestMessage(ctx, params.TaskID, params.WorkerID, params.Type, params.Category, payload)
+		resolution, id, err := s.RequestMessage(ctx, workerBinding.TaskID, workerBinding.WorkerID, params.Type, params.Category, payload)
 		if err != nil {
 			response.Error = err.Error()
 			response.Result = map[string]any{"message_id": id}
@@ -397,4 +440,65 @@ func readIPCResponse(conn net.Conn, response *Response) error {
 		}
 	}
 	return json.Unmarshal(line, response)
+}
+
+// authenticateRequest maps plane + token to a role. Errors are opaque ("unauthorized").
+func (s *Service) authenticateRequest(request Request, plane CallerRole) (CallerRole, *WorkerCredentialBinding, error) {
+	if s.auth == nil {
+		// Tests without auth: allow control plane only for backward-compatible unit tests.
+		if plane == CallerControl {
+			return CallerControl, nil, nil
+		}
+		return CallerNone, nil, fmt.Errorf("unauthorized")
+	}
+	token := request.AuthToken
+	switch plane {
+	case CallerControl:
+		if !s.auth.AuthenticateControl(token) {
+			return CallerNone, nil, fmt.Errorf("unauthorized")
+		}
+		return CallerControl, nil, nil
+	case CallerWorker:
+		binding, ok := s.auth.AuthenticateWorker(token)
+		if !ok {
+			return CallerNone, nil, fmt.Errorf("unauthorized")
+		}
+		if binding.RunID != "" && binding.RunID != request.RunID {
+			return CallerNone, nil, fmt.Errorf("unauthorized")
+		}
+		// Reject stale attempt when a newer active attempt exists for the same task.
+		if s.workerCredentialStale(binding) {
+			return CallerNone, nil, fmt.Errorf("unauthorized")
+		}
+		return CallerWorker, binding, nil
+	default:
+		return CallerNone, nil, fmt.Errorf("unauthorized")
+	}
+}
+
+func (s *Service) workerCredentialStale(b *WorkerCredentialBinding) bool {
+	if b == nil {
+		return true
+	}
+	s.mu.Lock()
+	active, ok := s.active[b.TaskID]
+	s.mu.Unlock()
+	if !ok {
+		// No active worker: credential may still be valid during blocked wait.
+		// Reject only when a different active attempt is registered.
+		if runtime, found := s.taskState(domain.TaskID(b.TaskID)); found && runtime.ActiveAttempt > 0 {
+			return runtime.ActiveAttempt != b.AttemptNumber
+		}
+		return false
+	}
+	if active.workerID != b.WorkerID {
+		return true
+	}
+	if active.attempt != b.AttemptNumber {
+		return true
+	}
+	if b.NativeSessionID != "" && active.sessionID != "" && b.NativeSessionID != active.sessionID {
+		return true
+	}
+	return false
 }

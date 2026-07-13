@@ -22,28 +22,36 @@ const (
 type EventStreamOptions struct {
 	// OutputBuffer is the capacity of the public Session.Events channel.
 	OutputBuffer int
-	// ProgressQueueLimit bounds non-critical events held internally.
-	// Critical events are not subject to this limit (low-volume control plane).
+	// ProgressQueueLimit bounds non-critical events held internally before acceptance.
+	// Once accepted, events keep global order with critical events.
 	ProgressQueueLimit int
+}
+
+type queuedEvent struct {
+	event    adapter.NativeEvent
+	critical bool
+	seq      uint64
 }
 
 // EventStream owns all sends to and the close of a public Events channel.
 // Producers must only call Publish; they must never send to or close Events().
+// Accepted events preserve global publication order across critical/progress classes.
 type EventStream struct {
 	out chan adapter.NativeEvent
 
 	mu              sync.Mutex
-	critical        []adapter.NativeEvent
-	progress        []adapter.NativeEvent
+	queue           []queuedEvent
+	progressInQueue int
 	progressLimit   int
+	nextSeq         uint64
 	droppedProgress uint64
 	accepting       bool
 	gracefulClose   bool
 	aborting        bool
 	ownerExited     bool
 
-	wake      chan struct{} // never closed; non-blocking signal to owner
-	abortCh   chan struct{} // closed exactly once on Abort
+	wake      chan struct{}
+	abortCh   chan struct{}
 	abortOnce sync.Once
 	done      chan struct{}
 	doneOnce  sync.Once
@@ -90,24 +98,26 @@ func (s *EventStream) DroppedProgress() uint64 {
 
 // Publish queues an event for the owner. Never panics after close/abort.
 // Does not block on the public consumer.
+// Critical events are never dropped for ordinary saturation.
+// Progress may be dropped before acceptance when progress capacity is exhausted.
+// Once accepted, events keep global order (critical does not overtake earlier progress).
 func (s *EventStream) Publish(native adapter.NativeEvent) PublishResult {
 	s.mu.Lock()
 	if !s.accepting || s.aborting {
 		s.mu.Unlock()
 		return PublishRejected
 	}
-	if IsCriticalNativeEvent(native.Kind) {
-		s.critical = append(s.critical, native)
-		s.mu.Unlock()
-		s.signal()
-		return PublishAccepted
+	critical := IsCriticalNativeEvent(native.Kind)
+	if !critical {
+		if s.progressInQueue >= s.progressLimit {
+			s.droppedProgress++
+			s.mu.Unlock()
+			return PublishDroppedProgress
+		}
+		s.progressInQueue++
 	}
-	if len(s.progress) >= s.progressLimit {
-		s.droppedProgress++
-		s.mu.Unlock()
-		return PublishDroppedProgress
-	}
-	s.progress = append(s.progress, native)
+	s.nextSeq++
+	s.queue = append(s.queue, queuedEvent{event: native, critical: critical, seq: s.nextSeq})
 	s.mu.Unlock()
 	s.signal()
 	return PublishAccepted
@@ -126,7 +136,6 @@ func (s *EventStream) CloseGracefully() {
 
 // Abort stops accepting events, unblocks the owner even if the public consumer
 // is stalled, and closes the public channel. Queued events may be discarded.
-// Idempotent and concurrent-safe with CloseGracefully.
 func (s *EventStream) Abort() {
 	s.mu.Lock()
 	s.accepting = false
@@ -137,8 +146,7 @@ func (s *EventStream) Abort() {
 	<-s.done
 }
 
-// TryCloseGracefully is like CloseGracefully but does not wait for the owner
-// when already done (non-blocking check). Prefer CloseGracefully for normal exit.
+// TryCloseGracefully is like CloseGracefully but handles concurrent abort.
 func (s *EventStream) TryCloseGracefully() {
 	s.mu.Lock()
 	s.accepting = false
@@ -149,7 +157,6 @@ func (s *EventStream) TryCloseGracefully() {
 	if exited {
 		return
 	}
-	// Wait with abort awareness so dual close paths cannot hang forever.
 	select {
 	case <-s.done:
 	case <-s.abortCh:
@@ -178,40 +185,40 @@ func (s *EventStream) finish() {
 func (s *EventStream) ownerLoop() {
 	defer s.finish()
 	for {
-		// Abort: discard queues and exit promptly.
 		s.mu.Lock()
 		if s.aborting {
-			s.critical = nil
-			s.progress = nil
+			s.queue = nil
+			s.progressInQueue = 0
 			s.mu.Unlock()
 			return
 		}
-		// Take next event: critical first, then progress.
-		var next adapter.NativeEvent
+		// Drain in global acceptance order (FIFO by sequence).
+		var next queuedEvent
 		var have bool
-		if len(s.critical) > 0 {
-			next = s.critical[0]
-			s.critical = s.critical[1:]
-			have = true
-		} else if len(s.progress) > 0 {
-			next = s.progress[0]
-			s.progress = s.progress[1:]
+		if len(s.queue) > 0 {
+			next = s.queue[0]
+			s.queue = s.queue[1:]
+			if !next.critical {
+				s.progressInQueue--
+				if s.progressInQueue < 0 {
+					s.progressInQueue = 0
+				}
+			}
 			have = true
 		}
 		draining := s.gracefulClose && !s.accepting
-		empty := len(s.critical) == 0 && len(s.progress) == 0
+		empty := len(s.queue) == 0
 		s.mu.Unlock()
 
 		if have {
-			if !s.forward(next) {
-				return // aborted while forwarding
+			if !s.forward(next.event) {
+				return
 			}
 			continue
 		}
 		if draining && empty {
 			return
 		}
-		// Wait for work, graceful close, or abort.
 		select {
 		case <-s.wake:
 		case <-s.abortCh:
@@ -220,7 +227,6 @@ func (s *EventStream) ownerLoop() {
 	}
 }
 
-// forward sends to the public channel. Returns false if aborted (caller should exit).
 func (s *EventStream) forward(native adapter.NativeEvent) bool {
 	select {
 	case s.out <- native:

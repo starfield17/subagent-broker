@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Format check
+        timeout-minutes: 5
+        run: test -z "$(gofmt -l .)"
+
+      - name: Unit tests
+        timeout-minutes: 10
+        run: go test ./...
+
+      - name: Race tests
+        timeout-minutes: 15
+        run: go test -race ./...
+
+      - name: Race stress (adapters/message/supervisor)
+        timeout-minutes: 20
+        run: go test -race ./internal/adapter/... ./internal/message/... ./internal/supervisor/... -count=5
+
+      - name: Vet
+        timeout-minutes: 5
+        run: go vet ./...
+
+      - name: Build
+        timeout-minutes: 5
+        run: go build ./cmd/subagent-broker

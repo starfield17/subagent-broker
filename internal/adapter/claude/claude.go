@@ -159,12 +159,24 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 		args = append(args, "--safe-mode")
 	}
 	if req.Interaction.Enabled {
-		config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"subagent-broker": map[string]any{"type": "stdio", "command": req.Interaction.BrokerExecutable, "args": []string{"mcp-worker", "--run-dir", req.Interaction.RunDir, "--task", req.TaskID, "--worker", req.WorkerID}}}})
+		mcpServer := map[string]any{
+			"type": "stdio", "command": req.Interaction.BrokerExecutable,
+			"args": []string{"mcp-worker", "--run-dir", req.Interaction.RunDir, "--task", req.TaskID, "--worker", req.WorkerID},
+		}
+		// Worker credential via MCP env only (never argv / control token).
+		if req.Interaction.WorkerToken != "" {
+			mcpServer["env"] = map[string]string{
+				"BROKER_WORKER_TOKEN":  req.Interaction.WorkerToken,
+				"BROKER_WORKER_SOCKET": req.Interaction.WorkerSocket,
+			}
+		}
+		config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"subagent-broker": mcpServer}})
 		if err != nil {
 			return adapter.Session{}, err
 		}
 		// Install permission hooks for every permission mode that claims PermissionEvents.
 		// Previously only "default" installed hooks while capability still advertised true.
+		// Hooks inherit Claude process env (token set below); never put token in argv.
 		hookCommand := strings.Join([]string{shellQuote(req.Interaction.BrokerExecutable), "claude-hook", "--run-dir", shellQuote(req.Interaction.RunDir), "--task", shellQuote(req.TaskID), "--worker", shellQuote(req.WorkerID)}, " ")
 		settingsValue := map[string]any{
 			"permissions": map[string]any{"allow": []string{"Bash", "Write", "Edit"}},
@@ -183,6 +195,13 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	cmd := exec.CommandContext(ctx, a.executable, args...)
 	cmd.Dir = req.ProjectRoot
 	process.ConfigureCommand(cmd)
+	if req.Interaction.Enabled && req.Interaction.WorkerToken != "" {
+		// Inherit for hooks; do not place token on process argv.
+		cmd.Env = append(os.Environ(),
+			"BROKER_WORKER_TOKEN="+req.Interaction.WorkerToken,
+			"BROKER_WORKER_SOCKET="+req.Interaction.WorkerSocket,
+		)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return adapter.Session{}, err

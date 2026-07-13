@@ -376,10 +376,13 @@ func callIPC(runDir, endpoint, method string, params any) (supervisor.Response, 
 	if err := json.Unmarshal(data, &runValue); err != nil {
 		return supervisor.Response{}, err
 	}
+	// Control credential is operator-only; never embedded in Worker configuration.
+	controlToken, _ := supervisor.LoadControlCredential(runDir)
 	request := supervisor.Request{
 		SchemaVersion: supervisor.SchemaVersion,
 		RequestID:     fmt.Sprintf("cli-%d", time.Now().UnixNano()),
 		RunID:         string(runValue.RunID), Method: method,
+		AuthToken: controlToken,
 	}
 	if params != nil {
 		request.Params, err = json.Marshal(params)

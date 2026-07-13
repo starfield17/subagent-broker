@@ -49,9 +49,23 @@ type sessionState struct {
 	promptInFlight bool
 	promptGen      uint64
 	promptRPCID    int64
+	currentTurn    *turnResult // independent readiness per generation
 	// Producer coordination: all Adds happen before readerExited; then Wait.
 	producers    sync.WaitGroup
 	readerExited bool
+}
+
+// turnResult is generation-specific completion state. A prior generation must
+// never close or satisfy a later generation's ready channel.
+type turnResult struct {
+	generation uint64
+	ready      chan struct{}
+	completed  bool
+	success    bool
+	final      []byte
+	resultErr  string
+	usage      adapter.Usage
+	once       sync.Once
 }
 
 type rpcMessage struct {
@@ -257,13 +271,22 @@ func (a *Adapter) GetUsage(ctx context.Context, id string) (adapter.Usage, error
 	if err != nil {
 		return adapter.Usage{}, err
 	}
+	state.mu.Lock()
+	turn := state.currentTurn
+	state.mu.Unlock()
+	if turn == nil {
+		return adapter.Usage{}, fmt.Errorf("no generation")
+	}
 	select {
-	case <-state.resultReady:
+	case <-turn.ready:
 	case <-ctx.Done():
 		return adapter.Usage{}, ctx.Err()
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if turn.completed {
+		return turn.usage, nil
+	}
 	return state.usage, nil
 }
 
@@ -286,20 +309,39 @@ func (a *Adapter) CollectFinalResult(ctx context.Context, id string) (report.Env
 	if err != nil {
 		return report.Envelope{}, err
 	}
+	state.mu.Lock()
+	turn := state.currentTurn
+	state.mu.Unlock()
+	if turn == nil {
+		return report.Envelope{}, fmt.Errorf("Grok: no authoritative generation")
+	}
 	select {
-	case <-state.resultReady:
+	case <-turn.ready:
 	case <-ctx.Done():
 		return report.Envelope{}, ctx.Err()
 	}
 	state.mu.Lock()
-	raw := append([]byte(nil), state.final...)
-	reason := state.resultError
-	if len(raw) == 0 {
-		raw = []byte(state.output.String())
+	// Reject if a newer generation has started since we captured turn.
+	if state.currentTurn != turn {
+		state.mu.Unlock()
+		return report.Envelope{}, fmt.Errorf("Grok: generation superseded")
 	}
+	if !turn.completed {
+		state.mu.Unlock()
+		return report.Envelope{}, fmt.Errorf("Grok: generation incomplete")
+	}
+	raw := append([]byte(nil), turn.final...)
+	reason := turn.resultErr
+	success := turn.success
 	state.mu.Unlock()
-	if reason != "" {
+	if !success || reason != "" {
+		if reason == "" {
+			reason = "generation failed"
+		}
 		return report.Envelope{}, fmt.Errorf("Grok session failed: %s", reason)
+	}
+	if len(raw) == 0 {
+		return report.Envelope{}, fmt.Errorf("Grok: empty final for current generation")
 	}
 	return protocol.ParseEnvelope(raw)
 }
@@ -329,18 +371,16 @@ func (a *Adapter) startPrompt(ctx context.Context, state *sessionState, text str
 		state.mu.Unlock()
 		return fmt.Errorf("Grok prompt already in flight; concurrent SendMessage rejected")
 	}
-	// Re-arm result channel for a new generation after a prior finalization.
-	if state.resultSignaled {
-		state.resultReady = make(chan struct{})
-		state.resultSignaled = false
-	}
+	// New independent generation readiness — never re-arm a prior channel.
 	state.generation++
 	gen := state.generation
+	turn := &turnResult{generation: gen, ready: make(chan struct{})}
+	state.currentTurn = turn
 	state.promptInFlight = true
 	state.promptGen = gen
 	state.output.Reset()
-	// Do not clear final yet — only matching gen may overwrite on completion.
 	state.resultError = ""
+	state.final = nil
 	sessionID := state.acpSessionID
 	state.nextID++
 	rpcID := state.nextID
@@ -432,18 +472,41 @@ func (a *Adapter) waitPromptCompletion(ctx context.Context, state *sessionState,
 	}
 }
 
-// finalizeGeneration emits exactly one authoritative ResultSubmitted or TurnFailed
-// for gen and signals CollectFinalResult. Stale generations are ignored.
+// finalizeGeneration freezes generation-specific result, closes that generation's
+// ready channel, then publishes ResultSubmitted/TurnFailed. Ordering prevents
+// Supervisor from starting turn N+1 before turn N readiness is complete.
 func (a *Adapter) finalizeGeneration(state *sessionState, gen uint64, success bool) {
 	state.mu.Lock()
-	if gen != state.generation {
+	if state.currentTurn == nil || state.currentTurn.generation != gen {
 		state.mu.Unlock()
 		return
 	}
-	// Snapshot under lock; emit after unlock.
+	turn := state.currentTurn
+	if turn.completed {
+		state.mu.Unlock()
+		return
+	}
+	// Freeze result onto the generation object first.
+	if success {
+		turn.final = append([]byte(nil), state.final...)
+		if len(turn.final) == 0 {
+			turn.final = []byte(state.output.String())
+		}
+		turn.usage = state.usage
+		turn.success = true
+	} else {
+		turn.resultErr = state.resultError
+		if turn.resultErr == "" {
+			turn.resultErr = "generation failed"
+		}
+		turn.success = false
+	}
+	turn.completed = true
+	// Close readiness before publishing the boundary event.
+	turn.once.Do(func() { close(turn.ready) })
 	payload := json.RawMessage(`{}`)
-	if !success && state.resultError != "" {
-		payload, _ = json.Marshal(map[string]string{"error": state.resultError})
+	if !success && turn.resultErr != "" {
+		payload, _ = json.Marshal(map[string]string{"error": turn.resultErr})
 	}
 	state.mu.Unlock()
 
@@ -452,17 +515,20 @@ func (a *Adapter) finalizeGeneration(state *sessionState, gen uint64, success bo
 		kind = event.TurnFailed
 	}
 	a.recordEvent(state, adapter.NativeEvent{Kind: kind, Timestamp: time.Now().UTC(), Payload: payload})
-	a.signalResult(state)
 }
 
 func (a *Adapter) signalResult(state *sessionState) {
+	// Used on process exit when no generation completed: fail current turn if open.
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.resultSignaled {
-		return
+	if state.currentTurn != nil && !state.currentTurn.completed {
+		state.currentTurn.completed = true
+		state.currentTurn.success = false
+		if state.currentTurn.resultErr == "" {
+			state.currentTurn.resultErr = "session ended without result"
+		}
+		state.currentTurn.once.Do(func() { close(state.currentTurn.ready) })
 	}
-	state.resultSignaled = true
-	close(state.resultReady)
 }
 
 func (a *Adapter) request(ctx context.Context, state *sessionState, method string, params any) (json.RawMessage, error) {

@@ -74,19 +74,21 @@ func TestCollectFinalSelectsNewestValidEnvelope(t *testing.T) {
 
 func TestSessionIdleDoesNotStopServer(t *testing.T) {
 	a := New("")
+	turn := &ocTurnResult{generation: 1, ready: make(chan struct{})}
 	state := &sessionState{
 		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 8, ProgressQueueLimit: 8}),
 		shutdown:    make(chan struct{}),
 		resultReady: make(chan struct{}),
 		sessionID:   "ses-idle",
+		generation:  1, promptGen: 1, promptInFlight: true, currentTurn: turn,
 	}
 	// No process attached: stop would panic/fail if called. Idle must not call stop.
 	a.handleEvent(state, sseEvent{Type: "session.idle", Properties: []byte(`{}`)})
-	// resultReady should be closed for CollectFinalResult path.
+	// Generation readiness should be closed for CollectFinalResult path.
 	select {
-	case <-state.resultReady:
+	case <-turn.ready:
 	default:
-		t.Fatal("session.idle should signal resultReady without stopping server")
+		t.Fatal("session.idle should signal generation ready without stopping server")
 	}
 	// Stream still accepting for next-turn (not aborted/closed by idle).
 	if state.stream.Publish(adapter.NativeEvent{Kind: "opencode.ping"}) == protocol.PublishRejected {
