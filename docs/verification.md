@@ -99,3 +99,46 @@ Protocol fixtures covered (scripted / unit, not live authenticated harnesses):
 | Claude hook path | protocol events do not enter native `RespondPermission` |
 
 **Live authenticated Grok/OpenCode permission smoke was not performed in this patch.**
+
+## Phase 4 PR 8.8 — next-turn delivery lifecycle
+
+Executed after making turn-boundary ownership lifecycle-correct:
+
+```bash
+gofmt -w .
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Results: all packages PASS under `go test` and `go test -race`; `go vet` clean; build success.
+
+Supervisor multi-turn lifecycle fixtures (`next_turn_lifecycle_test.go` via `runWorkerSession`, not direct flush-only tests):
+
+| Fixture | Coverage |
+|---|---|
+| Queued next-turn after first `ResultSubmitted` | session kept alive; second turn consumed; final envelope is turn 2 |
+| No queued instruction | first result remains final; terminate path |
+| Two queued instructions | FIFO one-per-boundary; final envelope is turn 3 |
+| Next-turn start failure | instruction `Failed`; first result remains final |
+| `TurnFailed` | does not start next queued instruction |
+| Second-turn permission | `SendMessage` returns; permission bridged/resolved; no deadlock; final result |
+
+Grok async prompt fixtures:
+
+| Fixture | Coverage |
+|---|---|
+| `SendMessage` before prompt RPC response | returns without waiting for completion; progress events readable |
+| `session/prompt_completed` notification | maps to `TurnCompleted`; authoritative result after RPC response |
+| Concurrent `SendMessage` | rejected while prompt in flight |
+| Multi-turn keep-alive | second `SendMessage` after first completion |
+
+OpenCode two-turn fixtures:
+
+| Fixture | Coverage |
+|---|---|
+| First/second `session.idle` | freezes successive envelopes; session not closed |
+| Concurrent prompt | rejected while in flight |
+
+**Live authenticated next-turn smoke against real Grok/OpenCode was not performed.**

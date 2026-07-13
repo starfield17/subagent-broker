@@ -23,17 +23,26 @@ type Scenario struct {
 	Usage    adapter.Usage
 	KeepOpen bool
 	ExitCode int
+	// FollowUpBatches: each SendMessage consumes the next batch and emits those
+	// events on the live session channel (multi-turn lifecycle tests).
+	FollowUpBatches [][]adapter.NativeEvent
+	// FollowUpFinals: optional final envelope after each follow-up batch index.
+	FollowUpFinals []*report.Envelope
 }
 
 type sessionState struct {
-	session adapter.Session
-	events  chan adapter.NativeEvent
-	done    chan struct{}
-	history []adapter.NativeEvent
-	final   *report.Envelope
-	diff    []string
-	usage   adapter.Usage
-	closed  bool
+	session         adapter.Session
+	events          chan adapter.NativeEvent
+	done            chan struct{}
+	history         []adapter.NativeEvent
+	final           *report.Envelope
+	diff            []string
+	usage           adapter.Usage
+	closed          bool
+	followUpBatches [][]adapter.NativeEvent
+	followUpFinals  []*report.Envelope
+	followUpIndex   int
+	promptInFlight  bool
 }
 
 type Adapter struct {
@@ -102,7 +111,14 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	}
 	n := a.counter.Add(1)
 	id := fmt.Sprintf("fake-session-%d", n)
-	channel := make(chan adapter.NativeEvent, len(scenario.Events)+1)
+	buf := len(scenario.Events) + 1
+	for _, batch := range scenario.FollowUpBatches {
+		buf += len(batch) + 1
+	}
+	if buf < 16 {
+		buf = 16
+	}
+	channel := make(chan adapter.NativeEvent, buf)
 	exited := make(chan adapter.ExitStatus, 1)
 	// Synthetic process identity: PID is chosen so it does not refer to a live
 	// process. Supervisor fills ProcessGroupToken; Controller then confirms
@@ -121,7 +137,12 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 			final.WorkerID = req.WorkerID
 		}
 	}
-	state := &sessionState{session: session, events: channel, done: make(chan struct{}), final: final, diff: append([]string(nil), scenario.Diff...), usage: scenario.Usage}
+	state := &sessionState{
+		session: session, events: channel, done: make(chan struct{}), final: final,
+		diff: append([]string(nil), scenario.Diff...), usage: scenario.Usage,
+		followUpBatches: append([][]adapter.NativeEvent(nil), scenario.FollowUpBatches...),
+		followUpFinals:  append([]*report.Envelope(nil), scenario.FollowUpFinals...),
+	}
 	a.sessions[id] = state
 	a.mu.Unlock()
 
@@ -250,15 +271,57 @@ func (a *Adapter) SendMessage(_ context.Context, id, message string) (adapter.De
 		}
 		return adapter.DeliveryResult{Mode: adapter.DeliveryUnsupported}, adapter.ErrUnsupported
 	}
-	if _, err := a.requireSession(id); err != nil {
+	state, err := a.requireSession(id)
+	if err != nil {
 		return adapter.DeliveryResult{}, err
 	}
 	a.mu.Lock()
+	if state.promptInFlight {
+		a.mu.Unlock()
+		return adapter.DeliveryResult{}, fmt.Errorf("fake prompt already in flight")
+	}
 	a.SentMessages = append(a.SentMessages, message)
 	fail := a.FailSendMessage
-	a.mu.Unlock()
 	if fail != nil {
+		a.mu.Unlock()
 		return adapter.DeliveryResult{}, fail
+	}
+	// Accept promptly (non-blocking w.r.t. follow-up completion).
+	var batch []adapter.NativeEvent
+	var nextFinal *report.Envelope
+	if state.followUpIndex < len(state.followUpBatches) {
+		batch = append([]adapter.NativeEvent(nil), state.followUpBatches[state.followUpIndex]...)
+		if state.followUpIndex < len(state.followUpFinals) {
+			nextFinal = cloneEnvelope(state.followUpFinals[state.followUpIndex])
+		}
+		state.followUpIndex++
+	}
+	state.promptInFlight = len(batch) > 0
+	eventsCh := state.events
+	a.mu.Unlock()
+
+	if len(batch) > 0 {
+		go func() {
+			for _, native := range batch {
+				if native.Timestamp.IsZero() {
+					native.Timestamp = time.Now().UTC()
+				}
+				select {
+				case <-state.done:
+					return
+				case eventsCh <- native:
+					a.mu.Lock()
+					state.history = append(state.history, native)
+					a.mu.Unlock()
+				}
+			}
+			a.mu.Lock()
+			if nextFinal != nil {
+				state.final = nextFinal
+			}
+			state.promptInFlight = false
+			a.mu.Unlock()
+		}()
 	}
 	return adapter.DeliveryResult{Mode: adapter.DeliveryNextTurn, MessageID: message}, nil
 }

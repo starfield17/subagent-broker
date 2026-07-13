@@ -52,6 +52,10 @@ type sessionState struct {
 	usage           adapter.Usage
 	droppedProgress uint64
 	closed          bool
+	generation      uint64
+	promptInFlight  bool
+	promptGen       uint64
+	resultSignaled  bool
 }
 
 type sseEvent struct {
@@ -367,17 +371,24 @@ func (a *Adapter) waitHealth(ctx context.Context, baseURL string) error {
 }
 
 func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adapter.StartRequest) error {
-	// Multi-turn: re-arm result readiness after a prior session.idle completed.
 	state.mu.Lock()
-	select {
-	case <-state.resultReady:
+	if state.promptInFlight {
+		state.mu.Unlock()
+		return fmt.Errorf("OpenCode prompt already in flight; concurrent prompt rejected")
+	}
+	// Multi-turn: re-arm result readiness after a prior session.idle completed.
+	if state.resultSignaled {
 		state.resultReady = make(chan struct{})
 		state.finishOnce = sync.Once{}
 		state.resultOnce = sync.Once{}
-		state.final = nil
+		state.resultSignaled = false
 		state.resultError = ""
-	default:
 	}
+	state.generation++
+	gen := state.generation
+	state.promptInFlight = true
+	state.promptGen = gen
+	sessionID := state.sessionID
 	state.mu.Unlock()
 
 	parts := []map[string]string{{"type": "text", "text": req.Contract}}
@@ -388,7 +399,17 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 			body["model"] = map[string]string{"providerID": pieces[0], "modelID": pieces[1]}
 		}
 	}
-	return a.requestJSON(ctx, state, http.MethodPost, "/session/"+url.PathEscape(state.sessionID)+"/prompt_async", nil, body, nil)
+	err := a.requestJSON(ctx, state, http.MethodPost, "/session/"+url.PathEscape(sessionID)+"/prompt_async", nil, body, nil)
+	if err != nil {
+		state.mu.Lock()
+		if state.promptGen == gen {
+			state.promptInFlight = false
+		}
+		state.mu.Unlock()
+		return err
+	}
+	// prompt_async returns after accept; completion arrives via session.idle.
+	return nil
 }
 
 func (a *Adapter) subscribeEvents(state *sessionState) {
@@ -430,15 +451,24 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 	case "permission.asked":
 		native.Kind = event.PermissionRequested
 	case "session.idle":
-		native.Kind = event.ResultSubmitted
+		// Freeze current generation result, then emit authoritative ResultSubmitted.
+		// Keep the server alive; Supervisor decides next turn vs terminate.
+		state.mu.Lock()
+		gen := state.promptGen
+		if state.promptInFlight && state.promptGen == gen {
+			state.promptInFlight = false
+		}
+		state.mu.Unlock()
 		if err := a.collectFinal(state); err != nil {
 			state.mu.Lock()
-			state.resultError = err.Error()
+			if gen == state.generation || gen == state.promptGen {
+				state.resultError = err.Error()
+			}
 			state.mu.Unlock()
 			native.Kind = event.TurnFailed
+		} else {
+			native.Kind = event.ResultSubmitted
 		}
-		// Keep the server alive for next-turn delivery (BidirectionalStream).
-		// Supervisor TerminateSession / Worker end owns process teardown.
 	}
 	state.mu.Lock()
 	if state.closed {
@@ -454,7 +484,12 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 		DroppedProgress: &state.droppedProgress,
 	}, native)
 	if value.Type == "session.idle" {
-		state.finishOnce.Do(func() { close(state.resultReady) })
+		state.mu.Lock()
+		if !state.resultSignaled {
+			state.resultSignaled = true
+			close(state.resultReady)
+		}
+		state.mu.Unlock()
 	}
 }
 

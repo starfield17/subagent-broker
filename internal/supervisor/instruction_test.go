@@ -217,24 +217,26 @@ func TestNextTurnFlushDeliversExactlyOnce(t *testing.T) {
 		t.Fatalf("want queued before flush, got %s", got.Status)
 	}
 
-	if err := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary"); err != nil {
-		t.Fatal(err)
+	boundary := service.startNextTurnAtBoundary(context.Background(), "task-a", false)
+	if !boundary.StartedNextTurn || boundary.MessageID != result.MessageID {
+		t.Fatalf("boundary=%+v", boundary)
 	}
 	if len(harness.SentMessages) != 1 || harness.SentMessages[0] != "at boundary" {
 		t.Fatalf("sent=%v", harness.SentMessages)
 	}
 	got, _ = service.router.Get(result.MessageID)
 	if got.Status != message.Delivered || got.DeliveryAttempts != 1 {
-		t.Fatalf("after flush: %+v", got)
+		t.Fatalf("after boundary: %+v", got)
 	}
 	statuses := journalStatuses(t, path)
 	if len(statuses) < 2 || statuses[0] != message.Queued || statuses[len(statuses)-1] != message.Delivered {
 		t.Fatalf("statuses=%v", statuses)
 	}
 
-	// Replay / repeated flush must not re-send.
-	if err := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary"); err != nil {
-		t.Fatal(err)
+	// Replay / repeated boundary must not re-send (already Delivered).
+	boundary2 := service.startNextTurnAtBoundary(context.Background(), "task-a", false)
+	if boundary2.StartedNextTurn {
+		t.Fatal("second boundary must not start another turn with empty queue")
 	}
 	if len(harness.SentMessages) != 1 {
 		t.Fatalf("double-send after replay: %v", harness.SentMessages)
@@ -251,9 +253,9 @@ func TestNextTurnFlushFailureBecomesFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	flushErr := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary")
-	if flushErr == nil {
-		t.Fatal("expected flush error")
+	boundary := service.startNextTurnAtBoundary(context.Background(), "task-a", false)
+	if boundary.StartedNextTurn {
+		t.Fatal("must not claim next turn started on send failure")
 	}
 	got, _ := service.router.Get(result.MessageID)
 	if got.Status != message.Failed || got.Error == "" {
@@ -272,18 +274,39 @@ func TestNextTurnInactiveWithoutResumeFailsExplicitly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Drop active session so flush cannot send.
+	// Drop active session so boundary cannot send.
 	service.mu.Lock()
 	delete(service.active, "task-a")
 	service.mu.Unlock()
 
-	flushErr := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary")
-	if flushErr == nil {
-		t.Fatal("expected explicit failure")
+	boundary := service.startNextTurnAtBoundary(context.Background(), "task-a", false)
+	if boundary.StartedNextTurn {
+		t.Fatal("must not start next turn without active session")
 	}
 	got, _ := service.router.Get(result.MessageID)
 	if got.Status != message.Failed {
 		t.Fatalf("want failed, got %+v", got)
+	}
+}
+
+func TestNextTurnProcessExitedDoesNotSend(t *testing.T) {
+	service, harness, _ := newInstructionService(t, adapter.Capabilities{
+		BidirectionalStream: true, StructuredStream: true,
+	}, true)
+	result, err := service.SendInstruction(context.Background(), "task-a", "too-late")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := service.startNextTurnAtBoundary(context.Background(), "task-a", true)
+	if boundary.StartedNextTurn {
+		t.Fatal("process exited must not start next turn")
+	}
+	if len(harness.SentMessages) != 0 {
+		t.Fatalf("must not send to dead session: %v", harness.SentMessages)
+	}
+	got, _ := service.router.Get(result.MessageID)
+	if got.Status != message.Failed {
+		t.Fatalf("status=%s", got.Status)
 	}
 }
 

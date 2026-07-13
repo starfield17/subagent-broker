@@ -352,6 +352,14 @@ type workerSessionResult struct {
 	Resolution WorkerExitResolution
 }
 
+// TurnBoundaryResult is the outcome of attempting to start a queued next turn
+// after a successful ResultSubmitted. StartedNextTurn is explicit — callers
+// must not infer it from message status alone.
+type TurnBoundaryResult struct {
+	StartedNextTurn bool
+	MessageID       string
+}
+
 // runWorkerSession drains Events/Stderr and observes session.Exited in one select.
 // Process exit is never deferred until after streams close — Exited starts a
 // bounded post-exit drain so hang-open streams cannot stall the driver forever.
@@ -471,11 +479,9 @@ func (s *Service) runWorkerSession(
 						break
 					}
 					s.handleNative(runtime, harness, native, workerID)
+					// Post-exit: never start a next turn; only observe final result.
 					if native.Kind == event.ResultSubmitted {
 						out.ResultSeen = true
-					}
-					if native.Kind == event.TurnFailed {
-						// keep draining; resultSeen stays false
 					}
 				default:
 					goto exitDrainDone
@@ -490,11 +496,29 @@ func (s *Service) runWorkerSession(
 				continue
 			}
 			s.handleNative(runtime, harness, native, workerID)
-			if (native.Kind == event.ResultSubmitted || native.Kind == event.TurnFailed) && !closing {
-				out.ResultSeen = native.Kind == event.ResultSubmitted
+			if closing {
+				continue
+			}
+			switch native.Kind {
+			case event.ResultSubmitted:
+				// Successful turn boundary: optionally start one queued next turn.
+				boundary := s.startNextTurnAtBoundary(workerCtx, string(runtime.Task.TaskID), exitObserved)
+				if boundary.StartedNextTurn {
+					// Keep the session alive; do not treat this result as final.
+					continue
+				}
+				out.ResultSeen = true
 				closing = true
 				if termErr := harness.TerminateSession(context.Background(), session.NativeSessionID); termErr != nil {
 					lastTerm.Errors = append(lastTerm.Errors, "adapter terminate after result: "+termErr.Error())
+				}
+				startBoundedDrain()
+			case event.TurnFailed:
+				// TurnFailed must not launch a queued next turn.
+				out.ResultSeen = false
+				closing = true
+				if termErr := harness.TerminateSession(context.Background(), session.NativeSessionID); termErr != nil {
+					lastTerm.Errors = append(lastTerm.Errors, "adapter terminate after turn failure: "+termErr.Error())
 				}
 				startBoundedDrain()
 			}

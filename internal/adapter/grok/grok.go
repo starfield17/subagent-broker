@@ -47,6 +47,11 @@ type sessionState struct {
 	nextID          int64
 	pending         map[int64]chan rpcMessage
 	serverRequest   map[string]struct{}
+	// Multi-turn generation: only the latest generation may finalize results.
+	generation     uint64
+	promptInFlight bool
+	promptGen      uint64
+	promptRPCID    int64
 }
 
 type rpcMessage struct {
@@ -155,18 +160,12 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 	a.mu.Lock()
 	a.sessions[sessionID] = state
 	a.mu.Unlock()
-	// ACP session/prompt is a long-running request. Keep the session visible to
-	// Supervisor immediately so events, cancellation, and next-turn delivery
-	// remain usable while the prompt is executing.
-	go func() {
-		if err := a.prompt(ctx, state, req.Contract); err != nil {
-			state.mu.Lock()
-			if state.resultError == "" {
-				state.resultError = err.Error()
-			}
-			state.mu.Unlock()
-		}
-	}()
+	// Start the initial prompt without blocking on completion so Supervisor can
+	// consume events/permissions while the turn runs.
+	if err := a.startPrompt(ctx, state, req.Contract); err != nil {
+		_ = p.CloseInput()
+		return adapter.Session{}, err
+	}
 	return sessionFromState(state), nil
 }
 
@@ -175,7 +174,8 @@ func (a *Adapter) SendMessage(ctx context.Context, id, message string) (adapter.
 	if err != nil {
 		return adapter.DeliveryResult{}, err
 	}
-	if err := a.prompt(ctx, state, message); err != nil {
+	// Non-blocking: returns after session/prompt is written, not after turn completion.
+	if err := a.startPrompt(ctx, state, message); err != nil {
 		return adapter.DeliveryResult{}, err
 	}
 	return adapter.DeliveryResult{Mode: adapter.DeliveryNextTurn, MessageID: message}, nil
@@ -313,45 +313,135 @@ func (a *Adapter) SessionConfigFact(req adapter.StartRequest) adapter.SessionCon
 	}
 }
 
-func (a *Adapter) prompt(ctx context.Context, state *sessionState, text string) error {
+// startPrompt writes session/prompt and returns after the request is accepted.
+// Turn completion is finalized asynchronously by waitPromptCompletion.
+func (a *Adapter) startPrompt(ctx context.Context, state *sessionState, text string) error {
 	state.mu.Lock()
-	// Multi-turn: re-arm result signaling if a prior turn already completed.
-	// Keep the ACP process/session alive for later SendMessage (BidirectionalStream).
+	if state.closed {
+		state.mu.Unlock()
+		return fmt.Errorf("Grok session is closed")
+	}
+	if state.promptInFlight {
+		state.mu.Unlock()
+		return fmt.Errorf("Grok prompt already in flight; concurrent SendMessage rejected")
+	}
+	// Re-arm result channel for a new generation after a prior finalization.
 	if state.resultSignaled {
 		state.resultReady = make(chan struct{})
 		state.resultSignaled = false
-		state.output.Reset()
-		state.final = nil
-		state.resultError = ""
 	}
+	state.generation++
+	gen := state.generation
+	state.promptInFlight = true
+	state.promptGen = gen
+	state.output.Reset()
+	// Do not clear final yet — only matching gen may overwrite on completion.
+	state.resultError = ""
 	sessionID := state.acpSessionID
+	state.nextID++
+	rpcID := state.nextID
+	state.promptRPCID = rpcID
+	response := make(chan rpcMessage, 1)
+	state.pending[rpcID] = response
 	state.mu.Unlock()
-	result, err := a.request(ctx, state, "session/prompt", map[string]any{
+
+	params := map[string]any{
 		"sessionId": sessionID,
 		"prompt":    []map[string]string{{"type": "text", "text": text}},
-	})
-	if err != nil {
-		state.mu.Lock()
-		state.resultError = err.Error()
-		state.mu.Unlock()
-		a.signalResult(state)
-		return fmt.Errorf("Grok ACP session/prompt: %w", err)
 	}
-	state.mu.Lock()
-	state.final = []byte(state.output.String())
-	var completion struct {
-		Usage struct {
-			InputTokens  int64   `json:"inputTokens"`
-			OutputTokens int64   `json:"outputTokens"`
-			Cost         float64 `json:"cost"`
-		} `json:"usage"`
+	if err := state.process.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": rpcID, "method": "session/prompt", "params": params}); err != nil {
+		a.clearPromptInFlight(state, gen, rpcID)
+		return fmt.Errorf("Grok ACP session/prompt write: %w", err)
 	}
-	_ = json.Unmarshal(result, &completion)
-	state.usage = adapter.Usage{InputTokens: completion.Usage.InputTokens, OutputTokens: completion.Usage.OutputTokens, Cost: completion.Usage.Cost, Currency: "USD"}
-	state.mu.Unlock()
-	a.signalResult(state)
-	// Do not close stdin: multi-turn SendMessage requires a live ACP session.
+	// Completion phase runs async; SendMessage returns before turn completion.
+	go a.waitPromptCompletion(ctx, state, gen, rpcID, response)
 	return nil
+}
+
+func (a *Adapter) clearPromptInFlight(state *sessionState, gen uint64, rpcID int64) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.promptGen == gen {
+		state.promptInFlight = false
+	}
+	if waiter := state.pending[rpcID]; waiter != nil {
+		delete(state.pending, rpcID)
+	}
+}
+
+func (a *Adapter) waitPromptCompletion(ctx context.Context, state *sessionState, gen uint64, rpcID int64, response <-chan rpcMessage) {
+	select {
+	case message := <-response:
+		// Clear in-flight before emitting ResultSubmitted so a Supervisor-driven
+		// next SendMessage is not rejected as concurrent.
+		a.clearPromptInFlight(state, gen, rpcID)
+		// Only the matching generation may finalize authoritative results.
+		state.mu.Lock()
+		if gen != state.generation {
+			state.mu.Unlock()
+			return
+		}
+		if len(message.Error) > 0 && string(message.Error) != "null" {
+			state.resultError = string(message.Error)
+			state.mu.Unlock()
+			a.finalizeGeneration(state, gen, false)
+			return
+		}
+		state.final = []byte(state.output.String())
+		var completion struct {
+			Usage struct {
+				InputTokens  int64   `json:"inputTokens"`
+				OutputTokens int64   `json:"outputTokens"`
+				Cost         float64 `json:"cost"`
+			} `json:"usage"`
+		}
+		_ = json.Unmarshal(message.Result, &completion)
+		state.usage = adapter.Usage{
+			InputTokens: completion.Usage.InputTokens, OutputTokens: completion.Usage.OutputTokens,
+			Cost: completion.Usage.Cost, Currency: "USD",
+		}
+		state.mu.Unlock()
+		a.finalizeGeneration(state, gen, true)
+	case <-ctx.Done():
+		a.clearPromptInFlight(state, gen, rpcID)
+		state.mu.Lock()
+		if gen == state.generation && state.resultError == "" {
+			state.resultError = ctx.Err().Error()
+		}
+		state.mu.Unlock()
+		a.finalizeGeneration(state, gen, false)
+	case <-state.shutdown:
+		a.clearPromptInFlight(state, gen, rpcID)
+		state.mu.Lock()
+		if gen == state.generation && state.resultError == "" {
+			state.resultError = "session shutdown"
+		}
+		state.mu.Unlock()
+		a.finalizeGeneration(state, gen, false)
+	}
+}
+
+// finalizeGeneration emits exactly one authoritative ResultSubmitted or TurnFailed
+// for gen and signals CollectFinalResult. Stale generations are ignored.
+func (a *Adapter) finalizeGeneration(state *sessionState, gen uint64, success bool) {
+	state.mu.Lock()
+	if gen != state.generation {
+		state.mu.Unlock()
+		return
+	}
+	// Snapshot under lock; emit after unlock.
+	payload := json.RawMessage(`{}`)
+	if !success && state.resultError != "" {
+		payload, _ = json.Marshal(map[string]string{"error": state.resultError})
+	}
+	state.mu.Unlock()
+
+	kind := event.ResultSubmitted
+	if !success {
+		kind = event.TurnFailed
+	}
+	a.recordEvent(state, adapter.NativeEvent{Kind: kind, Timestamp: time.Now().UTC(), Payload: payload})
+	a.signalResult(state)
 }
 
 func (a *Adapter) signalResult(state *sessionState) {
@@ -384,6 +474,9 @@ func (a *Adapter) request(ctx context.Context, state *sessionState, method strin
 	case <-ctx.Done():
 		a.removePending(state, id)
 		return nil, ctx.Err()
+	case <-state.shutdown:
+		a.removePending(state, id)
+		return nil, fmt.Errorf("session shutdown")
 	}
 }
 
@@ -484,7 +577,9 @@ func (a *Adapter) handleLine(state *sessionState, line []byte) {
 	case "session/prompt_started":
 		kind = event.TurnStarted
 	case "session/prompt_completed":
-		kind = event.ResultSubmitted
+		// Notification is informational only. Authoritative ResultSubmitted is
+		// emitted when the matching session/prompt JSON-RPC response arrives.
+		kind = event.TurnCompleted
 	case "session/cancelled":
 		kind = event.TurnFailed
 	}

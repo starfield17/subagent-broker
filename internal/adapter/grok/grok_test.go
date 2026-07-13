@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
+	"github.com/vnai/subagent-broker/internal/event"
 )
 
 func TestACPSessionContract(t *testing.T) {
@@ -126,6 +127,172 @@ done
 	}
 	if result.Summary != "turn-2" {
 		t.Fatalf("summary=%q want turn-2", result.Summary)
+	}
+}
+
+func TestSendMessageReturnsBeforePromptResponse(t *testing.T) {
+	// Fixture: first turn completes immediately; second turn delays the RPC response.
+	script := writeExecutable(t, `#!/bin/sh
+n=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}' ;;
+    *'"method":"authenticate"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
+    *'"method":"session/new"'*) echo '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"session-async"}}' ;;
+    *'"method":"session/prompt"'*)
+      n=$((n+1))
+      if [ "$n" -eq 1 ]; then
+        echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-async","update":{"sessionUpdate":"agent_message_chunk","delta":"{\"schema_version\":\"v1alpha1\",\"task_id\":\"t\",\"worker_id\":\"w\",\"status\":\"succeeded\",\"summary\":\"turn-1\",\"work_completed\":[\"done\"],\"files_changed\":[],\"no_files_changed_reason\":\"fixture\",\"validation\":[{\"command\":\"fixture\",\"passed\":true}],\"remaining_work\":[],\"blocking_issues\":[],\"risks\":[],\"handoff_notes\":[]}"}}}'
+        echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+      else
+        echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-async","update":{"sessionUpdate":"agent_message_chunk","delta":"partial-second"}}}'
+        sleep 0.3
+        echo '{"jsonrpc":"2.0","method":"session/prompt_completed","params":{}}'
+        echo '{"jsonrpc":"2.0","id":5,"result":{}}'
+      fi
+      ;;
+  esac
+done
+`)
+	a := New(script)
+	session, err := a.StartSession(context.Background(), adapter.StartRequest{
+		RunID: "r", TaskID: "t", WorkerID: "w", ProjectRoot: t.TempDir(), Contract: "first",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.CollectFinalResult(ctx, session.NativeSessionID); err != nil {
+		t.Fatal(err)
+	}
+	// Drain residual first-turn events so we observe second-turn traffic.
+	drainDeadline := time.After(200 * time.Millisecond)
+drain:
+	for {
+		select {
+		case <-session.Events:
+		case <-drainDeadline:
+			break drain
+		}
+	}
+	started := time.Now()
+	if _, err := a.SendMessage(ctx, session.NativeSessionID, "second"); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > 150*time.Millisecond {
+		t.Fatalf("SendMessage blocked on prompt completion: %s", time.Since(started))
+	}
+	// Events remain readable while prompt response is pending.
+	deadline := time.After(2 * time.Second)
+	sawProgress := false
+	for !sawProgress {
+		select {
+		case native := <-session.Events:
+			if native.Kind == event.ModelOutputDelta || native.Kind == event.TurnCompleted || native.Kind == event.ResultSubmitted {
+				sawProgress = true
+			}
+		case <-deadline:
+			t.Fatal("no events while prompt pending")
+		}
+	}
+}
+
+func TestPromptCompletedNotificationIsNotAuthoritativeResult(t *testing.T) {
+	// Emit prompt_completed without the matching RPC response; must not finalize.
+	script := writeExecutable(t, `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}' ;;
+    *'"method":"authenticate"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
+    *'"method":"session/new"'*) echo '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"session-notify"}}' ;;
+    *'"method":"session/prompt"'*)
+      echo '{"jsonrpc":"2.0","method":"session/prompt_completed","params":{}}'
+      # Hold the RPC response until later.
+      sleep 0.2
+      echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-notify","update":{"sessionUpdate":"agent_message_chunk","delta":"{\"schema_version\":\"v1alpha1\",\"task_id\":\"t\",\"worker_id\":\"w\",\"status\":\"succeeded\",\"summary\":\"authoritative\",\"work_completed\":[\"done\"],\"files_changed\":[],\"no_files_changed_reason\":\"fixture\",\"validation\":[{\"command\":\"fixture\",\"passed\":true}],\"remaining_work\":[],\"blocking_issues\":[],\"risks\":[],\"handoff_notes\":[]}"}}}'
+      echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+      ;;
+  esac
+done
+`)
+	a := New(script)
+	session, err := a.StartSession(context.Background(), adapter.StartRequest{
+		RunID: "r", TaskID: "t", WorkerID: "w", ProjectRoot: t.TempDir(), Contract: "first",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First event after start should be TurnCompleted (notification), not ResultSubmitted.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sawTurnCompleted := false
+	sawResult := false
+	for {
+		select {
+		case native := <-session.Events:
+			if native.Kind == event.TurnCompleted {
+				sawTurnCompleted = true
+			}
+			if native.Kind == event.ResultSubmitted {
+				sawResult = true
+				goto done
+			}
+		case <-ctx.Done():
+			goto done
+		}
+	}
+done:
+	if !sawTurnCompleted {
+		t.Fatal("expected TurnCompleted from prompt_completed notification")
+	}
+	if !sawResult {
+		// May still arrive; CollectFinalResult waits for authoritative path.
+	}
+	result, err := a.CollectFinalResult(context.Background(), session.NativeSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary != "authoritative" {
+		t.Fatalf("summary=%q", result.Summary)
+	}
+}
+
+func TestConcurrentSendMessageRejected(t *testing.T) {
+	script := writeExecutable(t, `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}' ;;
+    *'"method":"authenticate"'*) echo '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
+    *'"method":"session/new"'*) echo '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"session-conc"}}' ;;
+    *'"method":"session/prompt"'*)
+      sleep 1
+      case "$line" in
+        *'"id":4'*) echo '{"jsonrpc":"2.0","id":4,"result":{}}' ;;
+        *'"id":5'*) echo '{"jsonrpc":"2.0","id":5,"result":{}}' ;;
+        *) echo '{"jsonrpc":"2.0","id":4,"result":{}}' ;;
+      esac
+      ;;
+  esac
+done
+`)
+	a := New(script)
+	session, err := a.StartSession(context.Background(), adapter.StartRequest{
+		RunID: "r", TaskID: "t", WorkerID: "w", ProjectRoot: t.TempDir(), Contract: "first",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Initial prompt is in flight; concurrent SendMessage must fail.
+	time.Sleep(20 * time.Millisecond)
+	err = nil
+	if _, err2 := a.SendMessage(context.Background(), session.NativeSessionID, "overlap"); err2 == nil {
+		t.Fatal("expected concurrent SendMessage rejection")
+	} else {
+		err = err2
+	}
+	if err == nil {
+		t.Fatal("expected error")
 	}
 }
 
