@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -1044,9 +1043,9 @@ func sendCommand(args []string) error {
 		return err
 	}
 	if *taskID != "" && *textValue != "" && *messageID == "" {
-		response, err := callSupervisor(runDir, "send", map[string]any{"task_id": *taskID, "text": *textValue})
+		response, err := cliread.CallIPC(runDir, "send", map[string]any{"task_id": *taskID, "text": *textValue})
 		if err != nil {
-			return err
+			return clioutcome.New(clioutcome.ExitCommunication, "send", "Supervisor IPC unavailable; send was not delivered", err)
 		}
 		if !response.OK {
 			return clioutcome.New(clioutcome.ExitFailed, "send", response.Error, nil)
@@ -1078,9 +1077,9 @@ func sendCommand(args []string) error {
 			return fmt.Errorf("--deny requires --reason")
 		}
 	}
-	response, err := callSupervisor(runDir, "resolve_message", map[string]any{"message_id": *messageID, "resolution": resolution})
+	response, err := cliread.CallIPC(runDir, "resolve_message", map[string]any{"message_id": *messageID, "resolution": resolution})
 	if err != nil {
-		return err
+		return clioutcome.New(clioutcome.ExitCommunication, "send", "Supervisor IPC unavailable; message was not resolved", err)
 	}
 	if !response.OK {
 		return clioutcome.New(clioutcome.ExitFailed, "send", response.Error, nil)
@@ -1114,9 +1113,9 @@ func cancelCommand(args []string) error {
 	if targets > 1 {
 		return fmt.Errorf("cancel accepts at most one of --task, --worker, or --wave")
 	}
-	response, err := callSupervisor(runDir, "cancel", map[string]string{"task_id": *taskID, "worker_id": *workerID, "wave_id": *waveID})
+	response, err := cliread.CallIPC(runDir, "cancel", map[string]string{"task_id": *taskID, "worker_id": *workerID, "wave_id": *waveID})
 	if err != nil {
-		return err
+		return clioutcome.New(clioutcome.ExitCommunication, "cancel", "Supervisor IPC unavailable; cancel was not delivered", err)
 	}
 	if !response.OK {
 		return clioutcome.New(clioutcome.ExitFailed, "cancel", response.Error, nil)
@@ -1334,34 +1333,6 @@ func waitForSocket(runDir string, timeout time.Duration) error {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return fmt.Errorf("Supervisor socket did not become ready: %s", socketPath)
-}
-
-func callSupervisor(runDir, method string, params any) (supervisor.Response, error) {
-	path := supervisor.SocketPath(runDir)
-	conn, err := net.DialTimeout("unix", path, 2*time.Second)
-	if err != nil {
-		return supervisor.Response{}, clioutcome.New(clioutcome.ExitCommunication, "ipc", "supervisor socket dial failed", err)
-	}
-	defer conn.Close()
-	runValue, err := readRun(runDir)
-	if err != nil {
-		return supervisor.Response{}, clioutcome.New(clioutcome.ExitNotFound, "ipc", "run metadata not found", err)
-	}
-	request := supervisor.Request{SchemaVersion: supervisor.SchemaVersion, RequestID: fmt.Sprintf("request-%d", time.Now().UnixNano()), RunID: string(runValue.RunID), Method: method}
-	if params != nil {
-		request.Params, err = json.Marshal(params)
-		if err != nil {
-			return supervisor.Response{}, err
-		}
-	}
-	if err := json.NewEncoder(conn).Encode(request); err != nil {
-		return supervisor.Response{}, clioutcome.New(clioutcome.ExitCommunication, "ipc", "supervisor request encode failed", err)
-	}
-	var response supervisor.Response
-	if err := json.NewDecoder(conn).Decode(&response); err != nil {
-		return supervisor.Response{}, clioutcome.New(clioutcome.ExitCommunication, "ipc", "supervisor response decode failed", err)
-	}
-	return response, nil
 }
 
 func readRun(runDir string) (domain.Run, error) {

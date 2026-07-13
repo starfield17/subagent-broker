@@ -89,6 +89,61 @@ type sseEvent struct {
 	Properties json.RawMessage `json:"properties"`
 }
 
+// openCodeMessage is the canonical OpenCode session message shape.
+// Message identity and session ownership live under info, never top-level id.
+type openCodeMessage struct {
+	Info struct {
+		ID        string `json:"id"`
+		SessionID string `json:"sessionID"`
+		Role      string `json:"role"`
+		Tokens    struct {
+			Input     int64 `json:"input"`
+			Output    int64 `json:"output"`
+			Reasoning int64 `json:"reasoning"`
+			Cache     struct {
+				Read  int64 `json:"read"`
+				Write int64 `json:"write"`
+			} `json:"cache"`
+		} `json:"tokens"`
+		Cost float64 `json:"cost"`
+	} `json:"info"`
+	Parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"parts"`
+}
+
+// Typed SSE property shapes for session-scoped OpenCode events.
+type openCodeSessionEvent struct {
+	SessionID string `json:"sessionID"`
+}
+
+type openCodeSessionStatusEvent struct {
+	SessionID string `json:"sessionID"`
+	Status    struct {
+		Type string `json:"type"`
+	} `json:"status"`
+}
+
+type openCodeMessageUpdatedEvent struct {
+	SessionID string          `json:"sessionID"`
+	Info      json.RawMessage `json:"info"`
+}
+
+type openCodePartUpdatedEvent struct {
+	SessionID string          `json:"sessionID"`
+	Part      json.RawMessage `json:"part"`
+}
+
+// errOpenCodeContract is a stable provenance/protocol contract failure.
+type errOpenCodeContract struct {
+	reason string
+}
+
+func (e *errOpenCodeContract) Error() string {
+	return "OpenCode protocol contract: " + e.reason
+}
+
 func New(executable string) *Adapter {
 	if strings.TrimSpace(executable) == "" {
 		executable = "opencode"
@@ -502,20 +557,36 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 }
 
 // captureMessageIDs returns the set of existing message IDs at prompt start.
+// Every returned message must carry non-empty info.id and info.sessionID matching
+// the active session. Malformed messages fail closed — never silently skipped.
+// An empty response array is valid and authoritative (first-turn baseline).
 func (a *Adapter) captureMessageIDs(ctx context.Context, state *sessionState) (map[string]struct{}, error) {
-	var messages []struct {
-		ID string `json:"id"`
-	}
+	var messages []openCodeMessage
 	if err := a.requestJSON(ctx, state, http.MethodGet, "/session/"+url.PathEscape(state.sessionID)+"/message", nil, nil, &messages); err != nil {
 		return nil, err
 	}
 	set := make(map[string]struct{}, len(messages))
 	for _, m := range messages {
-		if m.ID != "" {
-			set[m.ID] = struct{}{}
+		if err := validateOpenCodeMessage(m, state.sessionID); err != nil {
+			return nil, err
 		}
+		set[m.Info.ID] = struct{}{}
 	}
 	return set, nil
+}
+
+// validateOpenCodeMessage enforces the real {info, parts} ownership contract.
+func validateOpenCodeMessage(m openCodeMessage, sessionID string) error {
+	if strings.TrimSpace(m.Info.ID) == "" {
+		return &errOpenCodeContract{reason: "message info.id is required"}
+	}
+	if strings.TrimSpace(m.Info.SessionID) == "" {
+		return &errOpenCodeContract{reason: "message info.sessionID is required"}
+	}
+	if m.Info.SessionID != sessionID {
+		return &errOpenCodeContract{reason: "message info.sessionID does not match active session"}
+	}
+	return nil
 }
 
 func (a *Adapter) subscribeEvents(state *sessionState) {
@@ -573,9 +644,19 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 	native := adapter.NativeEvent{Kind: "opencode." + value.Type, Timestamp: now, Payload: value.Properties}
 	publish := true
 	switch value.Type {
-	case "server.connected", "session.created":
+	case "server.connected":
+		// Global server event — unscoped.
 		native.Kind = event.SessionStarted
-	case "message.part.updated", "message.updated":
+	case "session.created":
+		// Session-scoped create: require matching session when present.
+		if !a.eventSessionMatches(state, value.Properties) {
+			return
+		}
+		native.Kind = event.SessionStarted
+	case "message.part.updated", "message.part.delta", "message.updated":
+		if !a.eventSessionMatches(state, value.Properties) {
+			return
+		}
 		native.Kind = event.ModelOutputDelta
 		// Mark current-generation activity only for the in-flight turn.
 		state.mu.Lock()
@@ -584,9 +665,22 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 		}
 		state.mu.Unlock()
 	case "permission.asked":
+		// Permission events are not turn-ownership events. When sessionID is
+		// present it must match; when absent (legacy fixtures), still publish.
+		if sessionIDFromProps(value.Properties) != "" && !a.eventSessionMatches(state, value.Properties) {
+			return
+		}
 		native.Kind = event.PermissionRequested
+	case "session.status":
+		publish = a.handleSessionStatus(state, value.Properties, &native)
 	case "session.idle":
+		// Deprecated idle event — same handler after session correlation.
+		if !a.eventSessionMatches(state, value.Properties) {
+			return
+		}
 		publish = a.handleSessionIdle(state, &native)
+	case "session.error":
+		publish = a.handleSessionError(state, value.Properties, &native)
 	}
 	if !publish {
 		return
@@ -597,6 +691,95 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 	if state.stream != nil {
 		_ = state.stream.Publish(native)
 	}
+}
+
+// eventSessionMatches requires properties.sessionID == state.sessionID.
+// Missing sessionID on a session-scoped event is a contract violation and is ignored.
+func (a *Adapter) eventSessionMatches(state *sessionState, properties json.RawMessage) bool {
+	sid := sessionIDFromProps(properties)
+	if sid == "" {
+		return false
+	}
+	state.mu.Lock()
+	active := state.sessionID
+	state.mu.Unlock()
+	return sid == active
+}
+
+func sessionIDFromProps(properties json.RawMessage) string {
+	var props openCodeSessionEvent
+	if len(properties) == 0 || json.Unmarshal(properties, &props) != nil {
+		return ""
+	}
+	return strings.TrimSpace(props.SessionID)
+}
+
+// handleSessionStatus processes current OpenCode session.status events.
+// status.type=="idle" completes via handleSessionIdle; busy/retry mark activity only.
+func (a *Adapter) handleSessionStatus(state *sessionState, properties json.RawMessage, native *adapter.NativeEvent) bool {
+	var props openCodeSessionStatusEvent
+	if len(properties) == 0 || json.Unmarshal(properties, &props) != nil {
+		return false
+	}
+	if strings.TrimSpace(props.SessionID) == "" {
+		return false
+	}
+	state.mu.Lock()
+	active := state.sessionID
+	inFlight := state.promptInFlight
+	turn := state.currentTurn
+	state.mu.Unlock()
+	if props.SessionID != active {
+		return false
+	}
+	switch props.Status.Type {
+	case "idle":
+		return a.handleSessionIdle(state, native)
+	case "busy", "retry":
+		if inFlight && turn != nil && !turn.completed {
+			state.mu.Lock()
+			if state.promptInFlight && state.currentTurn != nil && !state.currentTurn.completed {
+				state.currentTurn.sawCurrentActivity = true
+			}
+			state.mu.Unlock()
+		}
+		return true
+	default:
+		// Unknown status values must not complete the turn.
+		return true
+	}
+}
+
+// handleSessionError fails the current in-flight generation exactly once when
+// sessionID matches. Error text is redacted/stable — no provider payloads.
+func (a *Adapter) handleSessionError(state *sessionState, properties json.RawMessage, native *adapter.NativeEvent) bool {
+	var props openCodeSessionEvent
+	if len(properties) == 0 || json.Unmarshal(properties, &props) != nil {
+		return false
+	}
+	if strings.TrimSpace(props.SessionID) == "" {
+		// No session ID: do not attribute to the active turn.
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if props.SessionID != state.sessionID {
+		return false
+	}
+	turn := state.currentTurn
+	gen := state.promptGen
+	if !state.promptInFlight || turn == nil || turn.completed || turn.generation != gen {
+		return false
+	}
+	turn.resultErr = "OpenCode session error"
+	turn.success = false
+	turn.completed = true
+	state.promptInFlight = false
+	state.resultError = turn.resultErr
+	turn.once.Do(func() { close(turn.ready) })
+	state.resultSignaled = true
+	native.Kind = event.TurnFailed
+	return true
 }
 
 // handleSessionIdle implements the production current-turn idle path.
@@ -678,10 +861,17 @@ func (a *Adapter) handleSessionIdle(state *sessionState, native *adapter.NativeE
 	return false
 }
 
-// collectFinal is retained only as a narrowly named test utility for fixtures
-// that inject final state without promptAsync. Production idle uses collectFinalTurn.
-func (a *Adapter) collectFinal(state *sessionState) error {
-	result, err := a.collectFinalTurn(state, nil)
+// collectFinalTestOnly is a legacy test utility for fixtures that inject final
+// state without promptAsync. Production idle must use collectFinalTurn with a
+// non-nil turn. Still parses the real {info, parts} message schema.
+func (a *Adapter) collectFinalTestOnly(state *sessionState) error {
+	// Build a synthetic turn with empty authoritative baseline so first-turn
+	// semantics apply without whole-history fallback.
+	turn := &ocTurnResult{
+		baselineCaptured:   true,
+		baselineMessageIDs: map[string]struct{}{},
+	}
+	result, err := a.collectFinalTurn(state, turn)
 	if err != nil {
 		return err
 	}
@@ -696,42 +886,35 @@ func (a *Adapter) collectFinal(state *sessionState) error {
 }
 
 // collectFinalTurn scans messages attributable to the captured turn only.
-// When turn is non-nil and baselineCaptured, filtering uses baselineMessageIDs
-// even when the map is empty (authoritative first-turn boundary).
-// When turn is nil (test utility only), scans newest→oldest without provenance.
-// Does not mutate global session state; returns a generation-specific result.
+// Production calls must pass a non-nil turn with baselineCaptured==true.
+// Filtering uses message.Info.ID against baselineMessageIDs even when the map
+// is empty (authoritative first-turn boundary). Does not use map length as
+// proof of capture. Does not mutate global session state.
 func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) (collectedTurnResult, error) {
-	var messages []struct {
-		Info struct {
-			Role   string `json:"role"`
-			Tokens struct {
-				Input  int64 `json:"input"`
-				Output int64 `json:"output"`
-			} `json:"tokens"`
-			Cost float64 `json:"cost"`
-		} `json:"info"`
-		Parts []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"parts"`
-		ID string `json:"id"`
+	if turn == nil {
+		return collectedTurnResult{}, fmt.Errorf("OpenCode: collectFinalTurn requires a non-nil turn")
 	}
+	if !turn.baselineCaptured {
+		return collectedTurnResult{}, fmt.Errorf("OpenCode: collectFinalTurn requires baselineCaptured")
+	}
+	var messages []openCodeMessage
 	if err := a.requestJSON(context.Background(), state, http.MethodGet, "/session/"+url.PathEscape(state.sessionID)+"/message", nil, nil, &messages); err != nil {
 		return collectedTurnResult{}, err
 	}
 
-	filterBaseline := turn != nil && turn.baselineCaptured
 	var firstInvalid []byte
 	var firstInvalidUsage adapter.Usage
 	for i := len(messages) - 1; i >= 0; i-- {
 		message := messages[i]
+		// Validate ownership before examining result contents.
+		if err := validateOpenCodeMessage(message, state.sessionID); err != nil {
+			return collectedTurnResult{}, err
+		}
 		if message.Info.Role != "assistant" {
 			continue
 		}
-		if filterBaseline {
-			if _, existed := turn.baselineMessageIDs[message.ID]; existed {
-				continue
-			}
+		if _, existed := turn.baselineMessageIDs[message.Info.ID]; existed {
+			continue
 		}
 		var text strings.Builder
 		for _, part := range message.Parts {
@@ -759,20 +942,13 @@ func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) (col
 			Final: raw, Usage: usage, SawActivity: true, HasEnvelope: true,
 		}, nil
 	}
-	if filterBaseline {
-		if firstInvalid != nil {
-			return collectedTurnResult{
-				Final: firstInvalid, Usage: firstInvalidUsage,
-				SawActivity: true, InvalidOutput: true,
-			}, nil
-		}
-		// No attributable current-turn assistant output.
-		return collectedTurnResult{}, nil
-	}
-	// Test-utility path without turn provenance.
 	if firstInvalid != nil {
-		return collectedTurnResult{InvalidOutput: true, SawActivity: true}, nil
+		return collectedTurnResult{
+			Final: firstInvalid, Usage: firstInvalidUsage,
+			SawActivity: true, InvalidOutput: true,
+		}, nil
 	}
+	// No attributable current-turn assistant output.
 	return collectedTurnResult{}, nil
 }
 

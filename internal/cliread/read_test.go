@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,6 +120,80 @@ func TestWaitReturnsTerminalDiskResultWithoutSupervisor(t *testing.T) {
 	view, err := Wait(runDir, supervisor.WaitParams{For: "run"})
 	if err != nil || !view.Matched || view.Meta.Source != ReadSourceDisk || !view.Meta.Degraded {
 		t.Fatalf("expected terminal disk result, view=%+v err=%v", view, err)
+	}
+}
+
+func TestCallIPCControlCredentialMissingFailsClosed(t *testing.T) {
+	runDir := t.TempDir()
+	identity, err := process.Inspect(context.Background(), os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runValue := domain.Run{RunID: "run-1", ProjectID: "project-1", SupervisorIdentity: &domain.SupervisorIdentity{PID: identity.PID, ProcessStartToken: identity.StartToken}}
+	if err := writeJSON(filepath.Join(runDir, "run.json"), runValue); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(runDir, "state.json"), supervisor.Snapshot{SchemaVersion: supervisor.SchemaVersion, Run: runValue}); err != nil {
+		t.Fatal(err)
+	}
+	listener, endpoint := listenSocket(t, runDir)
+	// listenSocket writes a token — remove it to simulate missing credential.
+	_ = os.Remove(supervisor.ControlTokenPath(runDir))
+	runValue.SupervisorIdentity.IPCEndpoint = endpoint
+	if err := writeJSON(filepath.Join(runDir, "run.json"), runValue); err != nil {
+		t.Fatal(err)
+	}
+	// Server must not receive a request when CLI fails closed.
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		accepted <- struct{}{}
+	}()
+	_, err = CallIPC(runDir, "ping", nil)
+	if !errors.Is(err, ErrControlCredentialUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+	if strings.Contains(err.Error(), "auth.token") || strings.Contains(err.Error(), runDir) {
+		// Path may appear in some OS errors; category must remain stable.
+		if !strings.Contains(err.Error(), "control credential unavailable") {
+			t.Fatalf("unexpected error form: %v", err)
+		}
+	}
+	select {
+	case <-accepted:
+		t.Fatal("must not dial/send when control credential missing")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestCallIPCControlCredentialEmptyFailsClosed(t *testing.T) {
+	runDir := t.TempDir()
+	identity, err := process.Inspect(context.Background(), os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runValue := domain.Run{RunID: "run-1", ProjectID: "project-1", SupervisorIdentity: &domain.SupervisorIdentity{PID: identity.PID, ProcessStartToken: identity.StartToken}}
+	if err := writeJSON(filepath.Join(runDir, "run.json"), runValue); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(runDir, "state.json"), supervisor.Snapshot{SchemaVersion: supervisor.SchemaVersion, Run: runValue}); err != nil {
+		t.Fatal(err)
+	}
+	_, endpoint := listenSocket(t, runDir)
+	if err := os.WriteFile(supervisor.ControlTokenPath(runDir), []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runValue.SupervisorIdentity.IPCEndpoint = endpoint
+	if err := writeJSON(filepath.Join(runDir, "run.json"), runValue); err != nil {
+		t.Fatal(err)
+	}
+	_, err = CallIPC(runDir, "cancel", map[string]string{})
+	if !errors.Is(err, ErrControlCredentialUnavailable) {
+		t.Fatalf("err=%v", err)
 	}
 }
 

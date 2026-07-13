@@ -59,6 +59,20 @@ jobs:
         timeout-minutes: 10
         run: go test -race ./internal/adapter/opencode -run 'Test.*Turn|Test.*Idle|Test.*Historical|Test.*Baseline|TestEmpty|TestStale|TestDuplicate|TestOld' -count=20
 
+      - name: Authenticated control CLI regressions
+        timeout-minutes: 10
+        run: |
+          go test -race ./cmd/subagent-broker \
+            -run 'Test.*Authenticated.*Send|Test.*Authenticated.*Cancel|Test.*ControlCredential' \
+            -count=50
+
+      - name: OpenCode real protocol contract regressions
+        timeout-minutes: 10
+        run: |
+          go test -race ./internal/adapter/opencode \
+            -run 'Test.*RealSchema|Test.*Historical|Test.*SessionCorrelation|Test.*SessionStatus|Test.*SessionError|Test.*Generation' \
+            -count=100
+
       - name: Codex terminal-boundary regressions
         timeout-minutes: 10
         run: go test -race ./internal/adapter/codex -run 'TestAppServerSessionContract|TestCodexTerminal|TestCodexUnexpectedEOF' -count=100
