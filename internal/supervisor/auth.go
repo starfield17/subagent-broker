@@ -66,6 +66,7 @@ type WorkerCredentialBinding struct {
 	AttemptNumber   int
 	NativeSessionID string
 	Revoked         bool
+	Bound           bool // true when activated against a real native session
 }
 
 // AuthState holds control and worker credentials for one Supervisor process.
@@ -178,6 +179,38 @@ func (a *AuthState) IssueWorkerCredential(runID, taskID, workerID string, attemp
 	a.byAttempt[key] = h
 	a.mu.Unlock()
 	return token, nil
+}
+
+// BindWorkerSession activates a provisional Worker credential against a real
+// native session. The session ID must be non-empty and cannot change once bound.
+// Revoked credentials cannot be rebound. Wrong task/worker/attempt is rejected.
+func (a *AuthState) BindWorkerSession(token, nativeSessionID string) error {
+	if strings.TrimSpace(nativeSessionID) == "" {
+		return fmt.Errorf("native session id is required for credential binding")
+	}
+	if token == "" {
+		return fmt.Errorf("token is required for credential binding")
+	}
+	h := hashToken(token)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	b := a.workers[h]
+	if b == nil {
+		return fmt.Errorf("credential not found")
+	}
+	if b.Revoked {
+		return fmt.Errorf("credential has been revoked")
+	}
+	if b.Bound {
+		if b.NativeSessionID != nativeSessionID {
+			return fmt.Errorf("credential already bound to session %q; cannot rebind to %q",
+				b.NativeSessionID, nativeSessionID)
+		}
+		return nil // already bound to same session
+	}
+	b.NativeSessionID = nativeSessionID
+	b.Bound = true
+	return nil
 }
 
 // RevokeWorkerAttempt invalidates credentials for a Task/Worker/attempt.

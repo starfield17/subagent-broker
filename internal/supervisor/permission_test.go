@@ -61,7 +61,7 @@ func newNativePermissionService(t *testing.T, harness adapter.Adapter) *Service 
 		messages:         store,
 		messageIndex:     map[string]message.Message{},
 		router:           router,
-		pending:          map[string]chan message.Resolution{},
+		pending:          map[string]*pendingWaiter{},
 		active:           map[string]activeWorker{},
 		acceptingWork:    true,
 		fatalPersistence: make(chan error, 1),

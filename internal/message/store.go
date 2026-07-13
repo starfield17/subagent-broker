@@ -268,10 +268,10 @@ func validateMessageStatusFields(value Message) error {
 			return fmt.Errorf("status %s must not carry resolution", value.Status)
 		}
 	case Queued:
-		// Native permission decisions may freeze Resolution while remaining
-		// non-terminal Queued until Adapter.RespondPermission succeeds.
+		// Decision types may freeze Resolution while remaining non-terminal Queued
+		// until the side effect (delivery, scope expansion) completes.
 		// Other types must not carry resolution before Answered.
-		if len(value.Resolution) > 0 && value.Type != PermissionRequest {
+		if len(value.Resolution) > 0 && !IsDecisionType(value.Type) {
 			return fmt.Errorf("status queued must not carry resolution for type %s", value.Type)
 		}
 	case Answered:

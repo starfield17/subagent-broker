@@ -60,14 +60,17 @@ type sessionState struct {
 
 // ocTurnResult is generation-specific OpenCode completion state.
 type ocTurnResult struct {
-	generation uint64
-	ready      chan struct{}
-	completed  bool
-	success    bool
-	final      []byte
-	resultErr  string
-	usage      adapter.Usage
-	once       sync.Once
+	generation         uint64
+	ready              chan struct{}
+	baselineMessageIDs map[string]struct{}
+	promptMessageID    string
+	sawCurrentActivity bool
+	completed          bool
+	success            bool
+	final              []byte
+	resultErr          string
+	usage              adapter.Usage
+	once               sync.Once
 }
 
 type sseEvent struct {
@@ -424,7 +427,10 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 	// New generation with independent readiness — never re-arm a prior channel.
 	state.generation++
 	gen := state.generation
-	turn := &ocTurnResult{generation: gen, ready: make(chan struct{})}
+	turn := &ocTurnResult{
+		generation: gen,
+		ready:      make(chan struct{}),
+	}
 	state.currentTurn = turn
 	state.promptInFlight = true
 	state.promptGen = gen
@@ -434,6 +440,15 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 	sessionID := state.sessionID
 	state.mu.Unlock()
 
+	// Capture baseline message IDs so collectFinal can attribute messages to this turn.
+	if baseline, err := a.captureMessageIDs(ctx, state); err == nil {
+		state.mu.Lock()
+		if turn.generation == gen {
+			turn.baselineMessageIDs = baseline
+		}
+		state.mu.Unlock()
+	}
+
 	parts := []map[string]string{{"type": "text", "text": req.Contract}}
 	body := map[string]any{"parts": parts}
 	if req.Model != "" {
@@ -442,7 +457,11 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 			body["model"] = map[string]string{"providerID": pieces[0], "modelID": pieces[1]}
 		}
 	}
-	err := a.requestJSON(ctx, state, http.MethodPost, "/session/"+url.PathEscape(sessionID)+"/prompt_async", nil, body, nil)
+	// prompt_async may return a prompt/message ID; capture it.
+	var promptResponse struct {
+		ID string `json:"id"`
+	}
+	err := a.requestJSON(ctx, state, http.MethodPost, "/session/"+url.PathEscape(sessionID)+"/prompt_async", nil, body, &promptResponse)
 	if err != nil {
 		state.mu.Lock()
 		if state.promptGen == gen {
@@ -451,8 +470,31 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 		state.mu.Unlock()
 		return err
 	}
+	// Store the prompt message ID for turn attribution.
+	state.mu.Lock()
+	if turn.generation == gen && promptResponse.ID != "" {
+		turn.promptMessageID = promptResponse.ID
+	}
+	state.mu.Unlock()
 	// prompt_async returns after accept; completion arrives via session.idle.
 	return nil
+}
+
+// captureMessageIDs returns the set of existing message IDs at prompt start.
+func (a *Adapter) captureMessageIDs(ctx context.Context, state *sessionState) (map[string]struct{}, error) {
+	var messages []struct {
+		ID string `json:"id"`
+	}
+	if err := a.requestJSON(ctx, state, http.MethodGet, "/session/"+url.PathEscape(state.sessionID)+"/message", nil, nil, &messages); err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{}, len(messages))
+	for _, m := range messages {
+		if m.ID != "" {
+			set[m.ID] = struct{}{}
+		}
+	}
+	return set, nil
 }
 
 func (a *Adapter) subscribeEvents(state *sessionState) {
@@ -557,6 +599,15 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 }
 
 func (a *Adapter) collectFinal(state *sessionState) error {
+	return a.collectFinalTurn(state, nil)
+}
+
+// collectFinalTurn scans messages attributable to the current generation only.
+// When turn is nil, falls back to the legacy newest-to-oldest scan (backward compat
+// for tests that don't use promptAsync).
+// When turn has baselineMessageIDs, only messages not present at prompt start are
+// considered attributable to this turn.
+func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) error {
 	var messages []struct {
 		Info struct {
 			Role   string `json:"role"`
@@ -570,12 +621,50 @@ func (a *Adapter) collectFinal(state *sessionState) error {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"parts"`
+		ID string `json:"id"`
 	}
 	if err := a.requestJSON(context.Background(), state, http.MethodGet, "/session/"+url.PathEscape(state.sessionID)+"/message", nil, nil, &messages); err != nil {
 		return err
 	}
-	// Newest → oldest: pick the newest assistant text that is a valid Result Envelope.
-	// Do not concatenate historical turns into one document.
+
+	// When turn provenance is available, only inspect messages attributable to this turn.
+	if turn != nil && len(turn.baselineMessageIDs) > 0 {
+		for i := len(messages) - 1; i >= 0; i-- {
+			message := messages[i]
+			if message.Info.Role != "assistant" {
+				continue
+			}
+			// Skip messages that existed before this turn.
+			if _, existed := turn.baselineMessageIDs[message.ID]; existed {
+				continue
+			}
+			var text strings.Builder
+			for _, part := range message.Parts {
+				if part.Type == "text" {
+					text.WriteString(part.Text)
+				}
+			}
+			if text.Len() == 0 {
+				continue
+			}
+			raw := []byte(text.String())
+			if _, err := protocol.ParseEnvelope(raw); err != nil {
+				continue
+			}
+			turn.sawCurrentActivity = true
+			state.mu.Lock()
+			state.final = raw
+			state.usage = adapter.Usage{
+				InputTokens: message.Info.Tokens.Input, OutputTokens: message.Info.Tokens.Output,
+				Cost: message.Info.Cost, Currency: "USD",
+			}
+			state.mu.Unlock()
+			return nil
+		}
+		return fmt.Errorf("OpenCode: no valid Result Envelope in current-turn messages")
+	}
+
+	// Legacy fallback: newest → oldest, accepting any valid Result Envelope.
 	for i := len(messages) - 1; i >= 0; i-- {
 		message := messages[i]
 		if message.Info.Role != "assistant" {

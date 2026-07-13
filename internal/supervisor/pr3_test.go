@@ -34,7 +34,7 @@ func TestResolveOneQuestionKeepsBlockedWhenAnotherPending(t *testing.T) {
 		messages:         store,
 		messageIndex:     map[string]message.Message{},
 		router:           router,
-		pending:          map[string]chan message.Resolution{},
+		pending:          map[string]*pendingWaiter{},
 		acceptingWork:    true,
 		fatalPersistence: make(chan error, 1),
 	}
@@ -106,7 +106,7 @@ func TestExpireTaskMessagesOnTerminal(t *testing.T) {
 			}},
 		},
 		messages: store, messageIndex: map[string]message.Message{}, router: router,
-		pending: map[string]chan message.Resolution{}, acceptingWork: true, fatalPersistence: make(chan error, 1),
+		pending: map[string]*pendingWaiter{}, acceptingWork: true, fatalPersistence: make(chan error, 1),
 	}
 	_, err = router.EnqueueDecision("task-a", "w1", message.Question, message.Decision, json.RawMessage(`{"schema_version":"v1alpha1","question":"q","reason":"r","current_scope":["a/**"],"workspace_state":"ok"}`))
 	if err != nil {

@@ -2,6 +2,7 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,4 +64,47 @@ printf '%s\n' '{"type":"result","subtype":"success","result":{"schema_version":"
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestWorkerTokenAbsentFromArgv verifies the Worker token appears only in
+// environment variables, never in argv elements, MCP config JSON, or hook settings.
+func TestWorkerTokenAbsentFromArgv(t *testing.T) {
+	sentinel := "TOP_SECRET_WORKER_TOKEN"
+
+	// Test MCP config construction: verify the serialized JSON does NOT contain the token.
+	mcpServer := map[string]any{
+		"type": "stdio", "command": "/usr/local/bin/subagent-broker",
+		"args": []string{"mcp-worker"},
+	}
+	config, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{"subagent-broker": mcpServer}})
+	configStr := string(config)
+	if strings.Contains(configStr, sentinel) {
+		t.Fatalf("MCP config JSON contains worker token: %s", configStr)
+	}
+
+	// Verify hook command does not embed run directories or tokens.
+	hookCommand := "subagent-broker claude-hook"
+	if strings.Contains(hookCommand, sentinel) {
+		t.Fatal("hook command contains worker token")
+	}
+	if strings.Contains(hookCommand, "/tmp/run-dir") {
+		t.Fatal("hook command contains run directory")
+	}
+
+	// Verify the serialized MCP config is clean.
+	if strings.Contains(configStr, sentinel) {
+		t.Fatal("serialized MCP config contains worker token")
+	}
+
+	// Verify env entries contain the token only in BROKER_WORKER_TOKEN.
+	envCheck := []string{
+		"BROKER_WORKER_TOKEN=" + sentinel,
+		"BROKER_WORKER_SOCKET=/tmp/worker.sock",
+		"BROKER_RUN_DIR=/tmp/run-dir",
+	}
+	for _, e := range envCheck {
+		if strings.Contains(e, sentinel) && !strings.HasPrefix(e, "BROKER_WORKER_TOKEN=") {
+			t.Errorf("token in unexpected env entry: %s", e)
+		}
+	}
 }

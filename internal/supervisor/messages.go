@@ -65,12 +65,18 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 		return message.Resolution{}, value.MessageID, err
 	}
 
-	wait := make(chan message.Resolution, 1)
-	s.mu.Lock()
-	s.pending[value.MessageID] = wait
-	s.mu.Unlock()
+	// Register buffered waiter, then immediately re-read durable state so a
+	// resolver that answered between enqueue and registration is detected.
+	waiter := s.registerDecisionWaiter(value.MessageID)
+
+	// Re-check: durable Router state is authoritative.
+	if res, ok, checkErr := s.loadAnsweredResolution(value.MessageID); checkErr == nil && ok {
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		return res, value.MessageID, nil
+	}
 
 	if err := s.setTaskWaiting(taskID, messageType); err != nil {
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
 		return message.Resolution{}, value.MessageID, err
 	}
 
@@ -81,13 +87,25 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 		eventType = event.PermissionRequested
 	}
 	if err := s.appendEvent(event.Input{TaskID: taskID, WorkerID: workerID, Source: "message-router", Type: eventType, Severity: "warning", Payload: map[string]any{"message_id": value.MessageID, "type": messageType}}); err != nil {
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
 		return message.Resolution{}, value.MessageID, err
 	}
 
 	select {
-	case resolution := <-wait:
-		return resolution, value.MessageID, nil
+	case <-waiter.ch:
+		// After any wake-up, re-read durable Router state rather than trusting
+		// a channel payload. The durable Message.Resolution is authoritative.
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		if res, ok, checkErr := s.loadAnsweredResolution(value.MessageID); checkErr == nil && ok {
+			return res, value.MessageID, nil
+		}
+		// Should not happen: if we were notified the message should be Answered.
+		// Fall through to return an error rather than hanging.
+		return message.Resolution{}, value.MessageID, fmt.Errorf("waiter notified but message %q is not answered", value.MessageID)
 	case <-ctx.Done():
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		// A durable Answered message remains retrievable even if the caller
+		// receives context cancellation — the caller may re-read.
 		return message.Resolution{}, value.MessageID, ctx.Err()
 	}
 }
@@ -107,15 +125,15 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 		}
 	}
 	if message.IsTerminal(value.Status) {
-		return fmt.Errorf("message %q is already resolved", id)
+		// Compare resolution for idempotency/conflict.
+		resJSON, _ := json.Marshal(resolution)
+		if message.ResolutionsEqual(value.Resolution, resJSON) {
+			return nil // idempotent success
+		}
+		return fmt.Errorf("message %q is already terminal (%s) with a different resolution", id, value.Status)
 	}
 	if value.Type == message.Question && strings.TrimSpace(resolution.Answer) == "" {
 		return fmt.Errorf("question answer is required")
-	}
-	if value.Type == message.ScopeExpansionRequest && resolution.Decision.Allowed {
-		if err := s.approveScope(value, resolution.Decision); err != nil {
-			return err
-		}
 	}
 
 	// Native permission: freeze intent, bind exactly, deliver with retryable failures.
@@ -124,8 +142,29 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 		return s.resolveNativePermission(context.Background(), value, resolution)
 	}
 
-	answerPayload, _ := json.Marshal(resolution)
-	answered, err := s.router.Transition(id, message.Answered, "", answerPayload, nil)
+	// 1) Freeze canonical resolution before any side effect.
+	resJSON, err := json.Marshal(resolution)
+	if err != nil {
+		return err
+	}
+	frozen, freezeResult, freezeErr := s.router.FreezeResolution(id, resJSON)
+	if freezeErr != nil {
+		if freezeResult == message.ResolutionAlreadyIdentical {
+			// Already frozen with same resolution; continue to complete.
+		} else {
+			return freezeErr
+		}
+	}
+
+	// 2) For scope expansion: apply expansion only after freeze confirms allow.
+	if value.Type == message.ScopeExpansionRequest && resolution.Decision.Allowed {
+		if err := s.approveScope(frozen, resolution.Decision); err != nil {
+			return err
+		}
+	}
+
+	// 3) Transition to Answered using the exact frozen resolution.
+	answered, err := s.router.Transition(id, message.Answered, "", frozen.Resolution, nil)
 	if err != nil {
 		return err
 	}
@@ -133,14 +172,8 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 		return err
 	}
 
-	s.mu.Lock()
-	wait := s.pending[id]
-	delete(s.pending, id)
-	s.mu.Unlock()
-	if wait != nil {
-		wait <- resolution
-		close(wait)
-	}
+	// 4) Notify waiter (non-blocking; durable state is authoritative).
+	s.notifyDecisionWaiter(id)
 
 	// Refresh top-level projection: switch to next pending or clear.
 	if err := s.refreshQuestionProjection(value.TaskID); err != nil {
@@ -637,13 +670,8 @@ func (s *Service) expireTaskMessages(taskID, reason string) ([]message.Message, 
 		if cErr := s.CommitMessageProjection(context.Background(), item, event.MessageExpired); cErr != nil {
 			return expired, cErr
 		}
-		// Unblock any waiters.
-		s.mu.Lock()
-		if wait := s.pending[item.MessageID]; wait != nil {
-			delete(s.pending, item.MessageID)
-			close(wait)
-		}
-		s.mu.Unlock()
+		// Unblock any waiters via buffered notification.
+		s.notifyDecisionWaiter(item.MessageID)
 	}
 	if err := message.ClearTopLevelQuestion(filepath.Join(s.paths.Tasks, taskID)); err != nil {
 		return expired, err
@@ -932,6 +960,13 @@ func (s *Service) approveScope(value message.Message, decision message.DecisionP
 			return err
 		}
 		target := &candidate.Tasks[index]
+
+		// Idempotency: track which scopes are already present.
+		existing := map[string]bool{}
+		for _, s := range target.Task.WriteScope {
+			existing[s] = true
+		}
+		alreadyExpanded := true
 		for _, requested := range request.RequestedScope {
 			if _, err := scope.Compile(requested); err != nil {
 				return err
@@ -942,11 +977,21 @@ func (s *Service) approveScope(value message.Message, decision message.DecisionP
 					return fmt.Errorf("requested scope %q conflicts with forbidden scope %q", requested, forbidden)
 				}
 			}
+			if !existing[requested] {
+				alreadyExpanded = false
+			}
 		}
+		if alreadyExpanded && target.Task.AllowPublicInterfaceChange == decision.AllowPublicInterfaceChange {
+			// Scope already expanded identically; skip duplicate work.
+			return nil
+		}
+
 		if request.RequiresPublicInterfaceChange && !decision.AllowPublicInterfaceChange {
 			return fmt.Errorf("scope request requires explicit public-interface approval")
 		}
-		target.Task.WriteScope = append(target.Task.WriteScope, request.RequestedScope...)
+		if !alreadyExpanded {
+			target.Task.WriteScope = append(target.Task.WriteScope, request.RequestedScope...)
+		}
 		if decision.AllowPublicInterfaceChange {
 			target.Task.AllowPublicInterfaceChange = true
 		}

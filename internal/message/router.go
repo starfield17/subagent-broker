@@ -180,14 +180,27 @@ func (r *Router) EnqueueDecisionWithAttempt(
 	return copyMessage(value), nil
 }
 
-// RecordResolutionIntent freezes a decision Resolution without making the
-// message terminal. Journal append precedes the in-memory index update.
+// ResolutionFreezeResult describes the outcome of FreezeResolution.
+type ResolutionFreezeResult int
+
+const (
+	// ResolutionFrozen is a new canonical resolution.
+	ResolutionFrozen ResolutionFreezeResult = iota
+	// ResolutionAlreadyIdentical is an idempotent retry of the same resolution.
+	ResolutionAlreadyIdentical
+	// ResolutionConflict is a different resolution from the frozen/terminal one.
+	ResolutionConflict
+)
+
+// FreezeResolution freezes a canonical decision Resolution without making the
+// message terminal. Works for every decision type (question, scope_expansion_request,
+// permission_request). Journal append precedes the in-memory index update.
 // Identical semantic resolutions are idempotent; conflicts are rejected.
 // Does not increment DeliveryAttempts.
 // Holds the per-message lock for the entire mutation (linearizable).
-func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMessage) (Message, error) {
+func (r *Router) FreezeResolution(messageID string, resolution json.RawMessage) (Message, ResolutionFreezeResult, error) {
 	if len(resolution) == 0 {
-		return Message{}, fmt.Errorf("resolution is required")
+		return Message{}, ResolutionConflict, fmt.Errorf("resolution is required")
 	}
 	ml := r.lockMessage(messageID)
 	ml.Lock()
@@ -197,51 +210,82 @@ func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMes
 	current, ok := r.index[messageID]
 	if !ok {
 		r.mu.Unlock()
-		return Message{}, fmt.Errorf("message %q was not found", messageID)
+		return Message{}, ResolutionConflict, fmt.Errorf("message %q was not found", messageID)
 	}
 	current = copyMessage(current)
 	r.mu.Unlock()
 
 	if IsTerminal(current.Status) {
-		return Message{}, fmt.Errorf("message %q is already terminal (%s)", messageID, current.Status)
+		// Terminal: compare against persisted resolution for idempotency.
+		if len(current.Resolution) == 0 {
+			return Message{}, ResolutionConflict,
+				fmt.Errorf("message %q is already terminal (%s) with no resolution", messageID, current.Status)
+		}
+		normalized, err := normalizeResolutionJSON(resolution)
+		if err != nil {
+			return Message{}, ResolutionConflict, err
+		}
+		existing, err := normalizeResolutionJSON(current.Resolution)
+		if err != nil {
+			return Message{}, ResolutionConflict, err
+		}
+		if bytesEqualJSON(existing, normalized) {
+			return current, ResolutionAlreadyIdentical, nil
+		}
+		return Message{}, ResolutionConflict,
+			fmt.Errorf("message %q is already terminal (%s) with a different resolution", messageID, current.Status)
 	}
-	if current.Type != PermissionRequest {
-		return Message{}, fmt.Errorf("resolution intent is only supported for permission_request")
-	}
+
 	if current.Status != Queued {
-		return Message{}, fmt.Errorf("resolution intent requires queued status (status=%s)", current.Status)
+		return Message{}, ResolutionConflict,
+			fmt.Errorf("freeze resolution requires queued status (status=%s)", current.Status)
 	}
 
 	normalized, err := normalizeResolutionJSON(resolution)
 	if err != nil {
-		return Message{}, err
+		return Message{}, ResolutionConflict, err
 	}
 	if len(current.Resolution) > 0 {
 		existing, err := normalizeResolutionJSON(current.Resolution)
 		if err != nil {
-			return Message{}, err
+			return Message{}, ResolutionConflict, err
 		}
 		if bytesEqualJSON(existing, normalized) {
-			return current, nil
+			return current, ResolutionAlreadyIdentical, nil
 		}
-		return Message{}, fmt.Errorf("conflicting resolution: decision is already frozen")
+		return Message{}, ResolutionConflict,
+			fmt.Errorf("conflicting resolution: decision is already frozen")
 	}
 
 	candidate := copyMessage(current)
 	candidate.Resolution = append(json.RawMessage(nil), normalized...)
 	candidate.UpdatedAt = r.now().UTC()
 	if err := r.store.Append(candidate); err != nil {
-		return Message{}, err
+		return Message{}, ResolutionConflict, err
 	}
 	r.mu.Lock()
 	// Re-check: another path may have installed a terminal state (expire/cancel).
 	if latest, ok := r.index[messageID]; ok && IsTerminal(latest.Status) {
 		r.mu.Unlock()
-		return Message{}, fmt.Errorf("message %q became terminal during intent freeze", messageID)
+		return Message{}, ResolutionConflict,
+			fmt.Errorf("message %q became terminal during intent freeze", messageID)
 	}
 	r.index[messageID] = copyMessage(candidate)
 	r.mu.Unlock()
-	return copyMessage(candidate), nil
+	return copyMessage(candidate), ResolutionFrozen, nil
+}
+
+// RecordResolutionIntent is deprecated; use FreezeResolution instead.
+// Preserved for existing native permission callers during the transition.
+func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMessage) (Message, error) {
+	msg, result, err := r.FreezeResolution(messageID, resolution)
+	if err != nil {
+		if result == ResolutionAlreadyIdentical {
+			return msg, nil
+		}
+		return Message{}, err
+	}
+	return msg, nil
 }
 
 // ReclassifyDelivery updates DeliveryMode for a still-queued instruction.
@@ -361,6 +405,10 @@ func (r *Router) Transition(
 		return Message{}, err
 	}
 	if current.Status == next {
+		// Same status alone does not prove semantic idempotence when resolution data differs.
+		if len(resolution) > 0 && !bytesEqualJSON(current.Resolution, resolution) {
+			return Message{}, fmt.Errorf("same-status transition with different resolution is forbidden (status=%s)", current.Status)
+		}
 		return current, nil
 	}
 
@@ -399,6 +447,29 @@ func (r *Router) WithMessageLock(messageID string, fn func() error) error {
 	ml.Lock()
 	defer ml.Unlock()
 	return fn()
+}
+
+// GetAnsweredResolution re-reads the authoritative Router message and returns the
+// persisted Resolution when the message is terminal Answered. Used by waiter
+// re-check to recover resolution after a missed wake-up.
+func (r *Router) GetAnsweredResolution(messageID string) (Resolution, bool, error) {
+	r.mu.Lock()
+	value, ok := r.index[messageID]
+	r.mu.Unlock()
+	if !ok {
+		return Resolution{}, false, fmt.Errorf("message %q was not found", messageID)
+	}
+	if value.Status != Answered {
+		return Resolution{}, false, nil
+	}
+	if len(value.Resolution) == 0 {
+		return Resolution{}, false, fmt.Errorf("message %q is answered but has no resolution", messageID)
+	}
+	var res Resolution
+	if err := json.Unmarshal(value.Resolution, &res); err != nil {
+		return Resolution{}, false, err
+	}
+	return res, true, nil
 }
 
 // Get returns a copy of a message by id.
