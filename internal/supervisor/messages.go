@@ -117,6 +117,32 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 			return err
 		}
 	}
+
+	// Native permission: deliver to the adapter BEFORE recording Answered.
+	// On delivery failure keep a failed durable state (never false success).
+	if handled, deliverErr := s.deliverNativePermissionResponse(context.Background(), value, resolution); handled && deliverErr != nil {
+		failed, tErr := s.router.Transition(id, message.Failed, "", nil, deliverErr)
+		if tErr != nil {
+			return fmt.Errorf("permission adapter delivery failed: %w (also transition: %v)", deliverErr, tErr)
+		}
+		if cErr := s.CommitMessageProjection(context.Background(), failed, event.MessageFailed); cErr != nil {
+			return cErr
+		}
+		_ = s.appendEvent(event.Input{
+			TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router",
+			Type: event.PermissionResolved, Severity: "error",
+			Payload: map[string]any{"message_id": id, "status": string(message.Failed), "error": deliverErr.Error()},
+		})
+		// Keep task waiting semantics honest: no successful resolution.
+		if err := s.refreshQuestionProjection(value.TaskID); err != nil {
+			return err
+		}
+		if err := s.recomputeTaskWaiting(value.TaskID); err != nil {
+			return err
+		}
+		return deliverErr
+	}
+
 	answerPayload, _ := json.Marshal(resolution)
 	answered, err := s.router.Transition(id, message.Answered, "", answerPayload, nil)
 	if err != nil {

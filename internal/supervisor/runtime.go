@@ -912,6 +912,9 @@ func (s *Service) handleNative(runtime *TaskState, harness adapter.Adapter, nati
 	case event.PermissionRequested:
 		worker.StatusDimensions.Protocol = state.ProtocolWaitingPermission
 		worker.StatusDimensions.Progress = state.ProgressQuiet
+		// Protocol-native permission events become durable Broker messages so the
+		// Main Agent can answer and the adapter receives RespondPermission.
+		s.bridgeNativePermission(runtime, harness, native, workerID)
 	case event.UserInputRequested:
 		worker.StatusDimensions.Protocol = state.ProtocolWaitingUser
 		worker.StatusDimensions.Progress = state.ProgressQuiet

@@ -300,7 +300,15 @@ func (a *Adapter) CollectFinalResult(ctx context.Context, id string) (report.Env
 
 func (a *Adapter) SessionConfigFact(req adapter.StartRequest) adapter.SessionConfigFact {
 	safe := strings.EqualFold(req.Options["safe_mode"], "true")
-	return adapter.SessionConfigFact{PermissionMode: req.Options["permission_mode"], SafeMode: safe, SteerVerified: false, NextTurnDelivery: true}
+	mode := req.Options["permission_mode"]
+	native := !safe && !strings.EqualFold(strings.TrimSpace(mode), "bypassPermissions")
+	return adapter.SessionConfigFact{
+		PermissionMode:         mode,
+		SafeMode:               safe,
+		NativePermissionEvents: native,
+		SteerVerified:          false,
+		NextTurnDelivery:       true,
+	}
 }
 
 func (a *Adapter) startServer(ctx context.Context, executable, directory string) (*transport.Process, string, error) {

@@ -123,9 +123,10 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 		return adapter.Session{}, err
 	}
 	threadID := resumeID
+	approvalPolicy := codexApprovalPolicy(req)
 	if threadID == "" {
 		result, err := a.request(ctx, state, "thread/start", map[string]any{
-			"cwd": req.ProjectRoot, "approvalPolicy": "never", "sandbox": "workspace-write", "model": nil,
+			"cwd": req.ProjectRoot, "approvalPolicy": approvalPolicy, "sandbox": "workspace-write", "model": nil,
 		})
 		if err != nil {
 			_ = p.CloseInput()
@@ -136,7 +137,9 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 			return adapter.Session{}, fmt.Errorf("Codex thread/start returned no thread id")
 		}
 	} else {
-		if _, err := a.request(ctx, state, "thread/resume", map[string]any{"threadId": threadID, "cwd": req.ProjectRoot}); err != nil {
+		if _, err := a.request(ctx, state, "thread/resume", map[string]any{
+			"threadId": threadID, "cwd": req.ProjectRoot, "approvalPolicy": approvalPolicy,
+		}); err != nil {
 			_ = p.CloseInput()
 			return adapter.Session{}, fmt.Errorf("Codex thread/resume: %w", err)
 		}
@@ -330,7 +333,45 @@ func (a *Adapter) CollectFinalResult(ctx context.Context, id string) (report.Env
 
 func (a *Adapter) SessionConfigFact(req adapter.StartRequest) adapter.SessionConfigFact {
 	safe := strings.EqualFold(req.Options["safe_mode"], "true")
-	return adapter.SessionConfigFact{PermissionMode: req.Options["permission_mode"], SafeMode: safe, SteerVerified: true, NextTurnDelivery: false}
+	mode := req.Options["permission_mode"]
+	// Codex uses protocol-native server requests for approvals; no Claude hooks.
+	native := !safe && !isBypassPermissionMode(mode)
+	return adapter.SessionConfigFact{
+		PermissionMode:         mode,
+		SafeMode:               safe,
+		NativePermissionEvents: native,
+		SteerVerified:          true,
+		NextTurnDelivery:       false,
+	}
+}
+
+// codexApprovalPolicy maps Broker permission configuration onto a Codex
+// AskForApproval policy. Bypass / safe mode keep "never"; interactive modes
+// use "on-request" so permission events reach the Broker.
+func codexApprovalPolicy(req adapter.StartRequest) string {
+	if strings.EqualFold(req.Options["safe_mode"], "true") {
+		return "never"
+	}
+	if isBypassPermissionMode(req.Options["permission_mode"]) {
+		return "never"
+	}
+	mode := strings.TrimSpace(strings.ToLower(req.Options["permission_mode"]))
+	switch mode {
+	case "untrusted":
+		return "untrusted"
+	default:
+		// default, acceptEdits, plan, empty, or unknown interactive modes
+		return "on-request"
+	}
+}
+
+func isBypassPermissionMode(mode string) bool {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "bypasspermissions", "never", "none":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *Adapter) request(ctx context.Context, state *sessionState, method string, params any) (json.RawMessage, error) {

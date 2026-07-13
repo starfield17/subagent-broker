@@ -21,6 +21,35 @@ func TestDeriveEffectiveDisablesPermissionWithoutHooks(t *testing.T) {
 	}
 }
 
+func TestDeriveEffectiveNativePermissionWithoutHooks(t *testing.T) {
+	// Codex/Grok/OpenCode: protocol-native permission events, no Claude hooks.
+	declared := Capabilities{PermissionEvents: true, BidirectionalStream: true, ResumeSession: true}
+	set := DeriveEffective(declared, declared, SessionConfigFact{
+		PermissionMode:         "default",
+		HooksInstalled:         false,
+		NativePermissionEvents: true,
+		SteerVerified:          true,
+	})
+	if !set.Effective.PermissionEvents {
+		t.Fatalf("native permission events must remain effective without hooks: %+v downs=%v", set.Effective, set.Downgrades)
+	}
+	if set.Effective.Hooks {
+		t.Fatal("hooks must stay false when not installed")
+	}
+}
+
+func TestDeriveEffectiveClaudeHooksStillRequired(t *testing.T) {
+	// Claude-style: PermissionEvents without NativePermissionEvents still needs hooks.
+	declared := Capabilities{PermissionEvents: true, Hooks: true}
+	set := DeriveEffective(declared, declared, SessionConfigFact{
+		HooksInstalled:         false,
+		NativePermissionEvents: false,
+	})
+	if set.Effective.PermissionEvents {
+		t.Fatal("Claude hook-backed permission_events must be false without hooks")
+	}
+}
+
 func TestDeriveEffectiveAllTrueWhenConfiguredAndVerified(t *testing.T) {
 	declared := Capabilities{PermissionEvents: true, Hooks: true, SteerActiveTurn: true, BidirectionalStream: true}
 	set := DeriveEffective(declared, declared, SessionConfigFact{

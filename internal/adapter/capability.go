@@ -16,8 +16,11 @@ type CapabilitySet struct {
 type SessionConfigFact struct {
 	PermissionMode string `json:"permission_mode,omitempty"`
 	HooksInstalled bool   `json:"hooks_installed"`
-	MCPEnabled     bool   `json:"mcp_enabled"`
-	SafeMode       bool   `json:"safe_mode"`
+	// NativePermissionEvents is true when the harness emits protocol-native
+	// permission requests (Codex/Grok/OpenCode). These do not require Claude hooks.
+	NativePermissionEvents bool `json:"native_permission_events,omitempty"`
+	MCPEnabled             bool `json:"mcp_enabled"`
+	SafeMode               bool `json:"safe_mode"`
 	// SteerVerified is true only after a real contract test (or fake that asserts it).
 	// Descriptor claims alone never set this true.
 	SteerVerified bool `json:"steer_verified"`
@@ -55,10 +58,12 @@ func DeriveEffective(declared, probe Capabilities, fact SessionConfigFact) Capab
 		}
 	}
 
-	// Permission events require hooks actually installed this session.
-	if effective.PermissionEvents && !fact.HooksInstalled {
+	// Hook-backed permission events require hooks installed this session.
+	// Protocol-native permission events (NativePermissionEvents) do not.
+	permissionBacked := fact.HooksInstalled || fact.NativePermissionEvents
+	if effective.PermissionEvents && !permissionBacked {
 		effective.PermissionEvents = false
-		downs = append(downs, "permission_events require installed hooks; hooks not installed for this session")
+		downs = append(downs, "permission_events require installed hooks or native permission events; neither configured for this session")
 	}
 	if effective.Hooks && !fact.HooksInstalled {
 		effective.Hooks = false
@@ -76,9 +81,9 @@ func DeriveEffective(declared, probe Capabilities, fact SessionConfigFact) Capab
 
 	// ResumeSession is about adapter ability; native session presence is checked at route time.
 	set.Configured = base
-	// Reflect hooks install in configured view.
+	// Reflect hooks install and native permission backing in configured view.
 	set.Configured.Hooks = base.Hooks && fact.HooksInstalled
-	set.Configured.PermissionEvents = base.PermissionEvents && fact.HooksInstalled
+	set.Configured.PermissionEvents = base.PermissionEvents && permissionBacked && !fact.SafeMode
 	set.Configured.SteerActiveTurn = base.SteerActiveTurn && fact.SteerVerified
 
 	set.Effective = effective

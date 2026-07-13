@@ -57,3 +57,72 @@ func writeExecutable(t *testing.T, content string) string {
 func testStartRequest(t *testing.T, taskID, workerID string) adapter.StartRequest {
 	return adapter.StartRequest{RunID: "run", TaskID: taskID, WorkerID: workerID, ProjectRoot: t.TempDir(), Contract: "fixture"}
 }
+
+func TestCodexApprovalPolicyMapping(t *testing.T) {
+	cases := []struct {
+		mode string
+		safe bool
+		want string
+	}{
+		{mode: "default", want: "on-request"},
+		{mode: "acceptEdits", want: "on-request"},
+		{mode: "plan", want: "on-request"},
+		{mode: "", want: "on-request"},
+		{mode: "untrusted", want: "untrusted"},
+		{mode: "bypassPermissions", want: "never"},
+		{mode: "never", want: "never"},
+		{mode: "default", safe: true, want: "never"},
+	}
+	for _, tc := range cases {
+		req := adapter.StartRequest{Options: map[string]string{"permission_mode": tc.mode}}
+		if tc.safe {
+			req.Options["safe_mode"] = "true"
+		}
+		if got := codexApprovalPolicy(req); got != tc.want {
+			t.Fatalf("mode=%q safe=%v got=%q want=%q", tc.mode, tc.safe, got, tc.want)
+		}
+	}
+}
+
+func TestCodexSessionConfigFactNativePermissions(t *testing.T) {
+	a := New("codex")
+	fact := a.SessionConfigFact(adapter.StartRequest{Options: map[string]string{"permission_mode": "default"}})
+	if !fact.NativePermissionEvents || fact.HooksInstalled {
+		t.Fatalf("expected native permissions without hooks: %+v", fact)
+	}
+	bypass := a.SessionConfigFact(adapter.StartRequest{Options: map[string]string{"permission_mode": "bypassPermissions"}})
+	if bypass.NativePermissionEvents {
+		t.Fatal("bypass mode must not claim native permission events")
+	}
+}
+
+func TestCodexThreadStartUsesOnRequestPolicy(t *testing.T) {
+	script := writeExecutable(t, `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"id":1,"result":{"userAgent":"fixture"}}' ;;
+    *'"method":"thread/start"'*)
+      case "$line" in
+        *'"approvalPolicy":"on-request"'*) echo '{"id":2,"result":{"thread":{"id":"thread-policy"}}}' ;;
+        *) echo '{"id":2,"error":{"message":"unexpected approvalPolicy"}}' ;;
+      esac
+      ;;
+    *'"method":"turn/start"'*)
+      echo '{"method":"turn/started","params":{"turn":{"id":"turn-fixture"}}}'
+      echo '{"id":3,"result":{"turn":{"id":"turn-fixture"}}}'
+      echo '{"method":"turn/completed","params":{"usage":{"inputTokens":1,"outputTokens":1}}}'
+      ;;
+  esac
+done
+`)
+	a := New(script)
+	req := testStartRequest(t, "t", "w")
+	req.Options = map[string]string{"permission_mode": "default"}
+	session, err := a.StartSession(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.NativeSessionID != "thread-policy" {
+		t.Fatalf("session=%+v", session)
+	}
+}

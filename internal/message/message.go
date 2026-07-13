@@ -176,6 +176,11 @@ type ScopeRequestPayload struct {
 type PermissionRequestPayload struct {
 	ToolName string          `json:"tool_name"`
 	Input    json.RawMessage `json:"input"`
+	// Native routing metadata (protocol-native permission events).
+	// Empty for Claude hook-backed permission requests.
+	Harness            string `json:"harness,omitempty"`
+	NativeSessionID    string `json:"native_session_id,omitempty"`
+	NativePermissionID string `json:"native_permission_id,omitempty"`
 }
 
 type DecisionPayload struct {

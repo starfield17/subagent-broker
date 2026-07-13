@@ -42,6 +42,10 @@ type Adapter struct {
 	scenarios    map[string]Scenario
 	sessions     map[string]*sessionState
 	counter      atomic.Uint64
+	// PermissionResponses records RespondPermission calls for tests.
+	PermissionResponses []adapter.PermissionDecision
+	// FailPermissionResponse, when set, is returned from RespondPermission.
+	FailPermissionResponse error
 }
 
 func New(capabilities adapter.Capabilities) *Adapter {
@@ -54,16 +58,19 @@ func (a *Adapter) Descriptor() adapter.Descriptor {
 
 // SessionConfigFact reports what the fake installs. Steer is considered
 // contract-verified for tests that declare SteerActiveTurn (fake models true immediate).
+// PermissionEvents without Hooks model protocol-native permission events.
 func (a *Adapter) SessionConfigFact(req adapter.StartRequest) adapter.SessionConfigFact {
 	safe := strings.EqualFold(req.Options["safe_mode"], "true")
 	hooks := a.capabilities.Hooks && !safe
+	native := a.capabilities.PermissionEvents && !a.capabilities.Hooks && !safe
 	return adapter.SessionConfigFact{
-		PermissionMode:   req.Options["permission_mode"],
-		HooksInstalled:   hooks && a.capabilities.PermissionEvents,
-		MCPEnabled:       !safe,
-		SafeMode:         safe,
-		SteerVerified:    a.capabilities.SteerActiveTurn,
-		NextTurnDelivery: !a.capabilities.SteerActiveTurn && a.capabilities.BidirectionalStream,
+		PermissionMode:         req.Options["permission_mode"],
+		HooksInstalled:         hooks && a.capabilities.PermissionEvents,
+		NativePermissionEvents: native,
+		MCPEnabled:             !safe,
+		SafeMode:               safe,
+		SteerVerified:          a.capabilities.SteerActiveTurn,
+		NextTurnDelivery:       !a.capabilities.SteerActiveTurn && a.capabilities.BidirectionalStream,
 	}
 }
 
@@ -293,12 +300,18 @@ func (a *Adapter) ReadHistory(_ context.Context, id string) ([]adapter.NativeEve
 	return append([]adapter.NativeEvent(nil), state.history...), nil
 }
 
-func (a *Adapter) RespondPermission(_ context.Context, id string, _ adapter.PermissionDecision) error {
+func (a *Adapter) RespondPermission(_ context.Context, id string, decision adapter.PermissionDecision) error {
 	if !a.capabilities.PermissionEvents {
 		return adapter.ErrUnsupported
 	}
-	_, err := a.requireSession(id)
-	return err
+	if _, err := a.requireSession(id); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.PermissionResponses = append(a.PermissionResponses, decision)
+	fail := a.FailPermissionResponse
+	a.mu.Unlock()
+	return fail
 }
 
 func (a *Adapter) GetDiff(_ context.Context, id string) ([]string, error) {
@@ -378,7 +391,7 @@ func BuiltinScenarios() map[string]Scenario {
 		"normal_stream":      {Name: "normal_stream", Events: []adapter.NativeEvent{e("turn.started", nil), e("model.output_delta", map[string]string{"text": "working"}), e("turn.completed", nil), e("result.submitted", nil)}, Final: &valid},
 		"long_thinking":      {Name: "long_thinking", Events: []adapter.NativeEvent{e("turn.started", nil), e("protocol.thinking", nil)}, KeepOpen: true},
 		"long_command_quiet": {Name: "long_command_quiet", Events: []adapter.NativeEvent{e("tool.started", map[string]string{"command": "go test ./..."})}, KeepOpen: true},
-		"waiting_permission": {Name: "waiting_permission", Events: []adapter.NativeEvent{e("permission.requested", nil)}, KeepOpen: true},
+		"waiting_permission": {Name: "waiting_permission", Events: []adapter.NativeEvent{e("permission.requested", map[string]any{"id": "fake-perm-1", "tool_name": "Bash", "input": map[string]string{"command": "ls"}})}, KeepOpen: true},
 		"waiting_user":       {Name: "waiting_user", Events: []adapter.NativeEvent{e("user_input.requested", nil)}, KeepOpen: true},
 		"scope_request":      {Name: "scope_request", Events: []adapter.NativeEvent{e("scope_expansion.requested", map[string]any{"paths": []string{"go.mod"}})}, KeepOpen: true},
 		"nonzero_exit":       {Name: "nonzero_exit", Events: []adapter.NativeEvent{e("process.exited", map[string]int{"exit_code": 1})}, ExitCode: 1},
