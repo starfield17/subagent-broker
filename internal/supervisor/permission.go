@@ -142,37 +142,76 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 	if err != nil {
 		return
 	}
+	taskID := string(runtime.Task.TaskID)
+	// Test hook: after durable enqueue, before operation lock / pending publication.
+	s.fireAfterDecisionEnqueue(value.MessageID)
+
+	// Serialize setup with ResolveMessage / expiration on the same message.
+	opLock := s.decisionOpLock(value.MessageID)
+	opLock.Lock()
+	defer opLock.Unlock()
+	s.fireAfterDecisionOpLock(value.MessageID)
+
+	// Authoritative re-read: resolver may have already answered.
+	if latest, ok := s.router.Get(value.MessageID); ok {
+		value = latest
+	}
+	if message.IsTerminal(value.Status) {
+		// Skip stale pending publication / waiting setup; reconcile projections.
+		_ = s.refreshQuestionProjection(taskID)
+		_ = s.recomputeTaskWaiting(taskID)
+		return
+	}
+
 	if err := s.CommitMessageProjection(context.Background(), value, event.MessageQueued); err != nil {
 		// Fail-closed: durable enqueue succeeded but projection failed.
 		return
 	}
+	// Re-check after projection commit.
+	if latest, ok := s.router.Get(value.MessageID); ok {
+		value = latest
+	}
+	if message.IsTerminal(value.Status) {
+		_ = s.refreshQuestionProjection(taskID)
+		_ = s.recomputeTaskWaiting(taskID)
+		return
+	}
+
 	question := s.questionEnvelopeFor(value)
-	taskDir := filepath.Join(s.paths.Tasks, string(runtime.Task.TaskID))
+	taskDir := filepath.Join(s.paths.Tasks, taskID)
 	// Projection failure must not terminal-fail the permission while the harness is blocked.
-	if err := message.PublishQuestionProjection(taskDir, value.MessageID, string(runtime.Task.TaskID), question, false); err != nil {
+	if err := message.PublishQuestionProjection(taskDir, value.MessageID, taskID, question, false); err != nil {
 		_ = s.appendEvent(event.Input{
-			TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
+			TaskID: taskID, WorkerID: workerID, Source: "supervisor",
 			Type: "permission.projection_failed", Severity: "error",
 			Payload: map[string]any{"message_id": value.MessageID, "error": err.Error()},
 		})
-		// Keep pending and blocked.
-		_ = s.setTaskWaiting(string(runtime.Task.TaskID), message.PermissionRequest)
+		// Keep pending and blocked only while still non-terminal.
+		if latest, ok := s.router.Get(value.MessageID); !ok || !message.IsTerminal(latest.Status) {
+			_ = s.setTaskWaiting(taskID, message.PermissionRequest)
+		} else {
+			_ = s.recomputeTaskWaiting(taskID)
+		}
 		return
 	}
-	if err := s.refreshQuestionProjection(string(runtime.Task.TaskID)); err != nil {
+	if err := s.refreshQuestionProjection(taskID); err != nil {
 		_ = s.appendEvent(event.Input{
-			TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
+			TaskID: taskID, WorkerID: workerID, Source: "supervisor",
 			Type: "permission.projection_failed", Severity: "error",
 			Payload: map[string]any{"message_id": value.MessageID, "error": err.Error()},
 		})
-		_ = s.setTaskWaiting(string(runtime.Task.TaskID), message.PermissionRequest)
+		if latest, ok := s.router.Get(value.MessageID); !ok || !message.IsTerminal(latest.Status) {
+			_ = s.setTaskWaiting(taskID, message.PermissionRequest)
+		} else {
+			_ = s.recomputeTaskWaiting(taskID)
+		}
 		return
 	}
-	if err := s.setTaskWaiting(string(runtime.Task.TaskID), message.PermissionRequest); err != nil {
+	if err := s.setTaskWaiting(taskID, message.PermissionRequest); err != nil {
 		return
 	}
 	_ = s.appendEvent(event.Input{
-		TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
+		TaskID: taskID, WorkerID: workerID, Source: "supervisor",
 		Type: event.PermissionRequested, Severity: "warning",
 		Payload: map[string]any{
 			"message_id":           value.MessageID,
@@ -184,6 +223,12 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 			"worker_id":            workerID,
 		},
 	})
+
+	// Final re-read: if resolved while we held the lock through setup, clear waiting.
+	if latest, ok := s.router.Get(value.MessageID); ok && message.IsTerminal(latest.Status) {
+		_ = s.refreshQuestionProjection(taskID)
+		_ = s.recomputeTaskWaiting(taskID)
+	}
 }
 
 // findPermissionByIdentity matches the full originating identity tuple.

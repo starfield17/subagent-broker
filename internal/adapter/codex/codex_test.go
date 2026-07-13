@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
+	"github.com/vnai/subagent-broker/internal/event"
 )
 
 func TestAppServerSessionContract(t *testing.T) {
@@ -39,10 +40,141 @@ done
 	if result.TaskID != "t" || result.WorkerID != "w" {
 		t.Fatalf("unexpected result identity: %+v", result)
 	}
+	// Immediately after CollectFinalResult, terminal history must already be committed.
+	// No poll, no sleep — production linearizability.
 	history, err := a.ReadHistory(context.Background(), session.NativeSessionID)
-	if err != nil || len(history) < 3 {
-		t.Fatalf("history err=%v len=%d", err, len(history))
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertKindsPresent(t, history, event.TurnStarted, event.ModelOutputDelta, event.ResultSubmitted)
+	assertExactlyOneKind(t, history, event.ResultSubmitted)
+	assertNoKind(t, history, event.TurnFailed)
+
+	usage, err := a.GetUsage(ctx, session.NativeSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.InputTokens != 1 || usage.OutputTokens != 2 {
+		t.Fatalf("usage=%+v", usage)
+	}
+}
+
+func TestCodexTerminalFailed(t *testing.T) {
+	script := writeExecutable(t, `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"id":1,"result":{"userAgent":"fixture"}}' ;;
+    *'"method":"thread/start"'*) echo '{"id":2,"result":{"thread":{"id":"thread-fail"}}}' ;;
+    *'"method":"turn/start"'*)
+      echo '{"method":"turn/started","params":{"turn":{"id":"turn-fail"}}}'
+      echo '{"id":3,"result":{"turn":{"id":"turn-fail"}}}'
+      echo '{"method":"turn/failed","params":{"error":"model exploded"}}'
+      ;;
+  esac
+done
+`)
+	a := New(script)
+	session, err := a.StartSession(context.Background(), testStartRequest(t, "t", "w"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = a.CollectFinalResult(ctx, session.NativeSessionID)
+	if err == nil {
+		t.Fatal("expected CollectFinalResult error on turn/failed")
+	}
+	history, err := a.ReadHistory(context.Background(), session.NativeSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertExactlyOneKind(t, history, event.TurnFailed)
+	assertNoKind(t, history, event.ResultSubmitted)
+	// EOF must not append a second terminal after protocol failure.
+	// Wait briefly for process exit path without sleeping for correctness:
+	// ReadHistory again after Exited if available.
+	select {
+	case <-session.Exited:
+	case <-time.After(2 * time.Second):
+	}
+	history2, err := a.ReadHistory(context.Background(), session.NativeSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertExactlyOneKind(t, history2, event.TurnFailed)
+}
+
+func TestCodexTerminalCancelled(t *testing.T) {
+	script := writeExecutable(t, `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"id":1,"result":{"userAgent":"fixture"}}' ;;
+    *'"method":"thread/start"'*) echo '{"id":2,"result":{"thread":{"id":"thread-cancel"}}}' ;;
+    *'"method":"turn/start"'*)
+      echo '{"method":"turn/started","params":{"turn":{"id":"turn-cancel"}}}'
+      echo '{"id":3,"result":{"turn":{"id":"turn-cancel"}}}'
+      echo '{"method":"turn/cancelled","params":{"reason":"user"}}'
+      ;;
+  esac
+done
+`)
+	a := New(script)
+	session, err := a.StartSession(context.Background(), testStartRequest(t, "t", "w"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = a.CollectFinalResult(ctx, session.NativeSessionID)
+	if err == nil {
+		t.Fatal("expected CollectFinalResult error on turn/cancelled")
+	}
+	history, err := a.ReadHistory(context.Background(), session.NativeSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertExactlyOneKind(t, history, event.TurnFailed)
+	assertNoKind(t, history, event.ResultSubmitted)
+	select {
+	case <-session.Exited:
+	case <-time.After(2 * time.Second):
+	}
+	history2, _ := a.ReadHistory(context.Background(), session.NativeSessionID)
+	assertExactlyOneKind(t, history2, event.TurnFailed)
+}
+
+func TestCodexUnexpectedEOF(t *testing.T) {
+	// Process exits without any terminal protocol notification.
+	script := writeExecutable(t, `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"id":1,"result":{"userAgent":"fixture"}}' ;;
+    *'"method":"thread/start"'*) echo '{"id":2,"result":{"thread":{"id":"thread-eof"}}}' ;;
+    *'"method":"turn/start"'*)
+      echo '{"method":"turn/started","params":{"turn":{"id":"turn-eof"}}}'
+      echo '{"id":3,"result":{"turn":{"id":"turn-eof"}}}'
+      exit 0
+      ;;
+  esac
+done
+`)
+	a := New(script)
+	session, err := a.StartSession(context.Background(), testStartRequest(t, "t", "w"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = a.CollectFinalResult(ctx, session.NativeSessionID)
+	if err == nil {
+		t.Fatal("unexpected EOF must not look like success")
+	}
+	history, err := a.ReadHistory(context.Background(), session.NativeSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoKind(t, history, event.ResultSubmitted)
+	assertExactlyOneKind(t, history, event.TurnFailed)
 }
 
 func writeExecutable(t *testing.T, content string) string {
@@ -56,6 +188,49 @@ func writeExecutable(t *testing.T, content string) string {
 
 func testStartRequest(t *testing.T, taskID, workerID string) adapter.StartRequest {
 	return adapter.StartRequest{RunID: "run", TaskID: taskID, WorkerID: workerID, ProjectRoot: t.TempDir(), Contract: "fixture"}
+}
+
+func assertKindsPresent(t *testing.T, history []adapter.NativeEvent, kinds ...string) {
+	t.Helper()
+	have := map[string]bool{}
+	for _, h := range history {
+		have[h.Kind] = true
+	}
+	for _, k := range kinds {
+		if !have[k] {
+			t.Fatalf("history missing %q: %+v", k, kindsOf(history))
+		}
+	}
+}
+
+func assertExactlyOneKind(t *testing.T, history []adapter.NativeEvent, kind string) {
+	t.Helper()
+	n := 0
+	for _, h := range history {
+		if h.Kind == kind {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("want exactly one %q, got %d in %v", kind, n, kindsOf(history))
+	}
+}
+
+func assertNoKind(t *testing.T, history []adapter.NativeEvent, kind string) {
+	t.Helper()
+	for _, h := range history {
+		if h.Kind == kind {
+			t.Fatalf("history must not contain %q: %v", kind, kindsOf(history))
+		}
+	}
+}
+
+func kindsOf(history []adapter.NativeEvent) []string {
+	out := make([]string, 0, len(history))
+	for _, h := range history {
+		out = append(out, h.Kind)
+	}
+	return out
 }
 
 func TestCodexApprovalPolicyMapping(t *testing.T) {

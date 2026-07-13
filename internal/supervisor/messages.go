@@ -59,29 +59,51 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 	if err != nil {
 		return message.Resolution{}, "", err
 	}
-	if err := s.CommitMessageProjection(ctx, value, event.MessageQueued); err != nil {
-		return message.Resolution{}, value.MessageID, err
-	}
+	// Test hook: after durable enqueue, before operation lock / queued publication.
+	s.fireAfterDecisionEnqueue(value.MessageID)
 
-	// Acquire Service decision-operation lock for setup so a concurrent resolver
-	// cannot answer between waiting-state setup and waiter registration without
-	// RequestMessage observing the terminal state.
+	// Acquire Service decision-operation lock before any pending-state publication
+	// so MessageQueued cannot be appended after a concurrent MessageAnswered.
 	opLock := s.decisionOpLock(value.MessageID)
 	opLock.Lock()
+	s.fireAfterDecisionOpLock(value.MessageID)
 
-	// Register buffered waiter under the operation lock.
-	waiter := s.registerDecisionWaiter(value.MessageID)
-
-	// Authoritative re-read: resolver may have already answered.
+	// Authoritative re-read before publishing queued projection.
 	if res, ok, checkErr := s.loadAnsweredResolution(value.MessageID); checkErr == nil && ok {
-		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.refreshQuestionProjection(taskID)
 		_ = s.recomputeTaskWaiting(taskID)
 		opLock.Unlock()
 		return res, value.MessageID, nil
 	}
-	// Other terminal states (Expired/Failed): return without setting waiting.
+	if current, found := s.router.Get(value.MessageID); found && message.IsTerminal(current.Status) {
+		_ = s.refreshQuestionProjection(taskID)
+		_ = s.recomputeTaskWaiting(taskID)
+		opLock.Unlock()
+		return message.Resolution{}, value.MessageID, &message.ErrMessageTerminalNotAnswered{
+			MessageID: value.MessageID, Status: current.Status,
+		}
+	}
+
+	// Commit MessageQueued only while still pending and holding the op lock.
+	if err := s.CommitMessageProjection(ctx, value, event.MessageQueued); err != nil {
+		opLock.Unlock()
+		return message.Resolution{}, value.MessageID, err
+	}
+
+	// Register buffered waiter under the operation lock.
+	waiter := s.registerDecisionWaiter(value.MessageID)
+
+	// Re-check after projection: resolver may have raced during commit.
+	if res, ok, checkErr := s.loadAnsweredResolution(value.MessageID); checkErr == nil && ok {
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.refreshQuestionProjection(taskID)
+		_ = s.recomputeTaskWaiting(taskID)
+		opLock.Unlock()
+		return res, value.MessageID, nil
+	}
 	if current, found := s.router.Get(value.MessageID); found && message.IsTerminal(current.Status) {
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.refreshQuestionProjection(taskID)
 		_ = s.recomputeTaskWaiting(taskID)
 		opLock.Unlock()
 		return message.Resolution{}, value.MessageID, &message.ErrMessageTerminalNotAnswered{
@@ -98,11 +120,13 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 			_ = s.CommitMessageProjection(ctx, failed, event.MessageFailed)
 		}
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.recomputeTaskWaiting(taskID)
 		opLock.Unlock()
 		return message.Resolution{}, value.MessageID, err
 	}
 	if err := s.refreshQuestionProjection(taskID); err != nil {
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.recomputeTaskWaiting(taskID)
 		opLock.Unlock()
 		return message.Resolution{}, value.MessageID, err
 	}
@@ -121,6 +145,7 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 	}
 	if err := s.appendEvent(event.Input{TaskID: taskID, WorkerID: workerID, Source: "message-router", Type: eventType, Severity: "warning", Payload: map[string]any{"message_id": value.MessageID, "type": messageType}}); err != nil {
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.recomputeTaskWaiting(taskID)
 		opLock.Unlock()
 		return message.Resolution{}, value.MessageID, err
 	}
