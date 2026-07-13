@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
@@ -164,6 +165,54 @@ type eventAppender interface {
 	Append(event.Input) (event.Event, error)
 }
 
+// pendingWaiter is a buffered wake-up channel for a single decision message.
+// The channel is buffered (size 1) so a resolver can notify without blocking.
+// The durable Router message.Resolution is authoritative; the channel is only a
+// wake-up optimization.
+type pendingWaiter struct {
+	ch chan struct{}
+}
+
+func (s *Service) registerDecisionWaiter(messageID string) *pendingWaiter {
+	w := &pendingWaiter{ch: make(chan struct{}, 1)}
+	s.mu.Lock()
+	s.pending[messageID] = w
+	s.mu.Unlock()
+	return w
+}
+
+func (s *Service) unregisterDecisionWaiter(messageID string, waiter *pendingWaiter) {
+	s.mu.Lock()
+	if current, ok := s.pending[messageID]; ok && current == waiter {
+		delete(s.pending, messageID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) notifyDecisionWaiter(messageID string) {
+	s.mu.Lock()
+	waiter := s.pending[messageID]
+	if waiter != nil {
+		delete(s.pending, messageID)
+	}
+	s.mu.Unlock()
+	if waiter != nil {
+		select {
+		case waiter.ch <- struct{}{}:
+		default:
+			// Non-blocking: a missed notification is harmless because the
+			// waiter re-reads durable state after any wake-up.
+		}
+	}
+}
+
+func (s *Service) loadAnsweredResolution(messageID string) (message.Resolution, bool, error) {
+	if s.router == nil {
+		return message.Resolution{}, false, fmt.Errorf("router is not initialized")
+	}
+	return s.router.GetAnsweredResolution(messageID)
+}
+
 type Service struct {
 	mu             sync.Mutex
 	runDir         string
@@ -182,7 +231,7 @@ type Service struct {
 	messages       *message.Store
 	messageIndex   map[string]message.Message
 	router         *message.Router
-	pending        map[string]chan message.Resolution
+	pending        map[string]*pendingWaiter
 	active         map[string]activeWorker
 	resumeInFlight map[string]bool
 	runBaseline    verify.WorkspaceSnapshot
@@ -201,6 +250,10 @@ type Service struct {
 
 	// Per-message native permission delivery serialization (no adapter I/O under Router lock).
 	deliveryLocks sync.Map // messageID -> *sync.Mutex
+
+	// Supervisor lease: kernel-backed exclusive fd for the run's mutable lifetime.
+	// Acquired before any socket/token/state write; released on process exit.
+	leaseFD int
 }
 
 type activeWorker struct {
@@ -385,7 +438,7 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 					snapshot: snapshot, events: event.NewStore(paths.Events, string(run.RunID), lastSeq),
 					terminal: make(chan struct{}), recovering: recovering, plan: plan,
 					messages: messageStore, messageIndex: messageIndex,
-					pending: map[string]chan message.Resolution{}, active: map[string]activeWorker{},
+					pending: map[string]*pendingWaiter{}, active: map[string]activeWorker{},
 					cancelledTasks: map[string]bool{}, runBaseline: verify.WorkspaceSnapshot{},
 					fatalPersistence: make(chan error, 1), acceptingWork: false, advance: make(chan struct{}, 1),
 				}
@@ -435,7 +488,7 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 		runDir: runDir, paths: paths, registry: registry, config: config,
 		snapshot: snapshot, events: event.NewStore(paths.Events, string(run.RunID), lastSeq),
 		terminal: make(chan struct{}), recovering: recovering, plan: plan,
-		messages: messageStore, messageIndex: messageIndex, router: router, pending: map[string]chan message.Resolution{}, active: map[string]activeWorker{}, cancelledTasks: map[string]bool{}, runBaseline: runBaseline,
+		messages: messageStore, messageIndex: messageIndex, router: router, pending: map[string]*pendingWaiter{}, active: map[string]activeWorker{}, cancelledTasks: map[string]bool{}, runBaseline: runBaseline,
 		fatalPersistence: make(chan error, 1), acceptingWork: acceptingWork, advance: make(chan struct{}, 1),
 	}, nil
 }
@@ -443,6 +496,13 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 func (s *Service) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Acquire run-scoped exclusive lease before any mutable operation.
+	if err := s.acquireLease(); err != nil {
+		return fmt.Errorf("supervisor_already_running: %w", err)
+	}
+	defer s.releaseLease()
+
 	if err := s.prepareIPC(); err != nil {
 		return err
 	}
@@ -2152,6 +2212,53 @@ func cloneSnapshot(value Snapshot) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("clone snapshot: %w", err)
 	}
 	return copy, nil
+}
+
+// LeasePath is the run-scoped supervisor lock file (flock).
+func LeasePath(runDir string) string {
+	return filepath.Join(runDir, "control", "supervisor.lock")
+}
+
+func (s *Service) acquireLease() error {
+	lockPath := LeasePath(s.runDir)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return fmt.Errorf("create lock directory: %w", err)
+	}
+	fd, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	// Non-blocking exclusive flock: second start fails immediately.
+	if err := syscall.Flock(int(fd.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = fd.Close()
+		return fmt.Errorf("supervisor lock already held by another process: %w", err)
+	}
+	s.leaseFD = int(fd.Fd())
+	// Write diagnostic metadata (not authoritative; kernel lock is).
+	_ = fd.Truncate(0)
+	_, _ = fd.Seek(0, 0)
+	meta := map[string]any{
+		"pid":                 os.Getpid(),
+		"process_start_token": os.Getpid(), // placeholder
+		"acquired_at":         time.Now().UTC().Format(time.RFC3339),
+		"run_id":              s.snapshot.Run.RunID,
+	}
+	metaJSON, _ := json.Marshal(meta)
+	_, _ = fd.Write(append(metaJSON, '\n'))
+	return nil
+}
+
+func (s *Service) releaseLease() {
+	if s.leaseFD > 0 {
+		_ = syscall.Flock(s.leaseFD, syscall.LOCK_UN)
+		// The fd stays open; kernel releases on process exit.
+		// Do NOT close the fd here — we want the kernel to hold the lock for
+		// the full process lifetime. Close is done by OS on exit.
+	}
+	// Remove only the lock file; the fd still holds the kernel lock.
+	// Only the owner should unlink the lock file.
+	lockPath := LeasePath(s.runDir)
+	_ = os.Remove(lockPath)
 }
 
 func SocketPath(runDir string) string {

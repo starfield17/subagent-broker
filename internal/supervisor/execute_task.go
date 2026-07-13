@@ -164,12 +164,17 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	executable, _ := os.Executable()
 	interaction := adapter.InteractionConfig{Enabled: !s.config.SafeMode && harnessName == string(adapter.HarnessClaudeCode), BrokerExecutable: executable, RunDir: s.runDir}
 	// Per-attempt Worker credential (env only; never control token or argv).
-	if s.auth != nil {
+	// If interaction is enabled, credential failure must abort session startup.
+	if interaction.Enabled && s.auth == nil {
+		return fmt.Errorf("interaction enabled but auth is not initialized")
+	}
+	if interaction.Enabled {
 		wtok, tokErr := s.auth.IssueWorkerCredential(string(runID), string(runtime.Task.TaskID), workerID, attempt.Number, resumeSessionID)
-		if tokErr == nil {
-			interaction.WorkerToken = wtok
-			interaction.WorkerSocket = WorkerSocketPath(s.runDir)
+		if tokErr != nil {
+			return fmt.Errorf("issue worker credential: %w", tokErr)
 		}
+		interaction.WorkerToken = wtok
+		interaction.WorkerSocket = WorkerSocketPath(s.runDir)
 	}
 	request := adapter.StartRequest{RunID: string(runID), TaskID: string(runtime.Task.TaskID), WorkerID: workerID, ProjectRoot: runtime.Task.ProjectRoot, Contract: prompt, Model: model, Scenario: s.config.Scenario, Options: options, Interaction: interaction}
 
@@ -191,6 +196,15 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 			return s.cancelTask(runtime, "cancelled before the Worker session started")
 		}
 		return s.failTask(runtime, "start_session", err)
+	}
+
+	// Activate credential against the returned native session.
+	if interaction.Enabled && s.auth != nil && session.NativeSessionID != "" {
+		if bindErr := s.auth.BindWorkerSession(interaction.WorkerToken, session.NativeSessionID); bindErr != nil {
+			s.auth.RevokeWorkerAttempt(string(runtime.Task.TaskID), workerID, attempt.Number)
+			_ = harness.TerminateSession(context.Background(), session.NativeSessionID)
+			return s.failTask(runtime, "credential_binding", bindErr)
+		}
 	}
 
 	// Only OS Inspect may populate ProcessGroupToken. Never synthesize a PGID:

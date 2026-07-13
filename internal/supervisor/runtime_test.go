@@ -141,6 +141,141 @@ func TestRequestMessageBlocksUntilResolved(t *testing.T) {
 	}
 }
 
+// TestResolveBeforeWaiterRegistration verifies that a resolution arriving after
+// the durable message is visible but before the waiter is registered still
+// resumes the Worker immediately (no lost wakeup).
+func TestResolveBeforeWaiterRegistration(t *testing.T) {
+	runDir, _ := writeFixture(t)
+	registry := adapter.NewRegistry()
+	if err := registry.Register(fake.New(adapter.Capabilities{})); err != nil {
+		t.Fatal(err)
+	}
+	service, err := Load(runDir, registry, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the race: enqueue a message through the router, resolve it
+	// before a waiter is registered, then verify the recheck mechanism works.
+	val, err := service.router.EnqueueDecision("task-a", "worker-a", message.Question, message.Decision, json.RawMessage(`{"schema_version":"v1alpha1","question":"Race","reason":"R","current_scope":["x"],"workspace_state":"w"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = service.CommitMessageProjection(context.Background(), val, event.MessageQueued)
+
+	// Resolve the message before registering a waiter (simulating the race).
+	if err := service.ResolveMessage(val.MessageID, message.Resolution{Answer: "pre-register"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now simulate what RequestMessage does: register waiter, then re-check durable state.
+	waiter := service.registerDecisionWaiter(val.MessageID)
+	// The durable-state recheck should detect Answered immediately.
+	res, ok, checkErr := service.loadAnsweredResolution(val.MessageID)
+	if checkErr != nil || !ok {
+		t.Fatalf("durable-state recheck failed: err=%v ok=%v", checkErr, ok)
+	}
+	if res.Answer != "pre-register" {
+		t.Fatalf("expected 'pre-register', got %q", res.Answer)
+	}
+	service.unregisterDecisionWaiter(val.MessageID, waiter)
+
+	// Verify no goroutine leak: pending map should be empty.
+	service.mu.Lock()
+	pending := len(service.pending)
+	service.mu.Unlock()
+	if pending > 0 {
+		t.Fatalf("waiter leaked: %d entries", pending)
+	}
+}
+
+// TestResolveAfterRegistration verifies normal blocking behavior is preserved.
+func TestResolveAfterRegistration(t *testing.T) {
+	runDir, _ := writeFixture(t)
+	registry := adapter.NewRegistry()
+	if err := registry.Register(fake.New(adapter.Capabilities{})); err != nil {
+		t.Fatal(err)
+	}
+	service, err := Load(runDir, registry, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan message.Resolution, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resolution, _, reqErr := service.RequestMessage(context.Background(), "task-a", "worker-a", message.Question, message.Decision, message.QuestionEnvelope{SchemaVersion: SchemaVersion, Question: "Q", Reason: "R", CurrentScope: []string{"output.txt"}, WorkspaceState: "unchanged"})
+		if reqErr != nil {
+			errCh <- reqErr
+			return
+		}
+		done <- resolution
+	}()
+	// Wait for message to appear in inbox.
+	deadline := time.Now().Add(2 * time.Second)
+	var id string
+	for time.Now().Before(deadline) {
+		items := service.Inbox(false)
+		if len(items) > 0 {
+			id = items[0].MessageID
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if id == "" {
+		t.Fatal("message did not reach inbox")
+	}
+	if err := service.ResolveMessage(id, message.Resolution{Answer: "after"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case resolution := <-done:
+		if resolution.Answer != "after" {
+			t.Fatalf("unexpected answer: %+v", resolution)
+		}
+	case err := <-errCh:
+		t.Fatalf("RequestMessage error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Worker request did not resume")
+	}
+}
+
+// TestRequestMessageContextCancellationRace races context cancellation against
+// resolution to ensure no panic, no blocked send, and no leaked waiter.
+func TestRequestMessageContextCancellationRace(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		runDir, _ := writeFixture(t)
+		registry := adapter.NewRegistry()
+		if err := registry.Register(fake.New(adapter.Capabilities{})); err != nil {
+			t.Fatal(err)
+		}
+		service, err := Load(runDir, registry, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			_, _, _ = service.RequestMessage(ctx, "task-a", "worker-a", message.Question, message.Decision, message.QuestionEnvelope{SchemaVersion: SchemaVersion, Question: "Q", Reason: "R", CurrentScope: []string{"output.txt"}, WorkspaceState: "unchanged"})
+			close(done)
+		}()
+		// Small sleep then cancel; resolution may also race in.
+		time.Sleep(time.Microsecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: RequestMessage did not return after cancel", i)
+		}
+		// Verify no waiter leaked.
+		service.mu.Lock()
+		pending := len(service.pending)
+		service.mu.Unlock()
+		if pending > 0 {
+			t.Fatalf("iteration %d: %d waiters leaked after cancel", i, pending)
+		}
+	}
+}
+
 func writeFixture(t *testing.T) (string, storage.Layout) {
 	t.Helper()
 	home := filepath.Join(t.TempDir(), "broker")

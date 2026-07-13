@@ -9,4 +9,4 @@
 | Unified doctor | default all-Harness probe with optional `--harness` filter and stable JSON envelope | installed/authenticated local doctor output |
 | Unified contracts | common Result Envelope, normalized events, cancellation, exit, capability and protocol fixture checks | `go test ./...`, race tests, and native contract tests |
 
-Phase 4 does not claim compatibility for versions outside each Adapter's tested range. Uninstalled, unauthenticated, or provider-unavailable Harnesses remain explicit preflight failures; no credential or secret is persisted by the Broker.
+Phase 4 does not claim compatibility for versions outside each Adapter's tested range. Uninstalled, unauthenticated, or provider-unavailable Harnesses remain explicit preflight failures. Control credentials are persisted for CLI access; Worker credentials are process-lifetime only.

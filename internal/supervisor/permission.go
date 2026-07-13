@@ -235,11 +235,16 @@ func (s *Service) resolveNativePermission(ctx context.Context, value message.Mes
 		value = latest
 	}
 	if message.IsTerminal(value.Status) {
-		if value.Status == message.Answered {
-			// Idempotent success after concurrent identical resolution delivered.
-			return nil
+		// Compare canonical resolution: same semantic decision → idempotent success;
+		// conflicting decision → explicit conflict.
+		resJSON, marshalErr := json.Marshal(resolution)
+		if marshalErr != nil {
+			return marshalErr
 		}
-		return fmt.Errorf("message %q is already terminal (%s)", value.MessageID, value.Status)
+		if message.ResolutionsEqual(value.Resolution, resJSON) {
+			return nil // idempotent success
+		}
+		return fmt.Errorf("message %q is already terminal (%s) with a different resolution", value.MessageID, value.Status)
 	}
 
 	var payload message.PermissionRequestPayload

@@ -227,9 +227,43 @@ GitHub Actions (`.github/workflows/ci.yml`) runs the same core checks on `pull_r
 Security notes:
 
 * Control and Worker Unix sockets are separate; method authorization is role-based.
-* Control credentials use `crypto/rand` (256-bit) and live only under `control/auth.token` (0600); never Worker env/argv.
-* Worker credentials are per-attempt, env-injected only, and revoked on attempt end.
-* Same-UID malicious processes on the host are **not** fully isolated by Unix domain sockets alone; this is application-level authority separation, not a hard OS sandbox.
+* Control credentials use `crypto/rand` (256-bit) and are **persisted** under `control/auth.token` (0600) for CLI access across supervisor restarts; never Worker env/argv.
+* Worker credentials are process-lifetime credentials, env-injected only, and revoked on attempt end; they must **not** be persisted.
+* Application-level tokens do not provide hard isolation from every malicious same-UID process.
+* True protection of Broker Home from a malicious Worker requires a later OS sandbox / separate security principal.
+* PR 9.1 removes accidental argv leakage of Worker tokens but does not claim full same-UID confidentiality.
 * Permission delivery remains **at-least-once** across the crash window (not exactly-once).
 
 **Live authenticated harness smoke was not performed.**
+
+## Phase 4.9.1 — decision correctness, credential hygiene, and Supervisor ownership
+
+Executed after fixing lost-wakeup races, unifying resolution semantics, removing credential leaks, and adding Supervisor lease:
+
+```bash
+gofmt -w .
+test -z "$(gofmt -l .)"
+go test ./...
+go test -race ./...
+go test -race ./internal/adapter/... ./internal/message/... ./internal/supervisor/... -count=5
+go test -race ./internal/supervisor \
+  -run 'TestRequestMessage|TestResolve|TestScope|TestSupervisorLease' \
+  -count=50
+go test -race ./internal/adapter/opencode \
+  -run 'Test.*Turn|Test.*Idle|Test.*Historical|Test.*Generation' \
+  -count=50
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+### Security notes (updated):
+
+* Control credentials are **persisted** for CLI access across supervisor restarts.
+* Worker credentials are process-lifetime and must not be persisted.
+* Application-level tokens do not provide hard isolation from every malicious same-UID process.
+* True protection of Broker Home from a malicious Worker requires a later OS sandbox / separate security principal.
+* PR 9.1 removes accidental argv leakage of Worker tokens (previously present in `--mcp-config` JSON and hook command).
+* Permission and instruction delivery remain **at-least-once** across documented crash windows (not exactly-once).
+* No live authenticated smoke claim unless actually executed.
+
+**No live authenticated harness smoke was performed.**

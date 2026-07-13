@@ -213,33 +213,34 @@ func TestReplayRejectsPrematureResolution(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "messages.jsonl")
 	store := message.NewStore(path)
 	now := time.Now().UTC()
+	// Non-decision type (Instruction) must not carry resolution while queued.
 	bad := message.Message{
 		SchemaVersion: message.SchemaVersion, MessageID: "m1", RunID: "r1", TaskID: "t1",
-		Type: message.Question, Status: message.Queued, CreatedAt: now, UpdatedAt: now,
-		Payload: json.RawMessage(`{}`), Resolution: json.RawMessage(`{"answer":"nope"}`),
+		Type: message.Instruction, Status: message.Queued, CreatedAt: now, UpdatedAt: now,
+		Payload: json.RawMessage(`{"text":"test"}`), Resolution: json.RawMessage(`{"answer":"nope"}`),
 	}
 	if err := store.Append(bad); err != nil {
 		t.Fatal(err)
 	}
 	_, err := message.ReplayDetailed(path)
 	if err == nil {
-		t.Fatal("expected premature resolution corruption")
+		t.Fatal("expected premature resolution corruption on non-decision type")
 	}
 
 	path2 := filepath.Join(t.TempDir(), "m2.jsonl")
 	store2 := message.NewStore(path2)
-	first := message.Message{
-		SchemaVersion: message.SchemaVersion, MessageID: "m2", RunID: "r1", TaskID: "t1",
+	// Decision types (Question, ScopeExpansionRequest, PermissionRequest) allow
+	// frozen Resolution while Queued per PR 9.1.
+	okQ := message.Message{
+		SchemaVersion: message.SchemaVersion, MessageID: "m2-ok", RunID: "r1", TaskID: "t1",
 		Type: message.Question, Status: message.Queued, CreatedAt: now, UpdatedAt: now,
-		Payload: json.RawMessage(`{}`),
+		Payload: json.RawMessage(`{}`), Resolution: json.RawMessage(`{"answer":"fine"}`),
 	}
-	_ = store2.Append(first)
-	second := first
-	second.UpdatedAt = now.Add(time.Second)
-	second.Resolution = json.RawMessage(`{"answer":"sneak"}`)
-	_ = store2.Append(second)
-	if _, err := message.ReplayDetailed(path2); err == nil {
-		t.Fatal("expected corruption when resolution injected on queued")
+	if err := store2.Append(okQ); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := message.ReplayDetailed(path2); err != nil {
+		t.Fatalf("decision types may carry frozen resolution while queued: %v", err)
 	}
 }
 

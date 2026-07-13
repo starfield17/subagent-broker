@@ -41,7 +41,7 @@ func newLifecycleService(t *testing.T, harness *fake.Adapter, taskID string) (*S
 	service.messages = store
 	service.messageIndex = map[string]message.Message{}
 	service.router = router
-	service.pending = map[string]chan message.Resolution{}
+	service.pending = map[string]*pendingWaiter{}
 	service.active = map[string]activeWorker{}
 	service.config.CancelGrace = 200 * time.Millisecond
 	service.snapshot.Run.RunID = "run-life"

@@ -126,7 +126,7 @@ func TestRunDegradedExpiresPendingMessages(t *testing.T) {
 		router:            router,
 		messages:          store,
 		messageIndex:      map[string]message.Message{},
-		pending:           map[string]chan message.Resolution{},
+		pending:           map[string]*pendingWaiter{},
 		acceptingWork:     true,
 		fatalPersistence:  make(chan error, 1),
 		events:            &fakeEventAppender{},
