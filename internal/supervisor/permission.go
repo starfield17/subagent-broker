@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
@@ -222,7 +223,25 @@ func (s *Service) findPermissionByIdentity(taskID, harness, sessionID, nativeID,
 // resolveNativePermission freezes decision intent, validates exact binding, and
 // attempts Adapter.RespondPermission. On delivery failure the message stays
 // non-terminal Queued with frozen Resolution for identical retry.
+// Per-message delivery serialization ensures concurrent identical/conflicting
+// resolutions are linearizable without holding Router locks during adapter I/O.
 func (s *Service) resolveNativePermission(ctx context.Context, value message.Message, resolution message.Resolution) error {
+	lock := s.deliveryLock(value.MessageID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Re-load authoritative state under delivery serialization.
+	if latest, ok := s.router.Get(value.MessageID); ok {
+		value = latest
+	}
+	if message.IsTerminal(value.Status) {
+		if value.Status == message.Answered {
+			// Idempotent success after concurrent identical resolution delivered.
+			return nil
+		}
+		return fmt.Errorf("message %q is already terminal (%s)", value.MessageID, value.Status)
+	}
+
 	var payload message.PermissionRequestPayload
 	if err := json.Unmarshal(value.Payload, &payload); err != nil {
 		return err
@@ -422,6 +441,11 @@ func (s *Service) permissionBindingEventPayload(value message.Message, payload m
 		out["actual_attempt"] = active.attempt
 	}
 	return out
+}
+
+func (s *Service) deliveryLock(messageID string) *sync.Mutex {
+	v, _ := s.deliveryLocks.LoadOrStore(messageID, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // isNativePermission reports whether the message is a protocol-native permission

@@ -53,8 +53,21 @@ type sessionState struct {
 	promptInFlight bool
 	promptGen      uint64
 	resultSignaled bool
+	currentTurn    *ocTurnResult
 	// SSE producer coordination with watchExit.
 	sseDone chan struct{}
+}
+
+// ocTurnResult is generation-specific OpenCode completion state.
+type ocTurnResult struct {
+	generation uint64
+	ready      chan struct{}
+	completed  bool
+	success    bool
+	final      []byte
+	resultErr  string
+	usage      adapter.Usage
+	once       sync.Once
 }
 
 type sseEvent struct {
@@ -304,17 +317,45 @@ func (a *Adapter) CollectFinalResult(ctx context.Context, id string) (report.Env
 	if err != nil {
 		return report.Envelope{}, err
 	}
+	state.mu.Lock()
+	turn := state.currentTurn
+	state.mu.Unlock()
+	if turn == nil {
+		// Fallback for tests that only call collectFinal without promptAsync.
+		state.mu.Lock()
+		raw := append([]byte(nil), state.final...)
+		reason := state.resultError
+		state.mu.Unlock()
+		if reason != "" {
+			return report.Envelope{}, fmt.Errorf("OpenCode session failed: %s", reason)
+		}
+		if len(raw) == 0 {
+			return report.Envelope{}, fmt.Errorf("OpenCode: no authoritative generation")
+		}
+		return protocol.ParseEnvelope(raw)
+	}
 	select {
-	case <-state.resultReady:
+	case <-turn.ready:
 	case <-ctx.Done():
 		return report.Envelope{}, ctx.Err()
 	}
 	state.mu.Lock()
-	raw := append([]byte(nil), state.final...)
-	reason := state.resultError
-	state.mu.Unlock()
-	if reason != "" {
+	if state.currentTurn != turn {
+		state.mu.Unlock()
+		return report.Envelope{}, fmt.Errorf("OpenCode: generation superseded")
+	}
+	if !turn.completed || !turn.success {
+		reason := turn.resultErr
+		state.mu.Unlock()
+		if reason == "" {
+			reason = "generation incomplete"
+		}
 		return report.Envelope{}, fmt.Errorf("OpenCode session failed: %s", reason)
+	}
+	raw := append([]byte(nil), turn.final...)
+	state.mu.Unlock()
+	if len(raw) == 0 {
+		return report.Envelope{}, fmt.Errorf("OpenCode: empty final for current generation")
 	}
 	return protocol.ParseEnvelope(raw)
 }
@@ -380,18 +421,16 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 		state.mu.Unlock()
 		return fmt.Errorf("OpenCode prompt already in flight; concurrent prompt rejected")
 	}
-	// Multi-turn: re-arm result readiness after a prior session.idle completed.
-	if state.resultSignaled {
-		state.resultReady = make(chan struct{})
-		state.finishOnce = sync.Once{}
-		state.resultOnce = sync.Once{}
-		state.resultSignaled = false
-		state.resultError = ""
-	}
+	// New generation with independent readiness — never re-arm a prior channel.
 	state.generation++
 	gen := state.generation
+	turn := &ocTurnResult{generation: gen, ready: make(chan struct{})}
+	state.currentTurn = turn
 	state.promptInFlight = true
 	state.promptGen = gen
+	state.resultError = ""
+	state.final = nil
+	state.resultSignaled = false
 	sessionID := state.sessionID
 	state.mu.Unlock()
 
@@ -477,38 +516,43 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 	case "permission.asked":
 		native.Kind = event.PermissionRequested
 	case "session.idle":
-		// Freeze current generation result, then emit authoritative ResultSubmitted.
-		// Keep the server alive; Supervisor decides next turn vs terminate.
+		// Freeze generation result and close readiness BEFORE publishing boundary.
 		state.mu.Lock()
 		gen := state.promptGen
+		turn := state.currentTurn
 		if state.promptInFlight && state.promptGen == gen {
 			state.promptInFlight = false
 		}
 		state.mu.Unlock()
+		success := true
 		if err := a.collectFinal(state); err != nil {
+			success = false
 			state.mu.Lock()
-			if gen == state.generation || gen == state.promptGen {
-				state.resultError = err.Error()
+			if turn != nil && turn.generation == gen {
+				turn.resultErr = err.Error()
 			}
+			state.resultError = err.Error()
 			state.mu.Unlock()
 			native.Kind = event.TurnFailed
 		} else {
 			native.Kind = event.ResultSubmitted
 		}
+		state.mu.Lock()
+		if turn != nil && turn.generation == gen && !turn.completed {
+			turn.final = append([]byte(nil), state.final...)
+			turn.usage = state.usage
+			turn.success = success
+			turn.completed = true
+			turn.once.Do(func() { close(turn.ready) })
+			state.resultSignaled = true
+		}
+		state.mu.Unlock()
 	}
 	state.mu.Lock()
 	state.history = append(state.history, native)
 	state.mu.Unlock()
 	if state.stream != nil {
 		_ = state.stream.Publish(native)
-	}
-	if value.Type == "session.idle" {
-		state.mu.Lock()
-		if !state.resultSignaled {
-			state.resultSignaled = true
-			close(state.resultReady)
-		}
-		state.mu.Unlock()
 	}
 }
 

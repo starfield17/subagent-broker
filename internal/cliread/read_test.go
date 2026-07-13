@@ -135,6 +135,8 @@ func listenSocket(t *testing.T, runDir string) (net.Listener, string) {
 	if err := os.MkdirAll(filepath.Dir(supervisor.SocketPath(runDir)), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Control credential required by CallIPC after auth hardening.
+	_ = os.WriteFile(supervisor.ControlTokenPath(runDir), []byte("test-control-token\n"), 0o600)
 	listener, err := net.Listen("unix", supervisor.SocketPath(runDir))
 	if err != nil {
 		t.Fatal(err)

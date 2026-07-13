@@ -163,6 +163,14 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	}
 	executable, _ := os.Executable()
 	interaction := adapter.InteractionConfig{Enabled: !s.config.SafeMode && harnessName == string(adapter.HarnessClaudeCode), BrokerExecutable: executable, RunDir: s.runDir}
+	// Per-attempt Worker credential (env only; never control token or argv).
+	if s.auth != nil {
+		wtok, tokErr := s.auth.IssueWorkerCredential(string(runID), string(runtime.Task.TaskID), workerID, attempt.Number, resumeSessionID)
+		if tokErr == nil {
+			interaction.WorkerToken = wtok
+			interaction.WorkerSocket = WorkerSocketPath(s.runDir)
+		}
+	}
 	request := adapter.StartRequest{RunID: string(runID), TaskID: string(runtime.Task.TaskID), WorkerID: workerID, ProjectRoot: runtime.Task.ProjectRoot, Contract: prompt, Model: model, Scenario: s.config.Scenario, Options: options, Interaction: interaction}
 
 	var session adapter.Session
@@ -175,6 +183,9 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		session, err = harness.StartSession(workerCtx, request)
 	}
 	if err != nil {
+		if s.auth != nil {
+			s.auth.RevokeWorkerAttempt(string(runtime.Task.TaskID), workerID, attempt.Number)
+		}
 		_ = s.finishAttempt(runtime, workerpkg.AttemptFailedStart, err.Error())
 		if s.isCancelled() {
 			return s.cancelTask(runtime, "cancelled before the Worker session started")
@@ -200,6 +211,9 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	}
 	s.mu.Unlock()
 	defer func() {
+		if s.auth != nil {
+			s.auth.RevokeWorkerAttempt(string(runtime.Task.TaskID), workerID, attempt.Number)
+		}
 		s.mu.Lock()
 		delete(s.active, string(runtime.Task.TaskID))
 		s.mu.Unlock()
@@ -277,6 +291,10 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	}
 	if !sessionResult.ResultSeen && !sessionResult.Resolution.ExitObserved && sessionResult.Resolution.OrphanRisk {
 		return s.failTask(runtime, "process_unconfirmed", fmt.Errorf("worker exit unobserved and tree unconfirmed"))
+	}
+	// Exit code zero is not proof of a valid current-generation result.
+	if !sessionResult.ResultSeen && !s.isCancelled() && !s.isTaskCancelled(string(runtime.Task.TaskID)) && !sessionResult.TimedOut {
+		return s.failTask(runtime, "result_missing", fmt.Errorf("worker session ended without an authoritative ResultSubmitted for the current turn"))
 	}
 
 	result, err := harness.CollectFinalResult(context.Background(), session.NativeSessionID)

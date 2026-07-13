@@ -172,7 +172,8 @@ type Service struct {
 	config         Config
 	snapshot       Snapshot
 	events         eventAppender
-	listener       net.Listener
+	listener       net.Listener // control-plane Unix socket
+	workerListener net.Listener // worker-plane Unix socket (worker_request only)
 	terminal       chan struct{}
 	cancelled      bool
 	cancelledTasks map[string]bool
@@ -194,6 +195,12 @@ type Service struct {
 	// persistSnapshotFn overrides disk persistence for tests. When nil,
 	// persistSnapshotLocked writes the multi-file Snapshot projection.
 	persistSnapshotFn func(value Snapshot) error
+
+	// IPC authorities: control plane vs worker plane.
+	auth *AuthState
+
+	// Per-message native permission delivery serialization (no adapter I/O under Router lock).
+	deliveryLocks sync.Map // messageID -> *sync.Mutex
 }
 
 type activeWorker struct {
@@ -481,7 +488,12 @@ func (s *Service) Start(ctx context.Context) error {
 		_ = s.listener.Close()
 		s.listener = nil
 	}
+	if s.workerListener != nil {
+		_ = s.workerListener.Close()
+		s.workerListener = nil
+	}
 	_ = os.Remove(SocketPath(s.runDir))
+	_ = os.Remove(WorkerSocketPath(s.runDir))
 	status := s.snapshot.Run.Status
 	s.mu.Unlock()
 	// Best-effort final identity write; do not fail-close again if already closed.
@@ -1944,6 +1956,13 @@ func (s *Service) prepareIPC() error {
 	if err := os.MkdirAll(filepath.Join(s.runDir, "control"), 0o700); err != nil {
 		return err
 	}
+	if s.auth == nil {
+		s.auth = newAuthState()
+	}
+	if _, err := s.auth.InitControlCredential(s.runDir); err != nil {
+		return err
+	}
+	// Control-plane socket (operator methods only).
 	path := SocketPath(s.runDir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -1957,8 +1976,22 @@ func (s *Service) prepareIPC() error {
 		_ = listener.Close()
 		return err
 	}
+	// Worker-plane socket (worker_request only).
+	wpath := WorkerSocketPath(s.runDir)
+	_ = os.Remove(wpath)
+	wlistener, err := net.Listen("unix", wpath)
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	if err := os.Chmod(wpath, 0o600); err != nil {
+		_ = listener.Close()
+		_ = wlistener.Close()
+		return err
+	}
 	s.mu.Lock()
 	s.listener = listener
+	s.workerListener = wlistener
 	s.mu.Unlock()
 	return nil
 }
@@ -2007,10 +2040,23 @@ func (s *Service) heartbeat(ctx context.Context) {
 }
 
 func (s *Service) serveIPC(ctx context.Context) {
-	for {
+	// Control plane.
+	go s.acceptLoop(ctx, func() net.Listener {
 		s.mu.Lock()
-		listener := s.listener
-		s.mu.Unlock()
+		defer s.mu.Unlock()
+		return s.listener
+	}, CallerControl)
+	// Worker plane.
+	s.acceptLoop(ctx, func() net.Listener {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.workerListener
+	}, CallerWorker)
+}
+
+func (s *Service) acceptLoop(ctx context.Context, get func() net.Listener, plane CallerRole) {
+	for {
+		listener := get()
 		if listener == nil {
 			return
 		}
@@ -2021,7 +2067,7 @@ func (s *Service) serveIPC(ctx context.Context) {
 			}
 			return
 		}
-		go s.handleConnection(ctx, conn)
+		go s.handleConnection(ctx, conn, plane)
 	}
 }
 

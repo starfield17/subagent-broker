@@ -156,19 +156,32 @@ func TestEventStreamConcurrentCloseOps(t *testing.T) {
 }
 
 func TestEventStreamFIFOSerializedProducer(t *testing.T) {
-	s := NewEventStream(EventStreamOptions{OutputBuffer: 8, ProgressQueueLimit: 32})
-	kinds := []string{event.TurnStarted, event.PermissionRequested, event.ResultSubmitted}
+	// Mixed progress + critical; later critical must not overtake earlier progress.
+	s := NewEventStream(EventStreamOptions{OutputBuffer: 0, ProgressQueueLimit: 32})
+	kinds := []string{
+		event.ModelOutputDelta,
+		event.ToolStarted,
+		event.ToolCompleted,
+		event.PermissionRequested,
+		event.ResultSubmitted,
+	}
 	for _, k := range kinds {
 		if s.Publish(adapter.NativeEvent{Kind: k}) != PublishAccepted {
 			t.Fatal(k)
 		}
 	}
-	go s.CloseGracefully()
+	// Saturate before drain: unbuffered out + no consumer yet; events sit ordered in queue.
 	var got []string
-	for ev := range s.Events() {
-		got = append(got, ev.Kind)
-	}
-	if len(got) != 3 {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ev := range s.Events() {
+			got = append(got, ev.Kind)
+		}
+	}()
+	s.CloseGracefully()
+	<-done
+	if len(got) != len(kinds) {
 		t.Fatalf("got=%v", got)
 	}
 	for i, k := range kinds {

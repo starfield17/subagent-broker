@@ -82,6 +82,10 @@ type InteractionConfig struct {
 	Enabled          bool   `json:"enabled"`
 	BrokerExecutable string `json:"broker_executable,omitempty"`
 	RunDir           string `json:"run_dir,omitempty"`
+	// WorkerToken is the per-attempt Worker IPC credential. Passed only via process
+	// environment / MCP env — never argv. Not for control-plane use.
+	WorkerToken  string `json:"-"`
+	WorkerSocket string `json:"-"`
 }
 
 type ResumeRequest struct {

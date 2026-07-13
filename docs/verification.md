@@ -209,3 +209,27 @@ Results: all packages PASS; race stress used `-count=5` for supervisor/message (
 Crash window is **at-least-once** (intent persisted before adapter send; retry may resend). **Not exactly-once.**
 
 **Live authenticated permission retry smoke was not performed.**
+
+## Phase 4.9.0 — control-plane auth and multi-turn linearizability
+
+```bash
+gofmt -w .
+test -z "$(gofmt -l .)"
+go test ./...
+go test -race ./...
+go test -race ./internal/adapter/... ./internal/message/... ./internal/supervisor/... -count=5
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the same core checks on `pull_request` and `push` to `main` (Linux only; process-tree support is Linux-specific).
+
+Security notes:
+
+* Control and Worker Unix sockets are separate; method authorization is role-based.
+* Control credentials use `crypto/rand` (256-bit) and live only under `control/auth.token` (0600); never Worker env/argv.
+* Worker credentials are per-attempt, env-injected only, and revoked on attempt end.
+* Same-UID malicious processes on the host are **not** fully isolated by Unix domain sockets alone; this is application-level authority separation, not a hard OS sandbox.
+* Permission delivery remains **at-least-once** across the crash window (not exactly-once).
+
+**Live authenticated harness smoke was not performed.**

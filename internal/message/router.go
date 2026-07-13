@@ -12,13 +12,22 @@ import (
 
 // Router is the durable outbox / inbox state machine for run-scoped messages.
 // Persistence always precedes in-memory index updates.
+// Per-message locks linearize mutations for a single message_id (intent freeze,
+// delivery attempts, transitions) so concurrent clients cannot both observe a
+// stale snapshot and both append conflicting journal records.
 type Router struct {
-	mu    sync.Mutex
-	runID string
-	store *Store
-	index map[string]Message
-	now   func() time.Time
-	newID func(time.Time) (string, error)
+	mu       sync.Mutex
+	runID    string
+	store    *Store
+	index    map[string]Message
+	now      func() time.Time
+	newID    func(time.Time) (string, error)
+	msgLocks sync.Map // messageID -> *sync.Mutex
+}
+
+func (r *Router) lockMessage(messageID string) *sync.Mutex {
+	v, _ := r.msgLocks.LoadOrStore(messageID, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 // NewRouterOptions configures a Router.
@@ -175,10 +184,15 @@ func (r *Router) EnqueueDecisionWithAttempt(
 // message terminal. Journal append precedes the in-memory index update.
 // Identical semantic resolutions are idempotent; conflicts are rejected.
 // Does not increment DeliveryAttempts.
+// Holds the per-message lock for the entire mutation (linearizable).
 func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMessage) (Message, error) {
 	if len(resolution) == 0 {
 		return Message{}, fmt.Errorf("resolution is required")
 	}
+	ml := r.lockMessage(messageID)
+	ml.Lock()
+	defer ml.Unlock()
+
 	r.mu.Lock()
 	current, ok := r.index[messageID]
 	if !ok {
@@ -198,7 +212,6 @@ func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMes
 		return Message{}, fmt.Errorf("resolution intent requires queued status (status=%s)", current.Status)
 	}
 
-	// Normalize to stable JSON for durable equality.
 	normalized, err := normalizeResolutionJSON(resolution)
 	if err != nil {
 		return Message{}, err
@@ -209,7 +222,7 @@ func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMes
 			return Message{}, err
 		}
 		if bytesEqualJSON(existing, normalized) {
-			return current, nil // idempotent
+			return current, nil
 		}
 		return Message{}, fmt.Errorf("conflicting resolution: decision is already frozen")
 	}
@@ -221,6 +234,11 @@ func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMes
 		return Message{}, err
 	}
 	r.mu.Lock()
+	// Re-check: another path may have installed a terminal state (expire/cancel).
+	if latest, ok := r.index[messageID]; ok && IsTerminal(latest.Status) {
+		r.mu.Unlock()
+		return Message{}, fmt.Errorf("message %q became terminal during intent freeze", messageID)
+	}
 	r.index[messageID] = copyMessage(candidate)
 	r.mu.Unlock()
 	return copyMessage(candidate), nil
@@ -229,6 +247,10 @@ func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMes
 // ReclassifyDelivery updates DeliveryMode for a still-queued instruction.
 // Only next_turn → resume is permitted (session gone, resume path remains).
 func (r *Router) ReclassifyDelivery(messageID string, mode DeliveryMode) (Message, error) {
+	ml := r.lockMessage(messageID)
+	ml.Lock()
+	defer ml.Unlock()
+
 	r.mu.Lock()
 	current, ok := r.index[messageID]
 	if !ok {
@@ -258,6 +280,10 @@ func (r *Router) ReclassifyDelivery(messageID string, mode DeliveryMode) (Messag
 		return Message{}, err
 	}
 	r.mu.Lock()
+	if latest, ok := r.index[messageID]; ok && IsTerminal(latest.Status) {
+		r.mu.Unlock()
+		return Message{}, fmt.Errorf("message %q became terminal during reclassify", messageID)
+	}
 	r.index[messageID] = copyMessage(candidate)
 	r.mu.Unlock()
 	return copyMessage(candidate), nil
@@ -266,8 +292,12 @@ func (r *Router) ReclassifyDelivery(messageID string, mode DeliveryMode) (Messag
 // RecordDeliveryAttempt increments delivery_attempts and optionally updates status.
 // On success (cause == nil) a previous Error is cleared. On failure the message
 // may remain Queued (next empty) with Error set — used for retryable native
-// permission delivery.
+// permission delivery. Holds the per-message lock for the entire mutation.
 func (r *Router) RecordDeliveryAttempt(messageID string, next Status, cause error) (Message, error) {
+	ml := r.lockMessage(messageID)
+	ml.Lock()
+	defer ml.Unlock()
+
 	r.mu.Lock()
 	current, ok := r.index[messageID]
 	if !ok {
@@ -289,19 +319,24 @@ func (r *Router) RecordDeliveryAttempt(messageID string, next Status, cause erro
 	if cause != nil {
 		candidate.Error = cause.Error()
 	} else {
-		// Successful delivery clears a prior retry error.
 		candidate.Error = ""
 	}
 	if err := r.store.Append(candidate); err != nil {
 		return Message{}, err
 	}
 	r.mu.Lock()
+	if latest, ok := r.index[messageID]; ok && IsTerminal(latest.Status) && next != latest.Status {
+		// Do not overwrite a newer terminal with a stale delivery attempt.
+		r.mu.Unlock()
+		return copyMessage(latest), fmt.Errorf("message %q is already terminal (%s)", messageID, latest.Status)
+	}
 	r.index[messageID] = copyMessage(candidate)
 	r.mu.Unlock()
 	return copyMessage(candidate), nil
 }
 
 // Transition validates and persists a status change, then updates memory.
+// Holds the per-message lock for the entire mutation (linearizable).
 func (r *Router) Transition(
 	messageID string,
 	next Status,
@@ -309,6 +344,10 @@ func (r *Router) Transition(
 	resolution json.RawMessage,
 	cause error,
 ) (Message, error) {
+	ml := r.lockMessage(messageID)
+	ml.Lock()
+	defer ml.Unlock()
+
 	r.mu.Lock()
 	current, ok := r.index[messageID]
 	if !ok {
@@ -322,7 +361,6 @@ func (r *Router) Transition(
 		return Message{}, err
 	}
 	if current.Status == next {
-		// Idempotent no-op: do not rewrite terminal (or other) records.
 		return current, nil
 	}
 
@@ -344,9 +382,23 @@ func (r *Router) Transition(
 	}
 
 	r.mu.Lock()
+	if latest, ok := r.index[messageID]; ok && IsTerminal(latest.Status) && latest.Status != next {
+		r.mu.Unlock()
+		return copyMessage(latest), fmt.Errorf("message %q is already terminal (%s)", messageID, latest.Status)
+	}
 	r.index[messageID] = copyMessage(candidate)
 	r.mu.Unlock()
 	return copyMessage(candidate), nil
+}
+
+// WithMessageLock runs fn while holding the per-message mutation lock.
+// Used by Supervisor native permission delivery so freeze + deliver + record
+// are serialized without holding the global Router mutex during adapter I/O.
+func (r *Router) WithMessageLock(messageID string, fn func() error) error {
+	ml := r.lockMessage(messageID)
+	ml.Lock()
+	defer ml.Unlock()
+	return fn()
 }
 
 // Get returns a copy of a message by id.
