@@ -3,9 +3,12 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
@@ -26,6 +29,15 @@ func (s *Service) Inbox(includeResolved bool) []message.Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return message.Sorted(s.messageIndex, includeResolved)
+}
+
+// decisionOpLock returns the Service-level per-message operation mutex.
+// Serializes RequestMessage setup, ResolveMessage, native permission resolution,
+// and expiration for a single messageID without holding Router's internal lock
+// across adapter I/O.
+func (s *Service) decisionOpLock(messageID string) *sync.Mutex {
+	v, _ := s.decisionOperationLocks.LoadOrStore(messageID, &sync.Mutex{})
+	return v.(*sync.Mutex)
 }
 
 func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, messageType message.Type, category message.Category, payload any) (message.Resolution, string, error) {
@@ -51,6 +63,32 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 		return message.Resolution{}, value.MessageID, err
 	}
 
+	// Acquire Service decision-operation lock for setup so a concurrent resolver
+	// cannot answer between waiting-state setup and waiter registration without
+	// RequestMessage observing the terminal state.
+	opLock := s.decisionOpLock(value.MessageID)
+	opLock.Lock()
+
+	// Register buffered waiter under the operation lock.
+	waiter := s.registerDecisionWaiter(value.MessageID)
+
+	// Authoritative re-read: resolver may have already answered.
+	if res, ok, checkErr := s.loadAnsweredResolution(value.MessageID); checkErr == nil && ok {
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.recomputeTaskWaiting(taskID)
+		opLock.Unlock()
+		return res, value.MessageID, nil
+	}
+	// Other terminal states (Expired/Failed): return without setting waiting.
+	if current, found := s.router.Get(value.MessageID); found && message.IsTerminal(current.Status) {
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.recomputeTaskWaiting(taskID)
+		opLock.Unlock()
+		return message.Resolution{}, value.MessageID, &message.ErrMessageTerminalNotAnswered{
+			MessageID: value.MessageID, Status: current.Status,
+		}
+	}
+
 	question := s.questionEnvelopeFor(value)
 	taskDir := filepath.Join(s.paths.Tasks, taskID)
 	// Always archive; update top-level if this is the highest-priority pending.
@@ -59,24 +97,19 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 		if tErr == nil {
 			_ = s.CommitMessageProjection(ctx, failed, event.MessageFailed)
 		}
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		opLock.Unlock()
 		return message.Resolution{}, value.MessageID, err
 	}
 	if err := s.refreshQuestionProjection(taskID); err != nil {
-		return message.Resolution{}, value.MessageID, err
-	}
-
-	// Register buffered waiter, then immediately re-read durable state so a
-	// resolver that answered between enqueue and registration is detected.
-	waiter := s.registerDecisionWaiter(value.MessageID)
-
-	// Re-check: durable Router state is authoritative.
-	if res, ok, checkErr := s.loadAnsweredResolution(value.MessageID); checkErr == nil && ok {
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
-		return res, value.MessageID, nil
+		opLock.Unlock()
+		return message.Resolution{}, value.MessageID, err
 	}
 
 	if err := s.setTaskWaiting(taskID, messageType); err != nil {
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		opLock.Unlock()
 		return message.Resolution{}, value.MessageID, err
 	}
 
@@ -88,14 +121,34 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 	}
 	if err := s.appendEvent(event.Input{TaskID: taskID, WorkerID: workerID, Source: "message-router", Type: eventType, Severity: "warning", Payload: map[string]any{"message_id": value.MessageID, "type": messageType}}); err != nil {
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		opLock.Unlock()
 		return message.Resolution{}, value.MessageID, err
 	}
+
+	// Final authoritative recheck while still holding the operation lock.
+	if res, ok, checkErr := s.loadAnsweredResolution(value.MessageID); checkErr == nil && ok {
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.recomputeTaskWaiting(taskID)
+		opLock.Unlock()
+		return res, value.MessageID, nil
+	}
+	if current, found := s.router.Get(value.MessageID); found && message.IsTerminal(current.Status) {
+		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.recomputeTaskWaiting(taskID)
+		opLock.Unlock()
+		return message.Resolution{}, value.MessageID, &message.ErrMessageTerminalNotAnswered{
+			MessageID: value.MessageID, Status: current.Status,
+		}
+	}
+	// Message remains pending — release op lock before blocking wait so resolver can proceed.
+	opLock.Unlock()
 
 	select {
 	case <-waiter.ch:
 		// After any wake-up, re-read durable Router state rather than trusting
 		// a channel payload. The durable Message.Resolution is authoritative.
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
+		_ = s.recomputeTaskWaiting(taskID)
 		if res, ok, checkErr := s.loadAnsweredResolution(value.MessageID); checkErr == nil && ok {
 			return res, value.MessageID, nil
 		}
@@ -104,8 +157,9 @@ func (s *Service) RequestMessage(ctx context.Context, taskID, workerID string, m
 		return message.Resolution{}, value.MessageID, fmt.Errorf("waiter notified but message %q is not answered", value.MessageID)
 	case <-ctx.Done():
 		s.unregisterDecisionWaiter(value.MessageID, waiter)
-		// A durable Answered message remains retrievable even if the caller
-		// receives context cancellation — the caller may re-read.
+		// Recompute waiting so a concurrent answer does not leave the Task blocked
+		// with no pending decisions. Preserve any durable answer.
+		_ = s.recomputeTaskWaiting(taskID)
 		return message.Resolution{}, value.MessageID, ctx.Err()
 	}
 }
@@ -114,6 +168,14 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 	if s.router == nil {
 		return fmt.Errorf("message router is not initialized")
 	}
+
+	// Hold Service decision-operation lock across the complete application operation:
+	// reload → validate → freeze → scope side effect → Answered → notify → recompute.
+	// Does not hold Router's global mutex across adapter I/O.
+	opLock := s.decisionOpLock(id)
+	opLock.Lock()
+	defer opLock.Unlock()
+
 	value, ok := s.router.Get(id)
 	if !ok {
 		// Fallback to index for legacy paths.
@@ -124,13 +186,21 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 			return fmt.Errorf("message %q was not found", id)
 		}
 	}
+
+	resJSON, err := json.Marshal(resolution)
+	if err != nil {
+		return err
+	}
+
+	// Terminal semantics: only Answered + identical resolution is idempotent success.
 	if message.IsTerminal(value.Status) {
-		// Compare resolution for idempotency/conflict.
-		resJSON, _ := json.Marshal(resolution)
-		if message.ResolutionsEqual(value.Resolution, resJSON) {
-			return nil // idempotent success
+		if value.Status == message.Answered && message.ResolutionsEqual(value.Resolution, resJSON) {
+			return nil
 		}
-		return fmt.Errorf("message %q is already terminal (%s) with a different resolution", id, value.Status)
+		if value.Status == message.Answered {
+			return &message.ErrResolutionConflict{MessageID: id, Status: value.Status}
+		}
+		return &message.ErrMessageTerminalNotAnswered{MessageID: id, Status: value.Status}
 	}
 	if value.Type == message.Question && strings.TrimSpace(resolution.Answer) == "" {
 		return fmt.Errorf("question answer is required")
@@ -143,20 +213,23 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 	}
 
 	// 1) Freeze canonical resolution before any side effect.
-	resJSON, err := json.Marshal(resolution)
-	if err != nil {
-		return err
-	}
 	frozen, freezeResult, freezeErr := s.router.FreezeResolution(id, resJSON)
 	if freezeErr != nil {
 		if freezeResult == message.ResolutionAlreadyIdentical {
 			// Already frozen with same resolution; continue to complete.
+			frozen = value
+			if latest, ok := s.router.Get(id); ok {
+				frozen = latest
+			}
+		} else if freezeResult == message.ResolutionConflict {
+			return &message.ErrResolutionConflict{MessageID: id, Status: value.Status}
 		} else {
 			return freezeErr
 		}
 	}
 
 	// 2) For scope expansion: apply expansion only after freeze confirms allow.
+	// Held under the Service op lock so expiration cannot interleave.
 	if value.Type == message.ScopeExpansionRequest && resolution.Decision.Allowed {
 		if err := s.approveScope(frozen, resolution.Decision); err != nil {
 			return err
@@ -166,13 +239,23 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 	// 3) Transition to Answered using the exact frozen resolution.
 	answered, err := s.router.Transition(id, message.Answered, "", frozen.Resolution, nil)
 	if err != nil {
+		// Re-read: may have raced with another path (should not under op lock).
+		if latest, ok := s.router.Get(id); ok && message.IsTerminal(latest.Status) {
+			if latest.Status == message.Answered && message.ResolutionsEqual(latest.Resolution, resJSON) {
+				return nil
+			}
+			if latest.Status == message.Answered {
+				return &message.ErrResolutionConflict{MessageID: id, Status: latest.Status}
+			}
+			return &message.ErrMessageTerminalNotAnswered{MessageID: id, Status: latest.Status}
+		}
 		return err
 	}
 	if err := s.CommitMessageProjection(context.Background(), answered, event.MessageAnswered); err != nil {
 		return err
 	}
 
-	// 4) Notify waiter (non-blocking; durable state is authoritative).
+	// 4) Notify waiter (non-blocking; durable state is authoritative; never close channel).
 	s.notifyDecisionWaiter(id)
 
 	// Refresh top-level projection: switch to next pending or clear.
@@ -657,21 +740,55 @@ func instructionText(value message.Message) string {
 	return string(value.Payload)
 }
 
-// expireTaskMessages expires all pending messages for a task and clears projection.
+// expireTaskMessages expires pending messages for a task under Service-level
+// per-message serialization. Messages with a frozen resolution are not silently
+// expired — they surface as reconciliation-required and remain queued.
 func (s *Service) expireTaskMessages(taskID, reason string) ([]message.Message, error) {
 	if s.router == nil {
 		return nil, nil
 	}
-	expired, err := s.router.ExpireTask(taskID, reason)
-	if err != nil {
-		return expired, err
-	}
-	for _, item := range expired {
-		if cErr := s.CommitMessageProjection(context.Background(), item, event.MessageExpired); cErr != nil {
-			return expired, cErr
+	// Enumerate candidates without holding Service op locks, then expire one-by-one.
+	candidates := s.router.PendingDecisions(taskID)
+	// Also include pending non-decision messages (instructions etc.) via Snapshot.
+	all := s.router.Snapshot(true)
+	ids := make([]string, 0)
+	seen := map[string]bool{}
+	for _, item := range candidates {
+		if !seen[item.MessageID] && message.IsPending(item.Status) {
+			ids = append(ids, item.MessageID)
+			seen[item.MessageID] = true
 		}
-		// Unblock any waiters via buffered notification.
-		s.notifyDecisionWaiter(item.MessageID)
+	}
+	for _, item := range all {
+		if item.TaskID != taskID || !message.IsPending(item.Status) || seen[item.MessageID] {
+			continue
+		}
+		ids = append(ids, item.MessageID)
+		seen[item.MessageID] = true
+	}
+	sort.Strings(ids) // stable lock order
+
+	var cause error
+	if strings.TrimSpace(reason) != "" {
+		cause = fmt.Errorf("%s", reason)
+	}
+	expired := make([]message.Message, 0, len(ids))
+	var firstReconcile error
+	for _, id := range ids {
+		item, err := s.expireOneMessage(id, cause)
+		if err != nil {
+			var recon *message.ErrResolutionReconciliationRequired
+			if errors.As(err, &recon) {
+				if firstReconcile == nil {
+					firstReconcile = err
+				}
+				continue
+			}
+			return expired, err
+		}
+		if item.MessageID != "" {
+			expired = append(expired, item)
+		}
 	}
 	if err := message.ClearTopLevelQuestion(filepath.Join(s.paths.Tasks, taskID)); err != nil {
 		return expired, err
@@ -679,7 +796,46 @@ func (s *Service) expireTaskMessages(taskID, reason string) ([]message.Message, 
 	if err := s.recomputeTaskWaiting(taskID); err != nil {
 		return expired, err
 	}
+	if firstReconcile != nil && len(expired) == 0 {
+		return expired, firstReconcile
+	}
 	return expired, nil
+}
+
+// expireOneMessage acquires the Service decision-operation lock, re-reads
+// authoritative state, and expires only when safe.
+func (s *Service) expireOneMessage(id string, cause error) (message.Message, error) {
+	opLock := s.decisionOpLock(id)
+	opLock.Lock()
+	defer opLock.Unlock()
+
+	value, ok := s.router.Get(id)
+	if !ok {
+		return message.Message{}, nil
+	}
+	if message.IsTerminal(value.Status) {
+		return message.Message{}, nil
+	}
+	// Queued decision with frozen resolution must not be silently expired.
+	if len(value.Resolution) > 0 {
+		return message.Message{}, &message.ErrResolutionReconciliationRequired{
+			MessageID: id,
+			Reason:    "frozen resolution present; refuse silent expiration",
+		}
+	}
+	item, err := s.router.Transition(id, message.Expired, "", nil, cause)
+	if err != nil {
+		// Terminal race under lock is unexpected; re-read.
+		if latest, ok := s.router.Get(id); ok && message.IsTerminal(latest.Status) {
+			return message.Message{}, nil
+		}
+		return message.Message{}, err
+	}
+	if cErr := s.CommitMessageProjection(context.Background(), item, event.MessageExpired); cErr != nil {
+		return item, cErr
+	}
+	s.notifyDecisionWaiter(item.MessageID)
+	return item, nil
 }
 
 func (s *Service) setTaskWaiting(taskID string, kind message.Type) error {

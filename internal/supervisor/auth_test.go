@@ -55,6 +55,9 @@ func TestWorkerCredentialBinding(t *testing.T) {
 	if !ok || b.TaskID != "task-a" || b.AttemptNumber != 1 {
 		t.Fatalf("%+v ok=%v", b, ok)
 	}
+	if !b.Bound || b.NativeSessionID != "sess-1" {
+		t.Fatalf("expected pre-bound credential, got bound=%v session=%q", b.Bound, b.NativeSessionID)
+	}
 	if _, ok := auth.AuthenticateWorker("nope"); ok {
 		t.Fatal("bad worker token")
 	}
@@ -70,6 +73,23 @@ func TestWorkerCredentialBinding(t *testing.T) {
 	}
 }
 
+func TestUnboundCredentialRejected(t *testing.T) {
+	auth := newAuthState()
+	tok, err := auth.IssueWorkerCredential("run1", "task-a", "w1", 1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := auth.AuthenticateWorker(tok); ok {
+		t.Fatal("unbound credential must not authenticate")
+	}
+	if err := auth.BindWorkerSession(tok, "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := auth.AuthenticateWorker(tok); !ok {
+		t.Fatal("bound credential should authenticate")
+	}
+}
+
 func TestBindWorkerSessionLifecycle(t *testing.T) {
 	auth := newAuthState()
 	tok, err := auth.IssueWorkerCredential("run1", "task-a", "w1", 1, "")
@@ -77,9 +97,17 @@ func TestBindWorkerSessionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Unbound cannot authenticate.
+	if _, ok := auth.AuthenticateWorker(tok); ok {
+		t.Fatal("unbound must be rejected")
+	}
+
 	// Bind to a native session.
 	if err := auth.BindWorkerSession(tok, "sess-1"); err != nil {
 		t.Fatalf("initial bind failed: %v", err)
+	}
+	if _, ok := auth.AuthenticateWorker(tok); !ok {
+		t.Fatal("bound credential should authenticate")
 	}
 
 	// Same session idempotent rebind must succeed.
@@ -96,6 +124,9 @@ func TestBindWorkerSessionLifecycle(t *testing.T) {
 	auth.RevokeWorkerAttempt("task-a", "w1", 1)
 	if err := auth.BindWorkerSession(tok, "sess-1"); err == nil {
 		t.Fatal("binding revoked credential should fail")
+	}
+	if _, ok := auth.AuthenticateWorker(tok); ok {
+		t.Fatal("revoked token still valid")
 	}
 }
 
@@ -123,7 +154,14 @@ func TestBindWorkerSessionRejections(t *testing.T) {
 	if err := auth.BindWorkerSession(tok2, "sess-a"); err != nil {
 		t.Fatal(err)
 	}
-	// tok (attempt 1) should NOT authenticate as the attempt 2 binding.
+	// tok (attempt 1) remains unbound and cannot authenticate.
+	if _, ok := auth.AuthenticateWorker(tok); ok {
+		t.Fatal("unbound attempt-1 credential must not authenticate")
+	}
+	// After binding attempt-1 it authenticates as attempt 1.
+	if err := auth.BindWorkerSession(tok, "sess-1"); err != nil {
+		t.Fatal(err)
+	}
 	b, ok := auth.AuthenticateWorker(tok)
 	if !ok || b.AttemptNumber != 1 {
 		t.Fatal("attempt-1 credential should still map to attempt 1")

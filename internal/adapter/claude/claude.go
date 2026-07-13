@@ -159,30 +159,11 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 		args = append(args, "--safe-mode")
 	}
 	if req.Interaction.Enabled {
-		// MCP config contains only the executable and non-secret command shape.
-		// Worker credentials are passed via environment only (never argv / JSON).
-		mcpServer := map[string]any{
-			"type": "stdio", "command": req.Interaction.BrokerExecutable,
-			"args": []string{"mcp-worker"},
-		}
-		config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"subagent-broker": mcpServer}})
+		launch, err := BuildInteractionLaunch(req)
 		if err != nil {
 			return adapter.Session{}, err
 		}
-		// Hook command avoids embedding run directories or credentials in argv.
-		hookCommand := strings.Join([]string{shellQuote(req.Interaction.BrokerExecutable), "claude-hook"}, " ")
-		settingsValue := map[string]any{
-			"permissions": map[string]any{"allow": []string{"Bash", "Write", "Edit"}},
-			"hooks": map[string]any{"PreToolUse": []any{map[string]any{
-				"matcher": "Bash|Write|Edit",
-				"hooks":   []any{map[string]any{"type": "command", "command": hookCommand}},
-			}}},
-		}
-		settings, err := json.Marshal(settingsValue)
-		if err != nil {
-			return adapter.Session{}, err
-		}
-		args = append(args, "--mcp-config", string(config), "--settings", string(settings), "--include-hook-events", "--allowedTools", "mcp__subagent-broker__ask_main_agent,mcp__subagent-broker__request_scope_expansion", "--disallowedTools", "Agent,Task,AskUserQuestion")
+		args = append(args, launch.ExtraArgs...)
 	}
 
 	cmd := exec.CommandContext(ctx, a.executable, args...)
@@ -190,14 +171,7 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	process.ConfigureCommand(cmd)
 	if req.Interaction.Enabled && req.Interaction.WorkerToken != "" {
 		// Worker token and run metadata via parent env only (never argv / MCP config / hook command).
-		cmd.Env = append(os.Environ(),
-			"BROKER_WORKER_TOKEN="+req.Interaction.WorkerToken,
-			"BROKER_WORKER_SOCKET="+req.Interaction.WorkerSocket,
-			"BROKER_RUN_DIR="+req.Interaction.RunDir,
-			"BROKER_RUN_ID="+req.RunID,
-			"BROKER_TASK_ID="+req.TaskID,
-			"BROKER_WORKER_ID="+req.WorkerID,
-		)
+		cmd.Env = append(os.Environ(), WorkerProcessEnv(req)...)
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -610,4 +584,74 @@ func cloneOptions(options map[string]string) map[string]string {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+// InteractionLaunch is the pure production command-construction result for
+// Claude MCP + permission-hook wiring. Used by StartSession and tests.
+type InteractionLaunch struct {
+	// ExtraArgs are Claude CLI flags: --mcp-config, --settings, tools, etc.
+	ExtraArgs []string
+	// MCPConfigJSON is the serialized MCP config (never contains the Worker token).
+	MCPConfigJSON string
+	// SettingsJSON is the serialized Claude settings including the hook command.
+	SettingsJSON string
+	// HookCommand is the shell command for PreToolUse (no secrets / identity).
+	HookCommand string
+}
+
+// BuildInteractionLaunch constructs the production MCP config and hook settings
+// from a StartRequest. Identity and token live only in WorkerProcessEnv.
+func BuildInteractionLaunch(req adapter.StartRequest) (InteractionLaunch, error) {
+	// MCP config contains only the executable and non-secret command shape.
+	mcpServer := map[string]any{
+		"type": "stdio", "command": req.Interaction.BrokerExecutable,
+		"args": []string{"mcp-worker"},
+	}
+	config, err := json.Marshal(map[string]any{"mcpServers": map[string]any{"subagent-broker": mcpServer}})
+	if err != nil {
+		return InteractionLaunch{}, err
+	}
+	// Hook command avoids embedding run directories or credentials in argv.
+	hookCommand := strings.Join([]string{shellQuote(req.Interaction.BrokerExecutable), "claude-hook"}, " ")
+	settingsValue := map[string]any{
+		"permissions": map[string]any{"allow": []string{"Bash", "Write", "Edit"}},
+		"hooks": map[string]any{"PreToolUse": []any{map[string]any{
+			"matcher": "Bash|Write|Edit",
+			"hooks":   []any{map[string]any{"type": "command", "command": hookCommand}},
+		}}},
+	}
+	settings, err := json.Marshal(settingsValue)
+	if err != nil {
+		return InteractionLaunch{}, err
+	}
+	extra := []string{
+		"--mcp-config", string(config),
+		"--settings", string(settings),
+		"--include-hook-events",
+		"--allowedTools", "mcp__subagent-broker__ask_main_agent,mcp__subagent-broker__request_scope_expansion",
+		"--disallowedTools", "Agent,Task,AskUserQuestion",
+	}
+	return InteractionLaunch{
+		ExtraArgs:     extra,
+		MCPConfigJSON: string(config),
+		SettingsJSON:  string(settings),
+		HookCommand:   hookCommand,
+	}, nil
+}
+
+// WorkerProcessEnv returns the environment entries injected into the Claude
+// Worker process. The raw Worker token is present only here — never argv/JSON.
+func WorkerProcessEnv(req adapter.StartRequest) []string {
+	env := []string{
+		"BROKER_WORKER_TOKEN=" + req.Interaction.WorkerToken,
+		"BROKER_WORKER_SOCKET=" + req.Interaction.WorkerSocket,
+		"BROKER_RUN_DIR=" + req.Interaction.RunDir,
+		"BROKER_RUN_ID=" + req.RunID,
+		"BROKER_TASK_ID=" + req.TaskID,
+		"BROKER_WORKER_ID=" + req.WorkerID,
+	}
+	if req.Interaction.NativeSessionID != "" {
+		env = append(env, "BROKER_NATIVE_SESSION_ID="+req.Interaction.NativeSessionID)
+	}
+	return env
 }

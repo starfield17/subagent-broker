@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
@@ -251,9 +250,17 @@ type Service struct {
 	// Per-message native permission delivery serialization (no adapter I/O under Router lock).
 	deliveryLocks sync.Map // messageID -> *sync.Mutex
 
-	// Supervisor lease: kernel-backed exclusive fd for the run's mutable lifetime.
-	// Acquired before any socket/token/state write; released on process exit.
-	leaseFD int
+	// Service-level per-message operation lock for RequestMessage / Resolve /
+	// expiration / native permission. Separate from Router's internal locks.
+	decisionOperationLocks sync.Map // messageID -> *sync.Mutex
+
+	// Supervisor lease: owned *os.File strongly referenced for the full mutable
+	// Supervisor lifetime. Never retain only Fd() as ownership.
+	lease *SupervisorLease
+
+	// ipcPrepared tracks whether this owner created control/worker sockets so
+	// early-return cleanup only removes sockets created under this lease.
+	ipcPrepared bool
 }
 
 type activeWorker struct {
@@ -266,7 +273,32 @@ type activeWorker struct {
 	attempt   int
 }
 
+// Load acquires the exclusive Supervisor lease, then performs all mutable
+// recovery (journal repair, state.json writes, corruption markers, checkpoint
+// catch-up) under that lease. A losing process fails before any mutable write.
+//
+// The returned Service holds the lease until Close or Start completes.
+// Production CLI must call Load only on the mutable Supervisor path; read-only
+// commands must not call Load.
 func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service, error) {
+	lease, err := AcquireSupervisorLease(runDir)
+	if err != nil {
+		return nil, fmt.Errorf("supervisor_already_running: %w", err)
+	}
+	svc, err := loadMutable(runDir, registry, recovering, lease)
+	if err != nil {
+		_ = lease.Close()
+		return nil, err
+	}
+	return svc, nil
+}
+
+// loadMutable performs recovery and Service construction under an already-held
+// exclusive lease. The lease must remain strongly referenced on the Service.
+func loadMutable(runDir string, registry *adapter.Registry, recovering bool, lease *SupervisorLease) (*Service, error) {
+	if lease == nil || !lease.Held() {
+		return nil, fmt.Errorf("mutable load requires a held Supervisor lease")
+	}
 	if registry == nil {
 		return nil, fmt.Errorf("adapter registry is required")
 	}
@@ -441,6 +473,7 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 					pending: map[string]*pendingWaiter{}, active: map[string]activeWorker{},
 					cancelledTasks: map[string]bool{}, runBaseline: verify.WorkspaceSnapshot{},
 					fatalPersistence: make(chan error, 1), acceptingWork: false, advance: make(chan struct{}, 1),
+					lease: lease,
 				}
 				// Router still required for API surface; store is append-disabled.
 				if r, rErr := message.NewRouter(message.NewRouterOptions{RunID: string(run.RunID), Store: messageStore, Initial: messageIndex}); rErr == nil {
@@ -490,22 +523,58 @@ func Load(runDir string, registry *adapter.Registry, recovering bool) (*Service,
 		terminal: make(chan struct{}), recovering: recovering, plan: plan,
 		messages: messageStore, messageIndex: messageIndex, router: router, pending: map[string]*pendingWaiter{}, active: map[string]activeWorker{}, cancelledTasks: map[string]bool{}, runBaseline: runBaseline,
 		fatalPersistence: make(chan error, 1), acceptingWork: acceptingWork, advance: make(chan struct{}, 1),
+		lease: lease,
 	}, nil
 }
 
+// Close releases the Supervisor lease without running the full Start lifecycle.
+// Used by dispatch after Initialize so a child supervisor can acquire ownership.
+// Idempotent. Does not unlink the lock file.
+func (s *Service) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.cleanupOwnedIPC()
+	if s.lease != nil {
+		err := s.lease.Close()
+		s.lease = nil
+		return err
+	}
+	return nil
+}
+
+// Start runs the Supervisor under the lease acquired by Load. Lifecycle:
+//
+//	lease already held
+//	→ prepare IPC
+//	→ defer owner cleanup
+//	→ run
+//	→ close listeners
+//	→ remove owned sockets
+//	→ write final identity
+//	→ close lease (last)
 func (s *Service) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Acquire run-scoped exclusive lease before any mutable operation.
-	if err := s.acquireLease(); err != nil {
-		return fmt.Errorf("supervisor_already_running: %w", err)
+	if s.lease == nil || !s.lease.Held() {
+		return fmt.Errorf("supervisor start requires a held exclusive lease from Load")
 	}
-	defer s.releaseLease()
+	// Lease released last, after all mutable cleanup and final identity writes.
+	defer func() {
+		if s.lease != nil {
+			_ = s.lease.Close()
+			s.lease = nil
+		}
+	}()
 
 	if err := s.prepareIPC(); err != nil {
+		s.cleanupOwnedIPC()
 		return err
 	}
+	// Install owner cleanup for every later startup failure path.
+	defer s.cleanupOwnedIPC()
+
 	if err := s.writeSupervisorIdentity(""); err != nil {
 		return err
 	}
@@ -544,22 +613,42 @@ func (s *Service) Start(ctx context.Context) error {
 		err = fmt.Errorf("supervisor stopped after a fatal persistence failure")
 	}
 	s.mu.Lock()
-	if s.listener != nil {
-		_ = s.listener.Close()
-		s.listener = nil
-	}
-	if s.workerListener != nil {
-		_ = s.workerListener.Close()
-		s.workerListener = nil
-	}
-	_ = os.Remove(SocketPath(s.runDir))
-	_ = os.Remove(WorkerSocketPath(s.runDir))
 	status := s.snapshot.Run.Status
 	s.mu.Unlock()
-	// Best-effort final identity write; do not fail-close again if already closed.
+	// Final identity write while lease is still held; IPC cleanup runs via defer
+	// before lease release.
 	_ = s.writeSupervisorIdentity(shutdownReason(err, status))
-	close(s.terminal)
+	// Ensure terminal is closed exactly once for waiters.
+	select {
+	case <-s.terminal:
+	default:
+		close(s.terminal)
+	}
 	return err
+}
+
+// cleanupOwnedIPC closes listeners and removes only sockets created by this owner.
+func (s *Service) cleanupOwnedIPC() {
+	s.mu.Lock()
+	prepared := s.ipcPrepared
+	listener := s.listener
+	workerListener := s.workerListener
+	s.listener = nil
+	s.workerListener = nil
+	s.ipcPrepared = false
+	s.mu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
+	if workerListener != nil {
+		_ = workerListener.Close()
+	}
+	if !prepared {
+		return
+	}
+	// Only the current lease owner removes its own socket paths.
+	_ = os.Remove(SocketPath(s.runDir))
+	_ = os.Remove(WorkerSocketPath(s.runDir))
 }
 
 func (s *Service) advanceSignal() <-chan struct{} {
@@ -2042,16 +2131,20 @@ func (s *Service) prepareIPC() error {
 	wlistener, err := net.Listen("unix", wpath)
 	if err != nil {
 		_ = listener.Close()
+		_ = os.Remove(path) // remove only the socket this owner just created
 		return err
 	}
 	if err := os.Chmod(wpath, 0o600); err != nil {
 		_ = listener.Close()
 		_ = wlistener.Close()
+		_ = os.Remove(path)
+		_ = os.Remove(wpath)
 		return err
 	}
 	s.mu.Lock()
 	s.listener = listener
 	s.workerListener = wlistener
+	s.ipcPrepared = true
 	s.mu.Unlock()
 	return nil
 }
@@ -2212,53 +2305,6 @@ func cloneSnapshot(value Snapshot) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("clone snapshot: %w", err)
 	}
 	return copy, nil
-}
-
-// LeasePath is the run-scoped supervisor lock file (flock).
-func LeasePath(runDir string) string {
-	return filepath.Join(runDir, "control", "supervisor.lock")
-}
-
-func (s *Service) acquireLease() error {
-	lockPath := LeasePath(s.runDir)
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
-		return fmt.Errorf("create lock directory: %w", err)
-	}
-	fd, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return fmt.Errorf("open lock file: %w", err)
-	}
-	// Non-blocking exclusive flock: second start fails immediately.
-	if err := syscall.Flock(int(fd.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = fd.Close()
-		return fmt.Errorf("supervisor lock already held by another process: %w", err)
-	}
-	s.leaseFD = int(fd.Fd())
-	// Write diagnostic metadata (not authoritative; kernel lock is).
-	_ = fd.Truncate(0)
-	_, _ = fd.Seek(0, 0)
-	meta := map[string]any{
-		"pid":                 os.Getpid(),
-		"process_start_token": os.Getpid(), // placeholder
-		"acquired_at":         time.Now().UTC().Format(time.RFC3339),
-		"run_id":              s.snapshot.Run.RunID,
-	}
-	metaJSON, _ := json.Marshal(meta)
-	_, _ = fd.Write(append(metaJSON, '\n'))
-	return nil
-}
-
-func (s *Service) releaseLease() {
-	if s.leaseFD > 0 {
-		_ = syscall.Flock(s.leaseFD, syscall.LOCK_UN)
-		// The fd stays open; kernel releases on process exit.
-		// Do NOT close the fd here — we want the kernel to hold the lock for
-		// the full process lifetime. Close is done by OS on exit.
-	}
-	// Remove only the lock file; the fd still holds the kernel lock.
-	// Only the owner should unlink the lock file.
-	lockPath := LeasePath(s.runDir)
-	_ = os.Remove(lockPath)
 }
 
 func SocketPath(runDir string) string {

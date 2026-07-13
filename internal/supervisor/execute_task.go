@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/event"
 	"github.com/vnai/subagent-broker/internal/process"
+	"github.com/vnai/subagent-broker/internal/project"
 	"github.com/vnai/subagent-broker/internal/report"
 	"github.com/vnai/subagent-broker/internal/state"
 	"github.com/vnai/subagent-broker/internal/task"
@@ -164,17 +166,33 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	executable, _ := os.Executable()
 	interaction := adapter.InteractionConfig{Enabled: !s.config.SafeMode && harnessName == string(adapter.HarnessClaudeCode), BrokerExecutable: executable, RunDir: s.runDir}
 	// Per-attempt Worker credential (env only; never control token or argv).
-	// If interaction is enabled, credential failure must abort session startup.
+	// Claude known-session design: preselect native session ID, issue credential
+	// already Bound, start with the same session_id, verify exact match.
 	if interaction.Enabled && s.auth == nil {
 		return fmt.Errorf("interaction enabled but auth is not initialized")
 	}
+	expectedNativeSessionID := resumeSessionID
+	if interaction.Enabled && expectedNativeSessionID == "" {
+		// Fresh session: generate expected Claude native session ID before credential.
+		generated, genErr := project.UUIDv7(time.Now().UTC(), rand.Reader)
+		if genErr != nil {
+			return fmt.Errorf("generate expected native session id: %w", genErr)
+		}
+		expectedNativeSessionID = generated
+		if options == nil {
+			options = map[string]string{}
+		}
+		options["session_id"] = expectedNativeSessionID
+	}
 	if interaction.Enabled {
-		wtok, tokErr := s.auth.IssueWorkerCredential(string(runID), string(runtime.Task.TaskID), workerID, attempt.Number, resumeSessionID)
+		// Issue already bound to the expected native session (not provisional).
+		wtok, tokErr := s.auth.IssueWorkerCredential(string(runID), string(runtime.Task.TaskID), workerID, attempt.Number, expectedNativeSessionID)
 		if tokErr != nil {
 			return fmt.Errorf("issue worker credential: %w", tokErr)
 		}
 		interaction.WorkerToken = wtok
 		interaction.WorkerSocket = WorkerSocketPath(s.runDir)
+		interaction.NativeSessionID = expectedNativeSessionID
 	}
 	request := adapter.StartRequest{RunID: string(runID), TaskID: string(runtime.Task.TaskID), WorkerID: workerID, ProjectRoot: runtime.Task.ProjectRoot, Contract: prompt, Model: model, Scenario: s.config.Scenario, Options: options, Interaction: interaction}
 
@@ -198,12 +216,12 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		return s.failTask(runtime, "start_session", err)
 	}
 
-	// Activate credential against the returned native session.
-	if interaction.Enabled && s.auth != nil && session.NativeSessionID != "" {
-		if bindErr := s.auth.BindWorkerSession(interaction.WorkerToken, session.NativeSessionID); bindErr != nil {
+	// Verify returned native session matches the expected pre-bound identity.
+	if interaction.Enabled && s.auth != nil {
+		if session.NativeSessionID != expectedNativeSessionID {
 			s.auth.RevokeWorkerAttempt(string(runtime.Task.TaskID), workerID, attempt.Number)
 			_ = harness.TerminateSession(context.Background(), session.NativeSessionID)
-			return s.failTask(runtime, "credential_binding", bindErr)
+			return s.failTask(runtime, "session_identity_mismatch", fmt.Errorf("returned native session does not match expected identity"))
 		}
 	}
 

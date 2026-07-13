@@ -43,6 +43,18 @@ jobs:
         timeout-minutes: 20
         run: go test -race ./internal/adapter/... ./internal/message/... ./internal/supervisor/... -count=5
 
+      - name: Production-path worker identity regressions
+        timeout-minutes: 10
+        run: go test -race ./cmd/subagent-broker -run 'TestMCPWorkerEnvIdentity|TestClaudeHookEnvIdentity|TestWorkerIdentityMismatch' -count=3
+
+      - name: Decision/auth/lease ownership regressions
+        timeout-minutes: 15
+        run: go test -race ./internal/supervisor -run 'TestSupervisorLease|TestRequestMessage|TestResolve|TestExpire|TestUnbound|TestBind|TestWorkerCredential' -count=20
+
+      - name: OpenCode turn ownership regressions
+        timeout-minutes: 10
+        run: go test -race ./internal/adapter/opencode -run 'Test.*Turn|Test.*Idle|Test.*Historical|Test.*Baseline|TestEmpty|TestStale|TestDuplicate|TestOld' -count=20
+
       - name: Vet
         timeout-minutes: 5
         run: go vet ./...
