@@ -280,6 +280,41 @@ func ApplyEvent(snapshot Snapshot, ev event.Event) (Snapshot, error) {
 						next.Tasks[index].Worker.StatusDimensions.Process = state.Process(to)
 					}
 				}
+				if _, hasExit := payload["exit_observed"]; hasExit {
+					evidence := FailureProcessEvidence{}
+					if value, ok := payload["exit_observed"].(bool); ok {
+						evidence.ExitObserved = value
+					}
+					if value, ok := payload["tree_exit_confirmed"].(bool); ok {
+						evidence.TreeExitConfirmed = value
+					}
+					if value, ok := payload["orphan_risk"].(bool); ok {
+						evidence.OrphanRisk = value
+					}
+					if value, ok := payload["termination_requested"].(bool); ok {
+						evidence.TerminationRequested = value
+					}
+					evidence.TerminationInitiator, _ = payload["termination_initiator"].(string)
+					evidence.TerminationPhase, _ = payload["termination_phase"].(string)
+					evidence.ResultingProcessState = string(next.Tasks[index].Dimensions.Process)
+					if values, ok := payload["remaining"].([]any); ok {
+						for _, value := range values {
+							if number, ok := value.(float64); ok {
+								evidence.RemainingPIDs = append(evidence.RemainingPIDs, int(number))
+							}
+						}
+					}
+					if rawExit, ok := payload["exit"].(map[string]any); ok {
+						if number, ok := rawExit["code"].(float64); ok && evidence.ExitObserved {
+							code := int(number)
+							evidence.ExitCode = &code
+						}
+						if signal, ok := rawExit["signal"].(string); ok {
+							evidence.ExitSignal = signal
+						}
+					}
+					next.Tasks[index].LastProcessEvidence = &evidence
+				}
 			}
 		}
 

@@ -166,6 +166,11 @@ func dispatch(args []string) error {
 	hardTimeout := flags.Duration("hard-timeout", 30*time.Minute, "hard run timeout")
 	validationTimeout := flags.Duration("validation-timeout", 5*time.Minute, "validation command timeout")
 	maxConcurrency := flags.Int("max-concurrency", 4, "maximum concurrent Workers in a Wave")
+	var ephemeralPaths []string
+	flags.Func("ephemeral-path", "additional project-relative ephemeral audit glob (repeatable)", func(value string) error {
+		ephemeralPaths = append(ephemeralPaths, value)
+		return nil
+	})
 	if err := flags.Parse(args); err != nil {
 		return usageWrap("dispatch", err)
 	}
@@ -232,8 +237,14 @@ func dispatch(args []string) error {
 		}
 		return clioutcome.New(clioutcome.ExitUsage, "dispatch", err.Error(), err)
 	}
-	config := supervisor.Config{BrokerHome: home, Harness: *harness, Executable: *executable, Model: *model, SafeMode: *safeMode, PermissionMode: *permissionMode, MaxTurns: *maxTurns, QuietAfter: *quietAfter, StallAfter: *stallAfter, HardTimeout: *hardTimeout, ValidationTimeout: *validationTimeout, MaxConcurrency: *maxConcurrency}
-	config.Normalize()
+	auditPolicy, err := verify.NewAuditPolicy(ephemeralPaths...)
+	if err != nil {
+		return usageWrap("dispatch", err)
+	}
+	config := supervisor.Config{BrokerHome: home, Harness: *harness, Executable: *executable, Model: *model, SafeMode: *safeMode, PermissionMode: *permissionMode, MaxTurns: *maxTurns, QuietAfter: *quietAfter, StallAfter: *stallAfter, HardTimeout: *hardTimeout, ValidationTimeout: *validationTimeout, MaxConcurrency: *maxConcurrency, AuditPolicy: &auditPolicy}
+	if _, err := config.NormalizeAndValidate(); err != nil {
+		return usageWrap("dispatch", err)
+	}
 	runID, err := project.NewRunID(now)
 	if err != nil {
 		return err

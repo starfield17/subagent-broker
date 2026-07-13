@@ -1,6 +1,7 @@
 package wave
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -164,6 +165,55 @@ func TestEvaluateBarrierCleanPassed(t *testing.T) {
 	}, time.Now().UTC())
 	if result.Result != domain.BarrierPassed {
 		t.Fatalf("result=%s errors=%v warnings=%v", result.Result, result.Errors, result.Warnings)
+	}
+}
+
+func TestEvaluateBarrierEphemeralChangesAreWarningsAndRemainVisible(t *testing.T) {
+	result := EvaluateBarrier(BarrierInputs{
+		WaveID: "wave-1",
+		Reports: []ReportAssessment{{
+			TaskID: "task-a", Present: true, MetaValid: true, MarkdownValid: true, IdentityValid: true,
+			RuntimeStatus: state.TaskVerifiedSuccess, EnvelopeStatus: report.StatusSucceeded,
+		}},
+		ChangedFiles: []string{"__pycache__/module.pyc"},
+		ScopeAudit:   verify.ScopeAudit{Ephemeral: []verify.EphemeralAttribution{{Path: "__pycache__/module.pyc", Pattern: "**/__pycache__/**"}}},
+		Checks:       []CheckResult{{Command: "true", Passed: true}},
+	}, time.Now().UTC())
+	if result.Result != domain.BarrierPassedWithWarnings {
+		t.Fatalf("ephemeral-only result=%s errors=%v warnings=%v", result.Result, result.Errors, result.Warnings)
+	}
+	if len(result.ChangedFiles) != 1 || len(result.ScopeAudit.Ephemeral) != 1 {
+		t.Fatalf("ephemeral facts were lost: %+v", result)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != "ephemeral workspace artifacts observed: 1 path(s)" {
+		t.Fatalf("unexpected ephemeral warning: %v", result.Warnings)
+	}
+
+	result = EvaluateBarrier(BarrierInputs{
+		WaveID: "wave-1",
+		Reports: []ReportAssessment{{
+			TaskID: "task-a", Present: true, MetaValid: true, MarkdownValid: true, IdentityValid: true,
+			RuntimeStatus: state.TaskVerifiedSuccess,
+		}},
+		ScopeAudit: verify.ScopeAudit{
+			Ephemeral:    []verify.EphemeralAttribution{{Path: "cache.pyc", Pattern: "**/*.pyc"}},
+			Unauthorized: []string{"secret.env"},
+		},
+	}, time.Now().UTC())
+	if result.Result != domain.BarrierFailed {
+		t.Fatalf("ephemeral plus unauthorized result=%s", result.Result)
+	}
+}
+
+func TestRenderBarrierIncludesEphemeralSection(t *testing.T) {
+	markdown := RenderBarrier(Verification{
+		WaveID:       "wave-1",
+		Result:       domain.BarrierPassedWithWarnings,
+		ChangedFiles: []string{".pytest_cache/CACHEDIR.TAG"},
+		ScopeAudit:   verify.ScopeAudit{Ephemeral: []verify.EphemeralAttribution{{Path: ".pytest_cache/CACHEDIR.TAG", Pattern: "**/.pytest_cache/**"}}},
+	})
+	if !strings.Contains(markdown, "## Ephemeral Changes") || !strings.Contains(markdown, ".pytest_cache/CACHEDIR.TAG") {
+		t.Fatalf("ephemeral section missing:\n%s", markdown)
 	}
 }
 

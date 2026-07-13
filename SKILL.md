@@ -57,6 +57,15 @@ Workers may read the project, but may only write within the approved scope. When
 - Suspected stall is not an automatic kill condition.
 - Git describes code changes; it is not the control protocol or liveness oracle.
 - Broker state stays outside the project repository.
+- Every workspace change remains observable in Workspace Snapshots and
+  ChangedFiles.
+- Changed paths are classified as authorized, ephemeral, unauthorized, or
+  owner-uncertain. Ephemeral does not mean ignored or Task-owned.
+- Failure evidence records observed workspace and process facts. It is not a
+  Result Envelope, formal verification result, or automatic adoption of
+  residual files.
+- Failure evidence and cache observations are retained under Broker storage;
+  no workspace cleanup is performed automatically.
 - V1 does not create worktrees and does not allow nested agents by default.
 - Adapter capability declarations must be truthful.
 
@@ -76,9 +85,22 @@ Dispatch accepts the legacy Task array as one Wave or an ordered plan containing
   --project /path/to/project \
   --goal "Complete the requested task" \
   --tasks /path/to/tasks.json \
+  --ephemeral-path "generated-cache/**" \
   --permission-mode acceptEdits \
   --model sonnet
 ```
+
+Dispatch freezes the normalized audit policy into the Run configuration.
+The narrow built-in ephemeral patterns are:
+
+- `**/__pycache__/**`
+- `**/.pytest_cache/**`
+- `**/*.pyc`
+
+Additional project-relative patterns may be supplied with repeatable
+`--ephemeral-path`. These patterns classify observations; they do not exclude
+files from workspace capture or authorize Task deliverables. No automatic
+cleanup is performed.
 
 The command starts a detached Supervisor and prints the Run ID. The Supervisor is the only writer of Run state and owns each Harness process/session. Inspect or control the Run with:
 

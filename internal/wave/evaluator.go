@@ -137,6 +137,9 @@ func EvaluateBarrier(input BarrierInputs, now time.Time) Verification {
 	for _, item := range input.ScopeAudit.OwnerUncertain {
 		warnings = append(warnings, "owner uncertain: "+item.Path)
 	}
+	if len(input.ScopeAudit.Ephemeral) > 0 {
+		warnings = append(warnings, fmt.Sprintf("ephemeral workspace artifacts observed: %d path(s)", len(input.ScopeAudit.Ephemeral)))
+	}
 
 	for _, change := range input.HighRiskChanges {
 		severity := change.Severity

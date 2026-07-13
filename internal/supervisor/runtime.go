@@ -96,28 +96,30 @@ func joinFatalSupervisorError(original error, extra ...error) error {
 }
 
 type Config struct {
-	BrokerHome        string        `json:"broker_home"`
-	Harness           string        `json:"harness"`
-	Executable        string        `json:"executable,omitempty"`
-	Scenario          string        `json:"scenario,omitempty"`
-	Model             string        `json:"model,omitempty"`
-	SafeMode          bool          `json:"safe_mode,omitempty"`
-	PermissionMode    string        `json:"permission_mode,omitempty"`
-	MaxTurns          int           `json:"max_turns,omitempty"`
-	QuietAfter        time.Duration `json:"quiet_after"`
-	StallAfter        time.Duration `json:"stall_after"`
-	HardTimeout       time.Duration `json:"hard_timeout"`
-	CancelGrace       time.Duration `json:"cancel_grace"`
-	ValidationTimeout time.Duration `json:"validation_timeout"`
-	MaxConcurrency    int           `json:"max_concurrency"`
+	BrokerHome        string              `json:"broker_home"`
+	Harness           string              `json:"harness"`
+	Executable        string              `json:"executable,omitempty"`
+	Scenario          string              `json:"scenario,omitempty"`
+	Model             string              `json:"model,omitempty"`
+	SafeMode          bool                `json:"safe_mode,omitempty"`
+	PermissionMode    string              `json:"permission_mode,omitempty"`
+	MaxTurns          int                 `json:"max_turns,omitempty"`
+	QuietAfter        time.Duration       `json:"quiet_after"`
+	StallAfter        time.Duration       `json:"stall_after"`
+	HardTimeout       time.Duration       `json:"hard_timeout"`
+	CancelGrace       time.Duration       `json:"cancel_grace"`
+	ValidationTimeout time.Duration       `json:"validation_timeout"`
+	MaxConcurrency    int                 `json:"max_concurrency"`
+	AuditPolicy       *verify.AuditPolicy `json:"audit_policy,omitempty"`
 }
 
 func DefaultConfig() Config {
+	policy := verify.DefaultAuditPolicy()
 	return Config{
 		Harness: "claude-code", PermissionMode: "default", MaxTurns: 8,
 		QuietAfter: 30 * time.Second, StallAfter: 2 * time.Minute,
 		HardTimeout: 30 * time.Minute, CancelGrace: 1500 * time.Millisecond,
-		ValidationTimeout: 5 * time.Minute, MaxConcurrency: 4,
+		ValidationTimeout: 5 * time.Minute, MaxConcurrency: 4, AuditPolicy: &policy,
 	}
 }
 
@@ -150,6 +152,23 @@ func (c *Config) Normalize() {
 	if c.MaxConcurrency <= 0 {
 		c.MaxConcurrency = defaults.MaxConcurrency
 	}
+	if c.AuditPolicy == nil {
+		policy := verify.DefaultAuditPolicy()
+		c.AuditPolicy = &policy
+	}
+}
+
+// NormalizeAndValidate freezes the audit policy in its deterministic form.
+// Callers that load persisted configuration must invoke this before starting
+// any Worker.
+func (c *Config) NormalizeAndValidate() (verify.AuditPolicy, error) {
+	c.Normalize()
+	policy, err := verify.NormalizeAuditPolicy(*c.AuditPolicy)
+	if err != nil {
+		return verify.AuditPolicy{}, err
+	}
+	c.AuditPolicy = &policy
+	return policy, nil
 }
 
 type ValidationResult struct {
@@ -181,25 +200,27 @@ type ReportIdentity struct {
 }
 
 type TaskState struct {
-	Task                domain.Task           `json:"task"`
-	Worker              *domain.WorkerSession `json:"worker,omitempty"` // current/active attempt projection (compat)
-	Attempts            []workerpkg.Attempt   `json:"attempts,omitempty"`
-	ActiveAttempt       int                   `json:"active_attempt,omitempty"` // attempt number; 0 = none
-	BlockKind           BlockKind             `json:"block_kind,omitempty"`
-	Dimensions          state.Dimensions      `json:"status_dimensions"`
-	ReportPath          string                `json:"report_path,omitempty"`
-	ReportIdentity      *ReportIdentity       `json:"report_identity,omitempty"`
-	Validation          []ValidationResult    `json:"validation,omitempty"`
-	LastError           string                `json:"last_error,omitempty"`
-	LastProgress        time.Time             `json:"last_progress_at,omitempty"`
-	Stall               *stall.Assessment     `json:"stall_assessment,omitempty"`
-	LastStdout          time.Time             `json:"last_stdout_at,omitempty"`
-	LastStderr          time.Time             `json:"last_stderr_at,omitempty"`
-	LastProtocolEventAt time.Time             `json:"last_protocol_event_at,omitempty"`
-	LastToolStart       time.Time             `json:"last_tool_start_at,omitempty"`
-	LastToolFinish      time.Time             `json:"last_tool_finish_at,omitempty"`
-	TurnStartedAt       time.Time             `json:"turn_started_at,omitempty"`
-	TurnEndedAt         time.Time             `json:"turn_ended_at,omitempty"`
+	Task                domain.Task             `json:"task"`
+	Worker              *domain.WorkerSession   `json:"worker,omitempty"` // current/active attempt projection (compat)
+	Attempts            []workerpkg.Attempt     `json:"attempts,omitempty"`
+	ActiveAttempt       int                     `json:"active_attempt,omitempty"` // attempt number; 0 = none
+	BlockKind           BlockKind               `json:"block_kind,omitempty"`
+	Dimensions          state.Dimensions        `json:"status_dimensions"`
+	ReportPath          string                  `json:"report_path,omitempty"`
+	ReportIdentity      *ReportIdentity         `json:"report_identity,omitempty"`
+	Validation          []ValidationResult      `json:"validation,omitempty"`
+	LastError           string                  `json:"last_error,omitempty"`
+	LastProgress        time.Time               `json:"last_progress_at,omitempty"`
+	Stall               *stall.Assessment       `json:"stall_assessment,omitempty"`
+	LastStdout          time.Time               `json:"last_stdout_at,omitempty"`
+	LastStderr          time.Time               `json:"last_stderr_at,omitempty"`
+	LastProtocolEventAt time.Time               `json:"last_protocol_event_at,omitempty"`
+	LastToolStart       time.Time               `json:"last_tool_start_at,omitempty"`
+	LastToolFinish      time.Time               `json:"last_tool_finish_at,omitempty"`
+	TurnStartedAt       time.Time               `json:"turn_started_at,omitempty"`
+	TurnEndedAt         time.Time               `json:"turn_ended_at,omitempty"`
+	LastProcessEvidence *FailureProcessEvidence `json:"last_process_evidence,omitempty"`
+	FailureEvidencePath string                  `json:"failure_evidence_path,omitempty"`
 	// Deprecated: PendingInstruction is retained only for JSON compatibility with
 	// older snapshots. It is not an outbox; durable instructions use message.Router.
 	PendingInstruction string `json:"pending_instruction,omitempty"`
@@ -293,6 +314,8 @@ type Service struct {
 	active         map[string]activeWorker
 	resumeInFlight map[string]bool
 	runBaseline    verify.WorkspaceSnapshot
+	auditPolicy    verify.AuditPolicy
+	auditPolicySet bool
 
 	// Commit fail-closed control plane.
 	fatalPersistence chan error
@@ -417,7 +440,18 @@ func loadMutable(runDir string, registry *adapter.Registry, recovering bool, lea
 	if err := json.Unmarshal(run.ConfigSnapshot, &config); err != nil {
 		return nil, fmt.Errorf("decode run config: %w", err)
 	}
-	config.Normalize()
+	var configFields map[string]json.RawMessage
+	if err := json.Unmarshal(run.ConfigSnapshot, &configFields); err != nil {
+		return nil, fmt.Errorf("decode run config fields: %w", err)
+	}
+	rawAuditPolicy, hasPersistedAuditPolicy := configFields["audit_policy"]
+	if strings.TrimSpace(string(rawAuditPolicy)) == "null" {
+		hasPersistedAuditPolicy = false
+	}
+	auditPolicy, err := config.NormalizeAndValidate()
+	if err != nil {
+		return nil, fmt.Errorf("validate audit policy: %w", err)
+	}
 	if config.BrokerHome == "" {
 		config.BrokerHome = filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(runDir))))
 	}
@@ -431,6 +465,18 @@ func loadMutable(runDir string, registry *adapter.Registry, recovering bool, lea
 	}
 	if filepath.Clean(paths.Root) != filepath.Clean(runDir) {
 		return nil, fmt.Errorf("run directory does not match run identity: %s != %s", runDir, paths.Root)
+	}
+	// Legacy run configurations omitted audit_policy. Resolve the current
+	// narrow defaults once, then persist them so recovery never recomputes a
+	// policy from a newer binary or environment.
+	if !hasPersistedAuditPolicy {
+		run.ConfigSnapshot, err = json.Marshal(config)
+		if err != nil {
+			return nil, fmt.Errorf("encode normalized run config: %w", err)
+		}
+		if err := storage.AtomicWriteJSON(paths.Run, run, 0o600); err != nil {
+			return nil, fmt.Errorf("persist normalized run config: %w", err)
+		}
 	}
 	var plan domain.RunPlan
 	if data, readErr := os.ReadFile(paths.Plan); readErr == nil {
@@ -572,6 +618,7 @@ func loadMutable(runDir string, registry *adapter.Registry, recovering bool, lea
 					messages: messageStore, messageIndex: messageIndex,
 					pending: map[string]*pendingWaiter{}, active: map[string]activeWorker{},
 					cancelledTasks: map[string]bool{}, runBaseline: verify.WorkspaceSnapshot{},
+					auditPolicy: auditPolicy, auditPolicySet: true,
 					fatalPersistence: make(chan error, 1), acceptingWork: false, advance: make(chan struct{}, 1),
 					lease: lease,
 				}
@@ -622,6 +669,7 @@ func loadMutable(runDir string, registry *adapter.Registry, recovering bool, lea
 		snapshot: snapshot, events: event.NewStore(paths.Events, string(run.RunID), lastSeq),
 		terminal: make(chan struct{}), recovering: recovering, plan: plan,
 		messages: messageStore, messageIndex: messageIndex, router: router, pending: map[string]*pendingWaiter{}, active: map[string]activeWorker{}, cancelledTasks: map[string]bool{}, runBaseline: runBaseline,
+		auditPolicy: auditPolicy, auditPolicySet: true,
 		fatalPersistence: make(chan error, 1), acceptingWork: acceptingWork, advance: make(chan struct{}, 1),
 		lease: lease,
 	}, nil
@@ -833,7 +881,7 @@ func (s *Service) RequestCancel(ctx context.Context) error {
 	degraded := false
 	// One worker failure must not stop cancellation of others.
 	for _, worker := range active {
-		result, err := s.terminateActiveWorker(ctx, worker)
+		result, err := s.terminateActiveWorker(ctx, worker, "run_cancel")
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -861,7 +909,7 @@ func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 		if !ok {
 			return nil // idempotent: already cancelled and inactive
 		}
-		result, err := s.terminateActiveWorker(ctx, worker)
+		result, err := s.terminateActiveWorker(ctx, worker, "task_cancel")
 		var errs []error
 		if err != nil {
 			errs = append(errs, err)
@@ -885,7 +933,7 @@ func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 	if err := s.appendEvent(event.Input{TaskID: taskID, Source: "supervisor", Type: event.CancelTreeRequested, Severity: "warning", Payload: map[string]any{"scope": "task"}}); err != nil {
 		errs = append(errs, err)
 	}
-	result, err := s.terminateActiveWorker(ctx, worker)
+	result, err := s.terminateActiveWorker(ctx, worker, "task_cancel")
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -904,7 +952,11 @@ func (s *Service) RequestCancelTask(ctx context.Context, taskID string) error {
 	return errors.Join(errs...)
 }
 
-func (s *Service) terminateActiveWorker(ctx context.Context, worker activeWorker) (process.TerminationResult, error) {
+func (s *Service) terminateActiveWorker(ctx context.Context, worker activeWorker, initiators ...string) (process.TerminationResult, error) {
+	initiator := "task_cancel"
+	if len(initiators) > 0 && strings.TrimSpace(initiators[0]) != "" {
+		initiator = initiators[0]
+	}
 	// Protocol interrupt first (best effort).
 	if worker.adapter != nil {
 		_ = worker.adapter.InterruptTurn(ctx, worker.sessionID)
@@ -914,13 +966,17 @@ func (s *Service) terminateActiveWorker(ctx context.Context, worker activeWorker
 	var err error
 	if worker.identity.Complete() {
 		result, err = process.Controller{Manager: process.PlatformManager{}}.TerminateTree(ctx, worker.identity, policy)
+		if result.TerminationRequested {
+			result.TerminationInitiator = initiator
+		}
 		if err == nil && !result.TreeExited && !result.PIDReused {
 			result.OrphanRisk = true
 		}
 	} else {
 		// Incomplete identity: Adapter terminate is best-effort only.
 		// TerminateSession returning nil does NOT confirm full process-tree exit.
-		result.TermSent = true
+		// Do not mark a process-controller signal as sent: no controller signal
+		// was issued when process identity was incomplete.
 		result.TreeExited = false
 		result.OrphanRisk = true
 		if worker.adapter != nil {
@@ -928,6 +984,9 @@ func (s *Service) terminateActiveWorker(ctx context.Context, worker activeWorker
 				result.Errors = append(result.Errors, "adapter terminate: "+termErr.Error())
 				err = termErr
 			} else {
+				result.TerminationRequested = true
+				result.TerminationInitiator = initiator
+				result.TerminationPhase = "adapter_terminate"
 				result.Errors = append(result.Errors, "incomplete process identity: tree exit unconfirmed after adapter terminate")
 			}
 		} else {
@@ -963,13 +1022,19 @@ func (s *Service) recordCancelOrphanRisk(worker activeWorker, result process.Ter
 	if len(result.Errors) > 0 {
 		reason = reason + ": " + strings.Join(result.Errors, "; ")
 	}
+	processEvidence := failureProcessEvidenceFromTerminationResult(result, string(processState))
 	return s.commitMutate(context.Background(), event.Input{
 		TaskID: worker.taskID, WorkerID: worker.workerID, Source: "supervisor",
 		Type: event.ProcessOrphaned, Severity: "error",
 		Payload: map[string]any{
 			"from": string(state.ProcessAlive), "to": string(processState),
 			"reason": reason, "remaining": result.RemainingPIDs, "orphan_risk": result.OrphanRisk,
-			"tree_exited": result.TreeExited,
+			"exit_observed":         false,
+			"tree_exit_confirmed":   result.TreeExited || result.PIDReused,
+			"tree_exited":           result.TreeExited,
+			"termination_requested": result.TerminationRequested,
+			"termination_initiator": result.TerminationInitiator,
+			"termination_phase":     result.TerminationPhase,
 		},
 	}, func(candidate *Snapshot) error {
 		index, err := findTaskIndex(candidate, domain.TaskID(worker.taskID))
@@ -980,6 +1045,7 @@ func (s *Service) recordCancelOrphanRisk(worker activeWorker, result process.Ter
 		if candidate.Tasks[index].Worker != nil {
 			candidate.Tasks[index].Worker.StatusDimensions.Process = processState
 		}
+		candidate.Tasks[index].LastProcessEvidence = &processEvidence
 		candidate.LastError = reason
 		candidate.UpdatedAt = time.Now().UTC()
 		return nil
@@ -1721,7 +1787,11 @@ func (s *Service) collectFinalVerificationInputs(ctx context.Context) (wave.Barr
 		leases[string(runtime.Task.TaskID)] = append([]string(nil), runtime.Task.WriteScope...)
 	}
 	s.mu.Unlock()
-	scopeAudit, err := verify.AuditScopes(changed, leases)
+	policy, err := s.frozenAuditPolicy()
+	if err != nil {
+		return wave.BarrierInputs{}, err
+	}
+	scopeAudit, err := verify.AuditScopes(changed, leases, policy)
 	if err != nil {
 		return wave.BarrierInputs{}, err
 	}
@@ -1931,6 +2001,19 @@ func (s *Service) projectRoot() string {
 	return snap.Tasks[0].Task.ProjectRoot
 }
 
+// frozenAuditPolicy returns the policy selected at dispatch/load. The
+// compatibility fallback is used only by in-memory test Services and by old
+// configurations before Load has installed the persisted policy.
+func (s *Service) frozenAuditPolicy() (verify.AuditPolicy, error) {
+	if s.auditPolicySet {
+		return verify.NormalizeAuditPolicy(verify.AuditPolicy{EphemeralPaths: append([]string(nil), s.auditPolicy.EphemeralPaths...)})
+	}
+	if s.config.AuditPolicy != nil {
+		return verify.NormalizeAuditPolicy(verify.AuditPolicy{EphemeralPaths: append([]string(nil), s.config.AuditPolicy.EphemeralPaths...)})
+	}
+	return verify.NormalizeAuditPolicy(verify.DefaultAuditPolicy())
+}
+
 func (s *Service) wavePaths(id domain.WaveID) storage.WavePaths {
 	layout, _ := storage.NewLayout(s.config.BrokerHome)
 	snap := s.Snapshot()
@@ -2098,8 +2181,14 @@ func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
 		// Fail-closed: terminal cleanup persistence errors must surface.
 		durabilityErrs = append(durabilityErrs, fmt.Errorf("expire messages: %w", expireErr))
 	}
+	resultObserved := runtime.ReportPath != "" || stage == "result_validation"
+	evidencePublication, evidenceErr := s.recordFailureEvidence(runtime, stage, err, resultObserved)
+	if evidenceErr != nil {
+		durabilityErrs = append(durabilityErrs, fmt.Errorf("publish failure evidence: %w", evidenceErr))
+	}
 	if stage != "result" && stage != "result_validation" && runtime.ReportPath == "" {
-		failed := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusFailed, Summary: "Worker execution failed", NoFilesChangedReason: "No verified file list was available after the failure", ValidationNotRunReason: "validation was not reached", FailureStage: stage, ErrorSummary: err.Error(), WorkspaceState: "Workspace was left in place; no rollback was performed", HandoffNotes: []string{"Main Agent should inspect the workspace before retrying."}}
+		taskPaths := failureEvidenceTaskPaths(s, runtime.Task)
+		failed := report.Envelope{SchemaVersion: report.SchemaVersion, TaskID: string(runtime.Task.TaskID), WorkerID: workerID(runtime), Status: report.StatusFailed, Summary: "Worker execution failed", NoFilesChangedReason: "No verified Task-owned file list was available after the failure", ValidationNotRunReason: "validation was not reached", FailureStage: stage, ErrorSummary: err.Error(), WorkspaceState: "Workspace was left in place; no rollback was performed", HandoffNotes: []string{fmt.Sprintf("Observed workspace changes are recorded separately in %s and are not automatically attributed to this Task.", filepath.Base(taskPaths.FailureEvidence)), "Main Agent should inspect the workspace before retrying."}}
 		attemptNumber := reportAttemptNumber(runtime)
 		if publishErr := report.Publish(s.taskDir(runtime.Task), failed, attemptNumber, time.Now().UTC()); publishErr == nil {
 			runtime.ReportPath = filepath.Join(s.taskDir(runtime.Task), "report.md")
@@ -2112,6 +2201,11 @@ func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
 	}
 	if saveErr := s.saveRuntime(*runtime); saveErr != nil {
 		durabilityErrs = append(durabilityErrs, fmt.Errorf("save failed Task state: %w", saveErr))
+	}
+	if evidenceErr == nil {
+		if eventErr := s.appendFailureEvidencePublication(evidencePublication); eventErr != nil {
+			durabilityErrs = append(durabilityErrs, eventErr)
+		}
 	}
 	if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), Source: "supervisor", Type: event.TurnFailed, Severity: "error", Payload: map[string]string{"stage": stage, "error": err.Error()}}); eventErr != nil {
 		durabilityErrs = append(durabilityErrs, fmt.Errorf("record Task failure event: %w", eventErr))

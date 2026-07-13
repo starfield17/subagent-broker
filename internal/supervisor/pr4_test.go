@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,13 @@ func TestHighRiskUnauthorizedIsError(t *testing.T) {
 	changes := classifyHighRiskChanges([]string{"go.mod"}, verify.ScopeAudit{Unauthorized: []string{"go.mod"}})
 	if len(changes) != 1 || changes[0].Severity != wave.SeverityError {
 		t.Fatalf("%+v", changes)
+	}
+}
+
+func TestHighRiskEphemeralMatchRemainsError(t *testing.T) {
+	changes := classifyHighRiskChanges([]string{"go.mod"}, verify.ScopeAudit{Ephemeral: []verify.EphemeralAttribution{{Path: "go.mod", Pattern: "go.mod"}}})
+	if len(changes) != 1 || changes[0].Severity != wave.SeverityError {
+		t.Fatalf("high-risk ephemeral change was downgraded: %+v", changes)
 	}
 }
 
@@ -173,6 +181,10 @@ func TestBuildRunSummaryAggregates(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = os.WriteFile(filepath.Join(root, "go.mod"), []byte("module x\n"), 0o600)
+	if err := os.MkdirAll(filepath.Join(root, ".pytest_cache"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(root, ".pytest_cache", "CACHEDIR.TAG"), []byte("cache\n"), 0o600)
 	service := &Service{
 		config: Config{BrokerHome: filepath.Join(root, "broker")},
 		snapshot: Snapshot{
@@ -200,6 +212,53 @@ func TestBuildRunSummaryAggregates(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected go.mod in changed files: %v", summary.ChangedFiles)
+	}
+	found = false
+	for _, f := range summary.Ephemeral {
+		if f == ".pytest_cache/CACHEDIR.TAG" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected cache in ephemeral summary: %v", summary.Ephemeral)
+	}
+	for _, f := range summary.Unauthorized {
+		if f == ".pytest_cache/CACHEDIR.TAG" {
+			t.Fatalf("ephemeral path was listed unauthorized: %v", summary.Unauthorized)
+		}
+	}
+	markdown := renderAggregatedSummary(summary)
+	if !strings.Contains(markdown, "## Ephemeral Changes") || !strings.Contains(markdown, ".pytest_cache/CACHEDIR.TAG") {
+		t.Fatalf("summary Markdown did not render ephemeral paths:\n%s", markdown)
+	}
+}
+
+func TestRunSummaryReusesFrozenEmptyAuditPolicy(t *testing.T) {
+	root := t.TempDir()
+	baseline, err := verify.CaptureWorkspace(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".pytest_cache"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".pytest_cache", "CACHEDIR.TAG"), []byte("cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	empty := verify.AuditPolicy{EphemeralPaths: []string{}}
+	service := &Service{
+		config:      Config{BrokerHome: filepath.Join(root, "broker"), AuditPolicy: &empty},
+		auditPolicy: empty, auditPolicySet: true,
+		snapshot:    Snapshot{Run: domain.Run{RunID: "run-1", ProjectID: "p", Status: domain.RunCompleted}, Tasks: []TaskState{{Task: domain.Task{TaskID: "task-a", ProjectRoot: root, WaveID: "wave-1"}}}},
+		runBaseline: baseline,
+		paths:       storage.RunPaths{Root: root, Tasks: filepath.Join(root, "tasks"), Waves: filepath.Join(root, "waves")},
+	}
+	summary, err := service.buildRunSummary(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Ephemeral) != 0 || len(summary.Unauthorized) != 1 || summary.Unauthorized[0] != ".pytest_cache/CACHEDIR.TAG" {
+		t.Fatalf("frozen empty policy was not reused: %+v", summary)
 	}
 }
 

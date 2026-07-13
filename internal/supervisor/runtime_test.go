@@ -17,6 +17,7 @@ import (
 	"github.com/vnai/subagent-broker/internal/state"
 	"github.com/vnai/subagent-broker/internal/storage"
 	taskcontract "github.com/vnai/subagent-broker/internal/task"
+	"github.com/vnai/subagent-broker/internal/verify"
 )
 
 func TestServiceCompletesFakeLifecycle(t *testing.T) {
@@ -62,6 +63,87 @@ func TestServiceCompletesFakeLifecycle(t *testing.T) {
 	if err != nil || len(replay.Events) == 0 {
 		t.Fatalf("event replay failed: %v %+v", err, replay)
 	}
+}
+
+func TestLegacyRunPersistsFrozenDefaultAuditPolicy(t *testing.T) {
+	runDir, _ := writeFixture(t)
+	runValue, err := readRunForTest(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := DefaultConfig()
+	legacy.AuditPolicy = nil
+	runValue.ConfigSnapshot, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.AtomicWriteJSON(filepath.Join(runDir, "run.json"), runValue, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := Load(runDir, fakeRegistryForRuntimeTest(t), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	var persisted domain.Run
+	raw, err := os.ReadFile(filepath.Join(runDir, "run.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	var config Config
+	if err := json.Unmarshal(persisted.ConfigSnapshot, &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.AuditPolicy == nil {
+		t.Fatal("legacy load did not persist audit policy")
+	}
+	policy, err := verify.NormalizeAuditPolicy(*config.AuditPolicy)
+	if err != nil || len(policy.EphemeralPaths) != len(verify.DefaultEphemeralPaths) {
+		t.Fatalf("persisted policy=%+v err=%v", config.AuditPolicy, err)
+	}
+}
+
+func TestInvalidPersistedAuditPolicyFailsLoadBeforeWorkers(t *testing.T) {
+	runDir, _ := writeFixture(t)
+	runValue, err := readRunForTest(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := Config{BrokerHome: filepath.Dir(filepath.Dir(filepath.Dir(runDir))), AuditPolicy: &verify.AuditPolicy{EphemeralPaths: []string{"../outside/**"}}}
+	runValue.ConfigSnapshot, err = json.Marshal(invalid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.AtomicWriteJSON(filepath.Join(runDir, "run.json"), runValue, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(runDir, fakeRegistryForRuntimeTest(t), false); err == nil {
+		t.Fatal("invalid persisted policy unexpectedly loaded")
+	}
+}
+
+func readRunForTest(runDir string) (domain.Run, error) {
+	raw, err := os.ReadFile(filepath.Join(runDir, "run.json"))
+	if err != nil {
+		return domain.Run{}, err
+	}
+	var value domain.Run
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return domain.Run{}, err
+	}
+	return value, nil
+}
+
+func fakeRegistryForRuntimeTest(t *testing.T) *adapter.Registry {
+	t.Helper()
+	registry := adapter.NewRegistry()
+	if err := registry.Register(fake.New(adapter.Capabilities{StructuredStream: true, StructuredFinalOutput: true})); err != nil {
+		t.Fatal(err)
+	}
+	return registry
 }
 
 func TestServiceExecutesOrderedMultiTaskWaves(t *testing.T) {

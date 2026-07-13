@@ -66,6 +66,9 @@ func renderRunSummary(snapshot Snapshot) string {
 		if runtime.ReportPath != "" {
 			fmt.Fprintf(&b, "- Report: `%s`\n", runtime.ReportPath)
 		}
+		if runtime.FailureEvidencePath != "" {
+			fmt.Fprintf(&b, "- Failure evidence: `%s`\n", runtime.FailureEvidencePath)
+		}
 		if runtime.LastError != "" {
 			fmt.Fprintf(&b, "- Error: %s\n", runtime.LastError)
 		}

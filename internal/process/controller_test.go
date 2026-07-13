@@ -165,6 +165,9 @@ func TestTerminateTreeExitsAfterInterrupt(t *testing.T) {
 	if !result.TreeExited || result.PIDReused {
 		t.Fatalf("unexpected result: %+v", result)
 	}
+	if !result.TerminationRequested || result.TerminationPhase != "interrupt" {
+		t.Fatalf("termination provenance=%+v", result)
+	}
 	interrupt, term, kill := fake.counts()
 	if interrupt != 1 || term != 0 || kill != 0 {
 		t.Fatalf("counts interrupt=%d term=%d kill=%d", interrupt, term, kill)
@@ -184,6 +187,9 @@ func TestTerminateTreeEscalatesToTerm(t *testing.T) {
 	if !result.InterruptSent || !result.TermSent || result.KillSent || !result.TreeExited {
 		t.Fatalf("unexpected result: %+v", result)
 	}
+	if !result.TerminationRequested || result.TerminationPhase != "term" {
+		t.Fatalf("termination provenance=%+v", result)
+	}
 	interrupt, term, kill := fake.counts()
 	if interrupt != 1 || term != 1 || kill != 0 {
 		t.Fatalf("counts interrupt=%d term=%d kill=%d", interrupt, term, kill)
@@ -202,6 +208,9 @@ func TestTerminateTreeEscalatesToKill(t *testing.T) {
 	}
 	if !result.InterruptSent || !result.TermSent || !result.KillSent || !result.TreeExited {
 		t.Fatalf("unexpected result: %+v", result)
+	}
+	if !result.TerminationRequested || result.TerminationPhase != "kill_tree" {
+		t.Fatalf("termination provenance=%+v", result)
 	}
 	interrupt, term, kill := fake.counts()
 	if interrupt != 1 || term != 1 || kill != 1 {
@@ -261,6 +270,9 @@ func TestTerminateTreeMissingPIDIsExited(t *testing.T) {
 	}
 	if !result.TreeExited || result.InterruptSent {
 		t.Fatalf("expected immediate exit without signals: %+v", result)
+	}
+	if result.TerminationRequested || result.TerminationInitiator != "" || result.TerminationPhase != "" {
+		t.Fatalf("must not invent termination provenance: %+v", result)
 	}
 }
 

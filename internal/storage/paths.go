@@ -44,19 +44,21 @@ type WavePaths struct {
 }
 
 type TaskPaths struct {
-	Root          string
-	Task          string
-	Contract      string
-	ContractMeta  string
-	Events        string
-	Stdout        string
-	Stderr        string
-	Question      string
-	QuestionMeta  string
-	Report        string
-	ReportMeta    string
-	ValidationDir string
-	QuestionsDir  string
+	Root                    string
+	Task                    string
+	Contract                string
+	ContractMeta            string
+	Events                  string
+	Stdout                  string
+	Stderr                  string
+	Question                string
+	QuestionMeta            string
+	Report                  string
+	ReportMeta              string
+	FailureEvidence         string
+	FailureEvidenceMarkdown string
+	ValidationDir           string
+	QuestionsDir            string
 }
 
 func (l Layout) HomePaths() HomePaths {
@@ -106,6 +108,7 @@ func (l Layout) TaskPaths(projectKey, runID, taskID string) (TaskPaths, error) {
 		Root: root, Task: filepath.Join(root, "task.json"), Contract: filepath.Join(root, "contract.md"), ContractMeta: filepath.Join(root, "contract.meta.json"),
 		Events: filepath.Join(root, "events.jsonl"), Stdout: filepath.Join(root, "stdout.log"), Stderr: filepath.Join(root, "stderr.log"),
 		Question: filepath.Join(root, "question.md"), QuestionMeta: filepath.Join(root, "question.meta.json"), Report: filepath.Join(root, "report.md"),
-		ReportMeta: filepath.Join(root, "report.meta.json"), ValidationDir: filepath.Join(root, "validation"), QuestionsDir: filepath.Join(root, "questions"),
+		ReportMeta: filepath.Join(root, "report.meta.json"), FailureEvidence: filepath.Join(root, "failure-evidence.json"), FailureEvidenceMarkdown: filepath.Join(root, "failure-evidence.md"),
+		ValidationDir: filepath.Join(root, "validation"), QuestionsDir: filepath.Join(root, "questions"),
 	}, nil
 }

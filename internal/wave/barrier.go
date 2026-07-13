@@ -46,6 +46,14 @@ func RenderBarrier(value Verification) string {
 	fmt.Fprintf(&b, "- Wave: `%s`\n- Result: `%s`\n- Started: %s\n- Ended: %s\n\n", value.WaveID, value.Result, value.StartedAt.UTC().Format(time.RFC3339), value.EndedAt.UTC().Format(time.RFC3339))
 	b.WriteString("## Changed Files\n\n")
 	writeBarrierList(&b, value.ChangedFiles, "None.")
+	b.WriteString("\n## Ephemeral Changes\n\n")
+	if len(value.ScopeAudit.Ephemeral) == 0 {
+		b.WriteString("- None.\n")
+	} else {
+		for _, item := range value.ScopeAudit.Ephemeral {
+			fmt.Fprintf(&b, "- `%s` (pattern `%s`)\n", item.Path, item.Pattern)
+		}
+	}
 	b.WriteString("\n## Unauthorized Files\n\n")
 	writeBarrierList(&b, value.ScopeAudit.Unauthorized, "None.")
 	b.WriteString("\n## Integration Checks\n\n")

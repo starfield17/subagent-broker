@@ -289,6 +289,68 @@ go build ./cmd/subagent-broker
 
 **No live authenticated harness smoke was performed.**
 
+## Patch C — failure evidence and ephemeral audit policy
+
+Patch C freezes an explicit `audit_policy` in the persisted Run configuration.
+Dispatch validates, normalizes, sorts, and deduplicates the policy before any
+Worker starts; recovery reuses that persisted policy. Legacy Run configurations
+without `audit_policy` receive the narrow defaults once and are then persisted.
+
+The default ephemeral patterns are:
+
+- `**/__pycache__/**`
+- `**/.pytest_cache/**`
+- `**/*.pyc`
+
+Repeatable `--ephemeral-path <pattern>` flags add project-relative patterns to
+those defaults. Patterns use the existing scope/glob language. Ephemeral
+matches remain in Workspace Snapshots, `ChangedFiles`, verification JSON and
+Markdown, and Run summaries. No `.gitignore` rules or broad defaults such as
+`node_modules/**`, `target/**`, `dist/**`, `build/**`, or `tmp/**` are used, and
+no cleanup is performed automatically.
+
+The audit precedence is: ephemeral pattern match first; otherwise resolve
+write-lease owners; zero owners is unauthorized, one owner is authorized, and
+multiple owners are owner-uncertain. High-risk classification still examines
+all changed paths, including paths that match an ephemeral pattern.
+
+Every workspace change remains observable. Failure evidence records observed
+workspace and process facts, including baseline-relative file states and
+ownership candidates when available. It is not a Result Envelope, formal
+verification result, ownership proof, or automatic adoption of residual files.
+The canonical `failure-evidence.json` and its Markdown projection live under
+the Broker Task run directory, never in the project workspace. The JSON is
+published atomically before Markdown and is linked from Task state and the
+aggregated Run summary.
+
+### Patch C validation — 2026-07-13
+
+Executed:
+
+```bash
+gofmt -w .
+test -z "$(gofmt -l .)"
+go test ./...
+go test -race ./...
+go test -race ./internal/verify/... ./internal/wave/... ./internal/supervisor/... ./cmd/subagent-broker/... -count=10
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Results:
+
+| Command | Result |
+|---|---|
+| `test -z "$(gofmt -l .)"` | pass |
+| `go test ./...` | all packages PASS |
+| `go test -race ./...` | all packages PASS |
+| focused `go test -race ... -count=10` | all packages PASS |
+| `go vet ./...` | no findings |
+| `go build ./cmd/subagent-broker` | success |
+
+No live authenticated Harness smoke was run for Patch C. The pre-existing
+repeated Codex EOF fixture timeout was not changed by this patch.
+
 ## Result envelope and resolution protocol invariants
 
 - External Harness output is normalized at the Adapter protocol boundary before entering the canonical Result Envelope model.

@@ -385,13 +385,17 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 // WorkerExitResolution is the structured outcome of drain/cleanup termination.
 // Inability to confirm exit is never reported as ProcessExited.
 type WorkerExitResolution struct {
-	ExitObserved      bool
-	TreeExitConfirmed bool
-	ExitCode          *int
-	RemainingPIDs     []int
-	OrphanRisk        bool
-	ProcessState      state.Process
-	Errors            []string
+	ExitObserved         bool          `json:"exit_observed"`
+	TreeExitConfirmed    bool          `json:"tree_exit_confirmed"`
+	ExitCode             *int          `json:"exit_code,omitempty"`
+	ExitSignal           string        `json:"exit_signal,omitempty"`
+	RemainingPIDs        []int         `json:"remaining_pids,omitempty"`
+	OrphanRisk           bool          `json:"orphan_risk"`
+	ProcessState         state.Process `json:"process_state"`
+	Errors               []string      `json:"errors,omitempty"`
+	TerminationRequested bool          `json:"termination_requested,omitempty"`
+	TerminationInitiator string        `json:"termination_initiator,omitempty"`
+	TerminationPhase     string        `json:"termination_phase,omitempty"`
 }
 
 // workerSessionResult is the full outcome of runWorkerSession.
@@ -441,8 +445,25 @@ func (s *Service) runWorkerSession(
 	var drainC <-chan time.Time
 	var lastTerm process.TerminationResult
 	var lastTermErr error
+	terminationRequested := false
+	terminationInitiator := ""
+	terminationPhase := ""
 	controller := process.Controller{Manager: process.PlatformManager{}}
 	policy := defaultCancelPolicy(s.config.CancelGrace)
+	mergeTermination := func(requested bool, initiator, phase string) {
+		if requested {
+			terminationRequested = true
+		}
+		if terminationInitiator == "" && initiator != "" {
+			terminationInitiator = initiator
+		}
+		if terminationPhaseRank(phase) > terminationPhaseRank(terminationPhase) {
+			terminationPhase = phase
+		}
+	}
+	mergeControllerTermination := func(result process.TerminationResult, initiator string) {
+		mergeTermination(result.TerminationRequested, initiator, result.TerminationPhase)
+	}
 
 	stopDrainTimer := func() {
 		if drainTimer != nil {
@@ -462,20 +483,22 @@ func (s *Service) runWorkerSession(
 		drainC = drainTimer.C
 	}
 
-	terminateReliable := func() {
+	terminateReliable := func(initiator string) {
 		if termErr := harness.TerminateSession(context.Background(), session.NativeSessionID); termErr != nil {
 			lastTerm.Errors = append(lastTerm.Errors, "adapter terminate: "+termErr.Error())
 			lastTermErr = termErr
+		} else {
+			mergeTermination(true, initiator, "adapter_terminate")
 		}
 		if identity.Complete() {
 			result, err := controller.TerminateTree(context.Background(), identity, policy)
 			lastTerm = result
+			mergeControllerTermination(result, initiator)
 			if err != nil {
 				lastTermErr = err
 				lastTerm.Errors = append(lastTerm.Errors, err.Error())
 			}
 		} else {
-			lastTerm.TermSent = true
 			lastTerm.TreeExited = false
 			lastTerm.OrphanRisk = true
 			lastTerm.Errors = append(lastTerm.Errors, "incomplete process identity during drain")
@@ -489,7 +512,7 @@ func (s *Service) runWorkerSession(
 		case <-contextDone:
 			contextDone = nil
 			if !out.ResultSeen {
-				terminateReliable()
+				terminateReliable(terminationInitiatorForSession(s, runtime, errors.Is(workerCtx.Err(), context.DeadlineExceeded)))
 			}
 			startBoundedDrain()
 		case now := <-progressTicker.C:
@@ -499,11 +522,12 @@ func (s *Service) runWorkerSession(
 		case <-drainC:
 			// Bounded drain elapsed: stop waiting on hang-open streams.
 			if !exitObserved {
-				terminateReliable()
+				terminateReliable(terminationInitiatorForSession(s, runtime, out.TimedOut))
 			} else if identity.Complete() && !lastTerm.TreeExited {
 				// Parent exited but tree may still have children.
 				result, err := controller.TerminateTree(context.Background(), identity, policy)
 				lastTerm = result
+				mergeControllerTermination(result, "worker_exit")
 				if err != nil {
 					lastTermErr = err
 					lastTerm.Errors = append(lastTerm.Errors, err.Error())
@@ -561,6 +585,8 @@ func (s *Service) runWorkerSession(
 				closing = true
 				if termErr := harness.TerminateSession(context.Background(), session.NativeSessionID); termErr != nil {
 					lastTerm.Errors = append(lastTerm.Errors, "adapter terminate after result: "+termErr.Error())
+				} else {
+					mergeTermination(true, "supervisor_post_result", "adapter_terminate")
 				}
 				startBoundedDrain()
 			case event.TurnFailed:
@@ -569,6 +595,8 @@ func (s *Service) runWorkerSession(
 				closing = true
 				if termErr := harness.TerminateSession(context.Background(), session.NativeSessionID); termErr != nil {
 					lastTerm.Errors = append(lastTerm.Errors, "adapter terminate after turn failure: "+termErr.Error())
+				} else {
+					mergeTermination(true, "adapter_failure", "adapter_terminate")
 				}
 				startBoundedDrain()
 			}
@@ -594,10 +622,11 @@ func (s *Service) runWorkerSession(
 
 	// If Exited never arrived, attempt one final reliable terminate + tree confirm.
 	if !exitObserved {
-		terminateReliable()
+		terminateReliable(terminationInitiatorForSession(s, runtime, out.TimedOut))
 	} else if identity.Complete() && !lastTerm.TreeExited && len(lastTerm.RemainingPIDs) == 0 {
 		// Confirm tree gone after observed exit (children may remain).
 		result, err := controller.TerminateTree(context.Background(), identity, policy)
+		mergeControllerTermination(result, "worker_exit")
 		if err == nil {
 			lastTerm = result
 		} else {
@@ -607,11 +636,14 @@ func (s *Service) runWorkerSession(
 	}
 
 	resolution := WorkerExitResolution{
-		ExitObserved:      exitObserved,
-		TreeExitConfirmed: lastTerm.TreeExited || lastTerm.PIDReused,
-		RemainingPIDs:     append([]int(nil), lastTerm.RemainingPIDs...),
-		OrphanRisk:        lastTerm.OrphanRisk || (!exitObserved && !lastTerm.TreeExited && !lastTerm.PIDReused),
-		Errors:            append([]string(nil), lastTerm.Errors...),
+		ExitObserved:         exitObserved,
+		TreeExitConfirmed:    lastTerm.TreeExited || lastTerm.PIDReused,
+		RemainingPIDs:        append([]int(nil), lastTerm.RemainingPIDs...),
+		OrphanRisk:           lastTerm.OrphanRisk || (!exitObserved && !lastTerm.TreeExited && !lastTerm.PIDReused),
+		Errors:               append([]string(nil), lastTerm.Errors...),
+		TerminationRequested: terminationRequested,
+		TerminationInitiator: terminationInitiator,
+		TerminationPhase:     terminationPhase,
 	}
 	if lastTermErr != nil {
 		resolution.Errors = append(resolution.Errors, lastTermErr.Error())
@@ -619,6 +651,10 @@ func (s *Service) runWorkerSession(
 	if exitObserved {
 		code := out.Exit.Code
 		resolution.ExitCode = &code
+		resolution.ExitSignal = out.Exit.Signal
+		if resolution.TerminationInitiator == "" {
+			resolution.TerminationInitiator = "worker_exit"
+		}
 	}
 
 	// Map to process dimension honestly.
@@ -693,6 +729,7 @@ func (s *Service) commitWorkerExitResolution(runtime *TaskState, workerID string
 	} else {
 		runtime.Dimensions.Process = resolution.ProcessState
 	}
+	processEvidence := failureProcessEvidenceFromResolution(resolution)
 
 	return s.commitMutate(context.Background(), event.Input{
 		TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
@@ -702,6 +739,10 @@ func (s *Service) commitWorkerExitResolution(runtime *TaskState, workerID string
 			"exit_observed": resolution.ExitObserved, "tree_exit_confirmed": resolution.TreeExitConfirmed,
 			"orphan_risk": resolution.OrphanRisk, "remaining": resolution.RemainingPIDs,
 			"errors": resolution.Errors, "exit": exit,
+			"exit_signal":           resolution.ExitSignal,
+			"termination_requested": resolution.TerminationRequested,
+			"termination_initiator": resolution.TerminationInitiator,
+			"termination_phase":     resolution.TerminationPhase,
 		},
 	}, func(candidate *Snapshot) error {
 		index, err := findTaskIndex(candidate, runtime.Task.TaskID)
@@ -718,6 +759,7 @@ func (s *Service) commitWorkerExitResolution(runtime *TaskState, workerID string
 			}
 			updateAttemptWorker(&candidate.Tasks[index], *candidate.Tasks[index].Worker)
 		}
+		candidate.Tasks[index].LastProcessEvidence = &processEvidence
 		if resolution.OrphanRisk {
 			candidate.LastError = "worker process exit unconfirmed"
 		}
@@ -736,6 +778,34 @@ func defaultCancelPolicy(grace time.Duration) process.TerminationPolicy {
 		KillGrace:      grace / 3,
 		PollInterval:   50 * time.Millisecond,
 	}
+}
+
+func terminationPhaseRank(phase string) int {
+	switch phase {
+	case "adapter_terminate":
+		return 1
+	case "interrupt":
+		return 2
+	case "term":
+		return 3
+	case "kill_tree":
+		return 4
+	default:
+		return 0
+	}
+}
+
+func terminationInitiatorForSession(s *Service, runtime *TaskState, timedOut bool) string {
+	if timedOut {
+		return "hard_timeout"
+	}
+	if runtime != nil && s.isTaskCancelled(string(runtime.Task.TaskID)) {
+		return "task_cancel"
+	}
+	if s.isCancelled() {
+		return "run_cancel"
+	}
+	return ""
 }
 
 func updateAttemptWorker(ts *TaskState, w domain.WorkerSession) {
@@ -783,10 +853,21 @@ func (s *Service) applyResultEnvelope(runtime *TaskState, result report.Envelope
 			if err := s.transitionTask(runtime, state.TaskVerificationFailed); err != nil {
 				return err
 			}
-			if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"}); eventErr != nil {
-				return joinFatalSupervisorError(fmt.Errorf("task validation failed"), eventErr)
+			validationErr := fmt.Errorf("task validation failed")
+			publication, evidenceErr := s.recordFailureEvidence(runtime, "task_validation", validationErr, true)
+			if evidenceErr != nil {
+				return joinFatalSupervisorError(validationErr, evidenceErr)
 			}
-			return fmt.Errorf("task validation failed")
+			if saveErr := s.saveRuntime(*runtime); saveErr != nil {
+				return joinFatalSupervisorError(validationErr, fmt.Errorf("save validation failure evidence path: %w", saveErr))
+			}
+			if eventErr := s.appendFailureEvidencePublication(publication); eventErr != nil {
+				return joinFatalSupervisorError(validationErr, eventErr)
+			}
+			if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"}); eventErr != nil {
+				return joinFatalSupervisorError(validationErr, eventErr)
+			}
+			return validationErr
 		}
 		if err := s.transitionTask(runtime, state.TaskVerifiedSuccess); err != nil {
 			return err
@@ -804,10 +885,21 @@ func (s *Service) applyResultEnvelope(runtime *TaskState, result report.Envelope
 			if err := s.transitionTask(runtime, state.TaskVerificationFailed); err != nil {
 				return err
 			}
-			if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"}); eventErr != nil {
-				return joinFatalSupervisorError(fmt.Errorf("task validation failed"), eventErr)
+			validationErr := fmt.Errorf("task validation failed")
+			publication, evidenceErr := s.recordFailureEvidence(runtime, "task_validation", validationErr, true)
+			if evidenceErr != nil {
+				return joinFatalSupervisorError(validationErr, evidenceErr)
 			}
-			return fmt.Errorf("task validation failed")
+			if saveErr := s.saveRuntime(*runtime); saveErr != nil {
+				return joinFatalSupervisorError(validationErr, fmt.Errorf("save validation failure evidence path: %w", saveErr))
+			}
+			if eventErr := s.appendFailureEvidencePublication(publication); eventErr != nil {
+				return joinFatalSupervisorError(validationErr, eventErr)
+			}
+			if eventErr := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "verifier", Type: event.TaskVerificationFailed, Severity: "error"}); eventErr != nil {
+				return joinFatalSupervisorError(validationErr, eventErr)
+			}
+			return validationErr
 		}
 		return s.markPartial(runtime, result.Status)
 

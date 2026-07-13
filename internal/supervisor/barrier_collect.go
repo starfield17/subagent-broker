@@ -54,7 +54,11 @@ func (s *Service) collectBarrierInputs(ctx context.Context, planned domain.WaveP
 			leases[string(item.TaskID)] = append([]string(nil), runtime.Task.WriteScope...)
 		}
 	}
-	scopeAudit, err := verify.AuditScopes(changed, leases)
+	policy, err := s.frozenAuditPolicy()
+	if err != nil {
+		return wave.BarrierInputs{}, err
+	}
+	scopeAudit, err := verify.AuditScopes(changed, leases, policy)
 	if err != nil {
 		return wave.BarrierInputs{}, err
 	}
@@ -244,6 +248,10 @@ func classifyHighRiskChanges(changed []string, audit verify.ScopeAudit) []wave.H
 	for _, item := range audit.OwnerUncertain {
 		ownerUncertain[item.Path] = true
 	}
+	ephemeral := map[string]bool{}
+	for _, item := range audit.Ephemeral {
+		ephemeral[item.Path] = true
+	}
 	var out []wave.HighRiskChange
 	for _, match := range verify.ClassifyHighRisk(changed) {
 		severity := wave.SeverityWarning
@@ -254,6 +262,11 @@ func classifyHighRiskChanges(changed []string, audit verify.ScopeAudit) []wave.H
 		} else if ownerUncertain[match.Path] {
 			severity = wave.SeverityError
 			reason = match.Reason + " (owner uncertain)"
+		} else if ephemeral[match.Path] {
+			// An over-broad ephemeral policy must not downgrade a sensitive
+			// configuration/source path into a harmless cache observation.
+			severity = wave.SeverityError
+			reason = match.Reason + " (ephemeral high-risk path)"
 		}
 		out = append(out, wave.HighRiskChange{Path: match.Path, Severity: severity, Reason: reason})
 	}

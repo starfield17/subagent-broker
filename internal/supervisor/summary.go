@@ -25,9 +25,11 @@ type RunSummary struct {
 	Waves           []WaveSummaryEntry    `json:"waves"`
 	Tasks           []TaskSummaryEntry    `json:"tasks"`
 	ChangedFiles    []string              `json:"changed_files,omitempty"`
+	Ephemeral       []string              `json:"ephemeral,omitempty"`
 	Unauthorized    []string              `json:"unauthorized,omitempty"`
 	OwnerUncertain  []string              `json:"owner_uncertain,omitempty"`
 	HighRiskChanges []wave.HighRiskChange `json:"high_risk_changes,omitempty"`
+	FailureEvidence []string              `json:"failure_evidence,omitempty"`
 	Messages        MessageSummaryEntry   `json:"messages"`
 	LastError       string                `json:"last_error,omitempty"`
 }
@@ -45,14 +47,15 @@ type WaveSummaryEntry struct {
 }
 
 type TaskSummaryEntry struct {
-	TaskID     string            `json:"task_id"`
-	Status     string            `json:"status"`
-	BlockKind  string            `json:"block_kind,omitempty"`
-	ReportPath string            `json:"report_path,omitempty"`
-	Attempts   int               `json:"attempts"`
-	LastError  string            `json:"last_error,omitempty"`
-	WriteScope []string          `json:"write_scope,omitempty"`
-	Stall      *stall.Assessment `json:"stall_assessment,omitempty"`
+	TaskID              string            `json:"task_id"`
+	Status              string            `json:"status"`
+	BlockKind           string            `json:"block_kind,omitempty"`
+	ReportPath          string            `json:"report_path,omitempty"`
+	FailureEvidencePath string            `json:"failure_evidence_path,omitempty"`
+	Attempts            int               `json:"attempts"`
+	LastError           string            `json:"last_error,omitempty"`
+	WriteScope          []string          `json:"write_scope,omitempty"`
+	Stall               *stall.Assessment `json:"stall_assessment,omitempty"`
 }
 
 type MessageSummaryEntry struct {
@@ -85,13 +88,22 @@ func (s *Service) buildRunSummary(baseline verify.WorkspaceSnapshot) (RunSummary
 	for _, runtime := range snap.Tasks {
 		leases[string(runtime.Task.TaskID)] = append([]string(nil), runtime.Task.WriteScope...)
 	}
-	if audit, err := verify.AuditScopes(summary.ChangedFiles, leases); err == nil {
-		summary.Unauthorized = append([]string(nil), audit.Unauthorized...)
-		for _, item := range audit.OwnerUncertain {
-			summary.OwnerUncertain = append(summary.OwnerUncertain, item.Path)
-		}
-		summary.HighRiskChanges = classifyHighRiskChanges(summary.ChangedFiles, audit)
+	policy, err := s.frozenAuditPolicy()
+	if err != nil {
+		return summary, fmt.Errorf("resolve audit policy: %w", err)
 	}
+	audit, err := verify.AuditScopes(summary.ChangedFiles, leases, policy)
+	if err != nil {
+		return summary, fmt.Errorf("audit run changes: %w", err)
+	}
+	summary.Unauthorized = append([]string(nil), audit.Unauthorized...)
+	for _, item := range audit.Ephemeral {
+		summary.Ephemeral = append(summary.Ephemeral, item.Path)
+	}
+	for _, item := range audit.OwnerUncertain {
+		summary.OwnerUncertain = append(summary.OwnerUncertain, item.Path)
+	}
+	summary.HighRiskChanges = classifyHighRiskChanges(summary.ChangedFiles, audit)
 
 	for _, w := range snap.Waves {
 		entry := WaveSummaryEntry{
@@ -122,13 +134,17 @@ func (s *Service) buildRunSummary(baseline verify.WorkspaceSnapshot) (RunSummary
 	}
 
 	for _, runtime := range snap.Tasks {
+		failureEvidencePath := runtime.FailureEvidencePath
 		summary.Tasks = append(summary.Tasks, TaskSummaryEntry{
 			TaskID: string(runtime.Task.TaskID), Status: string(runtime.Task.Status),
-			BlockKind: string(runtime.BlockKind), ReportPath: runtime.ReportPath,
+			BlockKind: string(runtime.BlockKind), ReportPath: runtime.ReportPath, FailureEvidencePath: failureEvidencePath,
 			Attempts: len(runtime.Attempts), LastError: runtime.LastError,
 			WriteScope: append([]string(nil), runtime.Task.WriteScope...),
 			Stall:      runtime.Stall,
 		})
+		if failureEvidencePath != "" {
+			summary.FailureEvidence = append(summary.FailureEvidence, failureEvidencePath)
+		}
 	}
 
 	if s.router != nil {
@@ -189,6 +205,9 @@ func renderAggregatedSummary(summary RunSummary) string {
 		if t.ReportPath != "" {
 			fmt.Fprintf(&b, "- Report: `%s`\n", t.ReportPath)
 		}
+		if t.FailureEvidencePath != "" {
+			fmt.Fprintf(&b, "- Failure evidence: `%s`\n", t.FailureEvidencePath)
+		}
 		if len(t.WriteScope) > 0 {
 			fmt.Fprintf(&b, "- Scope: %s\n", strings.Join(t.WriteScope, ", "))
 		}
@@ -219,12 +238,28 @@ func renderAggregatedSummary(summary RunSummary) string {
 			fmt.Fprintf(&b, "- `%s`\n", f)
 		}
 	}
+	b.WriteString("\n## Ephemeral Changes\n\n")
+	if len(summary.Ephemeral) == 0 {
+		b.WriteString("- None.\n")
+	} else {
+		for _, f := range summary.Ephemeral {
+			fmt.Fprintf(&b, "- `%s`\n", f)
+		}
+	}
 	b.WriteString("\n## Owner Uncertain\n\n")
 	if len(summary.OwnerUncertain) == 0 {
 		b.WriteString("- None.\n")
 	} else {
 		for _, f := range summary.OwnerUncertain {
 			fmt.Fprintf(&b, "- `%s`\n", f)
+		}
+	}
+	b.WriteString("\n## Failure Evidence\n\n")
+	if len(summary.FailureEvidence) == 0 {
+		b.WriteString("- None.\n")
+	} else {
+		for _, path := range summary.FailureEvidence {
+			fmt.Fprintf(&b, "- `%s`\n", path)
 		}
 	}
 	b.WriteString("\n## High-Risk Changes\n\n")

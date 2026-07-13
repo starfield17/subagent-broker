@@ -24,14 +24,17 @@ type TerminationPolicy struct {
 // (or PID reuse). Inability to confirm is never reported as success: TreeExited
 // stays false and OrphanRisk may be set.
 type TerminationResult struct {
-	InterruptSent bool
-	TermSent      bool
-	KillSent      bool
-	TreeExited    bool
-	PIDReused     bool
-	OrphanRisk    bool
-	RemainingPIDs []int
-	Errors        []string
+	InterruptSent        bool     `json:"interrupt_sent,omitempty"`
+	TermSent             bool     `json:"term_sent,omitempty"`
+	KillSent             bool     `json:"kill_sent,omitempty"`
+	TreeExited           bool     `json:"tree_exited"`
+	PIDReused            bool     `json:"pid_reused,omitempty"`
+	OrphanRisk           bool     `json:"orphan_risk,omitempty"`
+	RemainingPIDs        []int    `json:"remaining_pids,omitempty"`
+	Errors               []string `json:"errors,omitempty"`
+	TerminationRequested bool     `json:"termination_requested,omitempty"`
+	TerminationInitiator string   `json:"termination_initiator,omitempty"`
+	TerminationPhase     string   `json:"termination_phase,omitempty"`
 }
 
 // Controller terminates process trees through a TreeManager.
@@ -74,6 +77,8 @@ func (c Controller) TerminateTree(
 		result.Errors = append(result.Errors, "interrupt: "+err.Error())
 	} else {
 		result.InterruptSent = true
+		result.TerminationRequested = true
+		result.TerminationPhase = "interrupt"
 	}
 	gone, reused, remaining, err = c.waitStage(ctx, identity, policy.InterruptGrace, policy.PollInterval)
 	if err != nil {
@@ -95,6 +100,8 @@ func (c Controller) TerminateTree(
 		result.Errors = append(result.Errors, "terminate: "+err.Error())
 	} else {
 		result.TermSent = true
+		result.TerminationRequested = true
+		result.TerminationPhase = "term"
 	}
 	gone, reused, remaining, err = c.waitStage(ctx, identity, policy.TermGrace, policy.PollInterval)
 	if err != nil {
@@ -116,6 +123,8 @@ func (c Controller) TerminateTree(
 		result.Errors = append(result.Errors, "kill: "+err.Error())
 	} else {
 		result.KillSent = true
+		result.TerminationRequested = true
+		result.TerminationPhase = "kill_tree"
 	}
 	gone, reused, remaining, err = c.waitStage(ctx, identity, policy.KillGrace, policy.PollInterval)
 	if err != nil {
