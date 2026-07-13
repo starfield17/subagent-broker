@@ -38,14 +38,6 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		*runtime = latest
 	}
 	migrateAttempts(runtime)
-	harnessName := strings.TrimSpace(runtime.Task.HarnessPreference)
-	if harnessName == "" {
-		harnessName = s.config.Harness
-	}
-	harness, ok := s.registry.Get(adapter.HarnessName(harnessName))
-	if !ok {
-		return fmt.Errorf("adapter %q is not registered", harnessName)
-	}
 
 	mode := workerpkg.AttemptFresh
 	if len(runtime.Attempts) > 0 {
@@ -55,6 +47,13 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 			// History exists but not a resume path: refuse silent retry.
 			return fmt.Errorf("task %s has prior attempts and is not recovery-resumable; explicit_retry is not enabled", runtime.Task.TaskID)
 		}
+	}
+
+	// Single harness selection rule: persisted Worker → Task preference → Run default.
+	// Resume never routes a native session ID through a different adapter.
+	harness, harnessName, err := s.resolveHarnessForExecution(runtime, mode)
+	if err != nil {
+		return err
 	}
 
 	workerID := fmt.Sprintf("worker-%d", time.Now().UTC().UnixNano())

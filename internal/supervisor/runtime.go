@@ -1643,6 +1643,54 @@ func (s *Service) adapterForTask(task domain.Task, worker *domain.WorkerSession)
 	return s.registry.Get(adapter.HarnessName(s.harnessNameForTask(task, worker)))
 }
 
+// resolveHarnessForExecution selects the adapter for executeTask / resume.
+// On recovery resume with a native session ID, an empty persisted harness is
+// rejected when multiple adapters are registered (ambiguous ownership).
+// A non-empty persisted harness always wins and is never overridden by Task preference.
+func (s *Service) resolveHarnessForExecution(runtime *TaskState, mode workerpkg.AttemptMode) (adapter.Adapter, string, error) {
+	if runtime == nil {
+		return nil, "", fmt.Errorf("runtime is required")
+	}
+	resuming := mode == workerpkg.AttemptRecoveryResume
+	if resuming && runtime.Worker != nil && runtime.Worker.NativeSessionID != "" {
+		if strings.TrimSpace(runtime.Worker.Harness) == "" && s.registryAdapterCount() > 1 {
+			return nil, "", fmt.Errorf(
+				"cannot resume native session %q for task %s: persisted worker harness is empty and multiple adapters are registered",
+				runtime.Worker.NativeSessionID, runtime.Task.TaskID,
+			)
+		}
+	}
+	name := s.harnessNameForTask(runtime.Task, runtime.Worker)
+	if strings.TrimSpace(name) == "" {
+		return nil, "", fmt.Errorf("no harness selected for task %s", runtime.Task.TaskID)
+	}
+	// Never hand a native session ID to a different adapter than the one that created it.
+	if runtime.Worker != nil && runtime.Worker.NativeSessionID != "" {
+		persisted := strings.TrimSpace(runtime.Worker.Harness)
+		if persisted != "" && persisted != name {
+			return nil, "", fmt.Errorf(
+				"harness mismatch for task %s: persisted worker harness %q != selected %q; refusing to resume native session on the wrong adapter",
+				runtime.Task.TaskID, persisted, name,
+			)
+		}
+	}
+	if s.registry == nil {
+		return nil, "", fmt.Errorf("adapter registry is not initialized")
+	}
+	harness, ok := s.registry.Get(adapter.HarnessName(name))
+	if !ok {
+		return nil, "", fmt.Errorf("adapter %q is not registered", name)
+	}
+	return harness, name, nil
+}
+
+func (s *Service) registryAdapterCount() int {
+	if s.registry == nil {
+		return 0
+	}
+	return len(s.registry.Descriptors())
+}
+
 // computeSessionCapabilities derives EffectiveCapabilities for a Task session.
 func (s *Service) computeSessionCapabilities(harness adapter.Adapter, task domain.Task) adapter.CapabilitySet {
 	declared := harness.Descriptor().Capabilities
@@ -1661,13 +1709,11 @@ func (s *Service) computeSessionCapabilities(harness adapter.Adapter, task domai
 		SafeMode:       s.config.SafeMode,
 	}
 	// Ask adapter for session install facts when supported.
+	// Use the resolved harness identity (descriptor), not Task preference alone.
 	type factProvider interface {
 		SessionConfigFact(adapter.StartRequest) adapter.SessionConfigFact
 	}
-	harnessName := strings.TrimSpace(task.HarnessPreference)
-	if harnessName == "" {
-		harnessName = string(harness.Descriptor().Name)
-	}
+	harnessName := string(harness.Descriptor().Name)
 	if fp, ok := harness.(factProvider); ok {
 		req := adapter.StartRequest{
 			Options: map[string]string{
