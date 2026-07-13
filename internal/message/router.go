@@ -156,6 +156,43 @@ func (r *Router) EnqueueDecision(
 	return copyMessage(value), nil
 }
 
+// ReclassifyDelivery updates DeliveryMode for a still-queued instruction.
+// Only next_turn → resume is permitted (session gone, resume path remains).
+func (r *Router) ReclassifyDelivery(messageID string, mode DeliveryMode) (Message, error) {
+	r.mu.Lock()
+	current, ok := r.index[messageID]
+	if !ok {
+		r.mu.Unlock()
+		return Message{}, fmt.Errorf("message %q was not found", messageID)
+	}
+	current = copyMessage(current)
+	r.mu.Unlock()
+
+	if current.Type != Instruction {
+		return Message{}, fmt.Errorf("message %q is not an instruction", messageID)
+	}
+	if current.Status != Queued {
+		return Message{}, fmt.Errorf("message %q is not queued (status %s)", messageID, current.Status)
+	}
+	if current.DeliveryMode == mode {
+		return current, nil
+	}
+	if !(current.DeliveryMode == DeliveryNextTurn && mode == DeliveryResume) {
+		return Message{}, fmt.Errorf("cannot reclassify delivery %s -> %s", current.DeliveryMode, mode)
+	}
+
+	candidate := copyMessage(current)
+	candidate.DeliveryMode = mode
+	candidate.UpdatedAt = r.now().UTC()
+	if err := r.store.Append(candidate); err != nil {
+		return Message{}, err
+	}
+	r.mu.Lock()
+	r.index[messageID] = copyMessage(candidate)
+	r.mu.Unlock()
+	return copyMessage(candidate), nil
+}
+
 // RecordDeliveryAttempt increments delivery_attempts and optionally updates status.
 func (r *Router) RecordDeliveryAttempt(messageID string, next Status, cause error) (Message, error) {
 	r.mu.Lock()

@@ -197,6 +197,96 @@ func TestSendInstructionNextTurnAndResumeStayQueued(t *testing.T) {
 	}
 }
 
+func TestNextTurnFlushDeliversExactlyOnce(t *testing.T) {
+	service, harness, path := newInstructionService(t, adapter.Capabilities{
+		BidirectionalStream: true, StructuredStream: true,
+	}, true)
+
+	result, err := service.SendInstruction(context.Background(), "task-a", "at boundary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Mode != adapter.DeliveryNextTurn {
+		t.Fatalf("mode=%s", result.Mode)
+	}
+	if len(harness.SentMessages) != 0 {
+		t.Fatalf("must not send during active turn: %v", harness.SentMessages)
+	}
+	got, _ := service.router.Get(result.MessageID)
+	if got.Status != message.Queued {
+		t.Fatalf("want queued before flush, got %s", got.Status)
+	}
+
+	if err := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary"); err != nil {
+		t.Fatal(err)
+	}
+	if len(harness.SentMessages) != 1 || harness.SentMessages[0] != "at boundary" {
+		t.Fatalf("sent=%v", harness.SentMessages)
+	}
+	got, _ = service.router.Get(result.MessageID)
+	if got.Status != message.Delivered || got.DeliveryAttempts != 1 {
+		t.Fatalf("after flush: %+v", got)
+	}
+	statuses := journalStatuses(t, path)
+	if len(statuses) < 2 || statuses[0] != message.Queued || statuses[len(statuses)-1] != message.Delivered {
+		t.Fatalf("statuses=%v", statuses)
+	}
+
+	// Replay / repeated flush must not re-send.
+	if err := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary"); err != nil {
+		t.Fatal(err)
+	}
+	if len(harness.SentMessages) != 1 {
+		t.Fatalf("double-send after replay: %v", harness.SentMessages)
+	}
+}
+
+func TestNextTurnFlushFailureBecomesFailed(t *testing.T) {
+	service, harness, _ := newInstructionService(t, adapter.Capabilities{
+		BidirectionalStream: true, StructuredStream: true,
+	}, true)
+	harness.FailSendMessage = errors.New("send exploded")
+
+	result, err := service.SendInstruction(context.Background(), "task-a", "will fail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	flushErr := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary")
+	if flushErr == nil {
+		t.Fatal("expected flush error")
+	}
+	got, _ := service.router.Get(result.MessageID)
+	if got.Status != message.Failed || got.Error == "" {
+		t.Fatalf("want failed with error: %+v", got)
+	}
+	if got.DeliveryAttempts != 1 {
+		t.Fatalf("attempts=%d", got.DeliveryAttempts)
+	}
+}
+
+func TestNextTurnInactiveWithoutResumeFailsExplicitly(t *testing.T) {
+	service, _, _ := newInstructionService(t, adapter.Capabilities{
+		BidirectionalStream: true, StructuredStream: true,
+	}, true)
+	result, err := service.SendInstruction(context.Background(), "task-a", "orphaned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drop active session so flush cannot send.
+	service.mu.Lock()
+	delete(service.active, "task-a")
+	service.mu.Unlock()
+
+	flushErr := service.FlushInstructionOutbox(context.Background(), "task-a", "turn_boundary")
+	if flushErr == nil {
+		t.Fatal("expected explicit failure")
+	}
+	got, _ := service.router.Get(result.MessageID)
+	if got.Status != message.Failed {
+		t.Fatalf("want failed, got %+v", got)
+	}
+}
+
 type panicOnSendAdapter struct {
 	*fake.Adapter
 	called *bool

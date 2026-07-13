@@ -325,6 +325,8 @@ func (s *Service) deliverInstruction(ctx context.Context, queued message.Message
 		return adapter.DeliveryResult{Mode: adapter.DeliveryImmediate, MessageID: queued.MessageID}, nil
 
 	case message.DeliveryNextTurn:
+		// Remain queued until an actual turn boundary flush. Do not claim delivery
+		// and do not call the adapter here — FlushInstructionOutbox owns send.
 		return adapter.DeliveryResult{Mode: adapter.DeliveryNextTurn, MessageID: queued.MessageID}, nil
 
 	case message.DeliveryResume:
@@ -380,11 +382,21 @@ func (s *Service) FlushInstructionOutbox(ctx context.Context, taskID, trigger st
 		pending := s.router.PendingInstructions(taskID, message.DeliveryNextTurn, message.DeliveryImmediate)
 		var firstErr error
 		for _, item := range pending {
-			if item.DeliveryMode != message.DeliveryNextTurn && item.DeliveryMode != message.DeliveryImmediate {
+			if message.IsTerminal(item.Status) || !message.IsDeliveryPending(item) {
 				continue
 			}
 			text := instructionText(item)
-			if _, err := s.deliverInstruction(ctx, item, text); err != nil {
+			var err error
+			switch item.DeliveryMode {
+			case message.DeliveryImmediate:
+				_, err = s.deliverInstruction(ctx, item, text)
+			case message.DeliveryNextTurn:
+				// Physical send at the turn boundary — never re-enter the next_turn no-op.
+				err = s.deliverQueuedToActiveSession(ctx, item, text)
+			default:
+				continue
+			}
+			if err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -417,9 +429,8 @@ func (s *Service) FlushInstructionOutbox(ctx context.Context, taskID, trigger st
 				continue
 			}
 			text := instructionText(item)
-			// Force immediate delivery on active resumed session.
-			item.DeliveryMode = message.DeliveryImmediate
-			if _, err := s.deliverInstruction(ctx, item, text); err != nil {
+			// Physical send on the active resumed session (retain durable resume mode).
+			if err := s.deliverQueuedToActiveSession(ctx, item, text); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -435,6 +446,96 @@ func (s *Service) FlushInstructionOutbox(ctx context.Context, taskID, trigger st
 		return firstErr
 	}
 	return nil
+}
+
+// deliverQueuedToActiveSession physically delivers a queued instruction to the
+// active adapter session via SendMessage. Used at turn boundaries and resume
+// flush so next_turn never recursively no-ops. On success records Delivered;
+// on failure records Failed. If no active session remains but resume is
+// possible, reclassifies next_turn → resume; otherwise fails explicitly.
+func (s *Service) deliverQueuedToActiveSession(ctx context.Context, queued message.Message, text string) error {
+	if s.router == nil {
+		return fmt.Errorf("message router is not initialized")
+	}
+	// Re-read: already delivered messages must not be sent again.
+	if latest, ok := s.router.Get(queued.MessageID); ok {
+		if !message.IsDeliveryPending(latest) {
+			return nil
+		}
+		queued = latest
+	}
+
+	s.mu.Lock()
+	active, isActive := s.active[queued.TaskID]
+	s.mu.Unlock()
+
+	if !isActive {
+		return s.handleInactiveQueuedInstruction(ctx, queued)
+	}
+
+	_, sendErr := active.adapter.SendMessage(ctx, active.sessionID, text)
+	if sendErr != nil {
+		failed, tErr := s.router.RecordDeliveryAttempt(queued.MessageID, message.Failed, sendErr)
+		if tErr != nil {
+			return tErr
+		}
+		if cErr := s.CommitMessageProjection(ctx, failed, event.MessageFailed); cErr != nil {
+			return cErr
+		}
+		return sendErr
+	}
+	delivered, tErr := s.router.RecordDeliveryAttempt(queued.MessageID, message.Delivered, nil)
+	if tErr != nil {
+		return tErr
+	}
+	if cErr := s.CommitMessageProjection(ctx, delivered, event.MessageDelivered); cErr != nil {
+		return cErr
+	}
+	return nil
+}
+
+// handleInactiveQueuedInstruction reclassifies next_turn → resume when possible,
+// otherwise fails the instruction explicitly (never silent loss).
+func (s *Service) handleInactiveQueuedInstruction(ctx context.Context, queued message.Message) error {
+	if queued.DeliveryMode == message.DeliveryResume {
+		// Resume flush without active session is owned by EnsureResumeAndFlushOutbox.
+		return s.EnsureResumeAndFlushOutbox(ctx, queued.TaskID)
+	}
+
+	canResume := false
+	if runtime, ok := s.taskState(domain.TaskID(queued.TaskID)); ok && !recoveryTaskTerminal(runtime) {
+		eff := s.effectiveCapsForTask(queued.TaskID, nil)
+		native := ""
+		if runtime.Worker != nil {
+			native = runtime.Worker.NativeSessionID
+			if len(runtime.Worker.Capabilities) > 0 {
+				eff = adapter.CapabilitiesFromMap(runtime.Worker.Capabilities)
+			}
+		}
+		if native != "" && eff.ResumeSession {
+			canResume = true
+		}
+	}
+	if canResume && queued.DeliveryMode == message.DeliveryNextTurn {
+		reclass, err := s.router.ReclassifyDelivery(queued.MessageID, message.DeliveryResume)
+		if err != nil {
+			return err
+		}
+		if cErr := s.CommitMessageProjection(ctx, reclass, event.MessageQueued); cErr != nil {
+			return cErr
+		}
+		return s.EnsureResumeAndFlushOutbox(ctx, queued.TaskID)
+	}
+
+	cause := fmt.Errorf("no active session for next_turn delivery and resume unavailable: %w", adapter.ErrUnsupported)
+	failed, tErr := s.router.RecordDeliveryAttempt(queued.MessageID, message.Failed, cause)
+	if tErr != nil {
+		return tErr
+	}
+	if cErr := s.CommitMessageProjection(ctx, failed, event.MessageFailed); cErr != nil {
+		return cErr
+	}
+	return cause
 }
 
 func instructionText(value message.Message) string {
@@ -939,8 +1040,8 @@ func (s *Service) failQueuedResumeInstructions(taskID string, cause error, reaso
 	return fmt.Errorf("%s: %w", reason, cause)
 }
 
-// flushResumeOnActive delivers pending resume instructions via immediate mode
-// on an already-registered active session.
+// flushResumeOnActive delivers pending resume instructions on an already-registered
+// active session via physical SendMessage (not the next_turn no-op path).
 func (s *Service) flushResumeOnActive(ctx context.Context, taskID string) error {
 	if s.router == nil {
 		return nil
@@ -954,12 +1055,11 @@ func (s *Service) flushResumeOnActive(ctx context.Context, taskID string) error 
 	}
 	var firstErr error
 	for _, item := range pending {
-		if message.IsTerminal(item.Status) {
+		if message.IsTerminal(item.Status) || !message.IsDeliveryPending(item) {
 			continue
 		}
 		text := instructionText(item)
-		item.DeliveryMode = message.DeliveryImmediate
-		if _, err := s.deliverInstruction(ctx, item, text); err != nil {
+		if err := s.deliverQueuedToActiveSession(ctx, item, text); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}

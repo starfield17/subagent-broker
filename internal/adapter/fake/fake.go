@@ -46,6 +46,10 @@ type Adapter struct {
 	PermissionResponses []adapter.PermissionDecision
 	// FailPermissionResponse, when set, is returned from RespondPermission.
 	FailPermissionResponse error
+	// SentMessages records SendMessage calls for tests (sessionID, text).
+	SentMessages []string
+	// FailSendMessage, when set, is returned from SendMessage.
+	FailSendMessage error
 }
 
 func New(capabilities adapter.Capabilities) *Adapter {
@@ -248,6 +252,13 @@ func (a *Adapter) SendMessage(_ context.Context, id, message string) (adapter.De
 	}
 	if _, err := a.requireSession(id); err != nil {
 		return adapter.DeliveryResult{}, err
+	}
+	a.mu.Lock()
+	a.SentMessages = append(a.SentMessages, message)
+	fail := a.FailSendMessage
+	a.mu.Unlock()
+	if fail != nil {
+		return adapter.DeliveryResult{}, fail
 	}
 	return adapter.DeliveryResult{Mode: adapter.DeliveryNextTurn, MessageID: message}, nil
 }

@@ -190,13 +190,18 @@ func validateMessageLifecycle(previous, next Message) error {
 	}
 
 	// DeliveryMode: unset → set once only for Instruction in Validated/Queued;
-	// once set must not change or clear.
+	// once set must not change or clear, except the explicit next_turn → resume
+	// reclassification when the active session is gone but resume is possible.
 	if previous.DeliveryMode != "" {
 		if next.DeliveryMode == "" {
 			return fmt.Errorf("delivery_mode cannot be cleared once set")
 		}
 		if next.DeliveryMode != previous.DeliveryMode {
-			return fmt.Errorf("delivery_mode changed from %q to %q", previous.DeliveryMode, next.DeliveryMode)
+			if !(previous.Type == Instruction &&
+				previous.Status == Queued && next.Status == Queued &&
+				previous.DeliveryMode == DeliveryNextTurn && next.DeliveryMode == DeliveryResume) {
+				return fmt.Errorf("delivery_mode changed from %q to %q", previous.DeliveryMode, next.DeliveryMode)
+			}
 		}
 	} else if next.DeliveryMode != "" {
 		if err := validateDeliveryModeFirstAssignment(next); err != nil {
