@@ -275,7 +275,7 @@ func TestReplayRejectsLateDeliveryModeAssignment(t *testing.T) {
 		Payload: json.RawMessage(`{"text":"x"}`),
 	}
 	// First record delivered without mode, then same-status assigns mode — illegal.
-	// Use queued without mode then delivered with mode via transition... 
+	// Use queued without mode then delivered with mode via transition...
 	// Better: queued no mode, then queued with mode (first assign OK), then delivered with mode OK.
 	// Late first assign: delivered without previous mode.
 	_ = store.Append(first)

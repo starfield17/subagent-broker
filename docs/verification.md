@@ -34,3 +34,40 @@ The Phase 4 runtime was verified with the locally installed tools:
 `subagent-broker doctor` probes all four Harnesses and reports installed, authenticated, compatible status and capabilities without printing credentials. Scripted Adapter contracts cover Codex App Server JSONL and Grok ACP multiplexing; the native contract smoke completed authenticated `StartSession`/`CollectFinalResult` flows for Claude Code, Codex, Grok Build, and OpenCode. A full Codex dispatch completed through Supervisor, Barrier verification, and report publication; OpenCode also passed a real loopback server health probe.
 
 Capability claims remain protocol-specific: Codex active-turn steering is sent through `turn/steer`; Grok Build and OpenCode expose next-turn/resume delivery rather than immediate steering. Versions outside the tested versions are reported as `compatibility_unverified`.
+
+## Phase 4 correctness patches (8.1–8.6)
+
+Executed on 2026-07-13 against this repository after patches 8.1–8.6:
+
+```bash
+gofmt -w .
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Results:
+
+| Command | Result |
+|---|---|
+| `go test ./...` | all packages PASS |
+| `go test -race ./...` | all packages PASS |
+| `go vet ./...` | no findings |
+| `go build ./cmd/subagent-broker` | success |
+
+Supervisor-level integration coverage (`internal/supervisor/phase4_integration_test.go` and related unit tests) exercises:
+
+1. Native permission bridge: durable `permission_request`, allow/deny reach `RespondPermission`, adapter failure not recorded as Answered
+2. Next-turn delivery: queue during turn, physical `SendMessage` at turn boundary, exactly-once Delivered
+3. Resume harness routing: persisted Worker harness wins over Task preference / Run default
+4. Event backpressure: critical lifecycle events survive channel saturation; progress may drop
+5. Cancellation / multi-turn protocol unit tests: Grok cancel notification (no response waiter), OpenCode idle keeps server, newest Result Envelope selection
+
+**Not claimed by these commands** (no live native harness re-smoke for the new paths in this patch series):
+
+- Live Codex/Grok/OpenCode permission request → Main Agent answer → Worker continue
+- Live next-turn instruction flush against a real multi-turn native session
+- Live cancel tree honesty under real process-group failure modes beyond existing process tests
+
+A simple historical `StartSession`/`CollectFinalResult` smoke is **not** treated as evidence for permission, resume, next-turn, or cancellation claims.

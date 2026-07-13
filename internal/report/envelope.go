@@ -142,14 +142,14 @@ func ValidateEnvelope(e Envelope) error {
 
 // Meta is durable report identity + content integrity binding.
 type Meta struct {
-	SchemaVersion  string    `json:"schema_version"`
-	TaskID         string    `json:"task_id"`
-	WorkerID       string    `json:"worker_id"`
-	AttemptNumber  int       `json:"attempt_number,omitempty"`
-	Status         Status    `json:"status"`
-	EnvelopeHash   string    `json:"envelope_hash,omitempty"`
-	MarkdownHash   string    `json:"markdown_hash,omitempty"`
-	PublishedAt    time.Time `json:"published_at"`
+	SchemaVersion string    `json:"schema_version"`
+	TaskID        string    `json:"task_id"`
+	WorkerID      string    `json:"worker_id"`
+	AttemptNumber int       `json:"attempt_number,omitempty"`
+	Status        Status    `json:"status"`
+	EnvelopeHash  string    `json:"envelope_hash,omitempty"`
+	MarkdownHash  string    `json:"markdown_hash,omitempty"`
+	PublishedAt   time.Time `json:"published_at"`
 	// Unverified is set for legacy reports that lack attempt/hash binding.
 	Unverified bool `json:"unverified,omitempty"`
 }

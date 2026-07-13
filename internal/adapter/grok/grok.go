@@ -32,7 +32,7 @@ type sessionState struct {
 	workerID        string
 	events          chan adapter.NativeEvent
 	resultReady     chan struct{}
-	resultOnce      sync.Once
+	resultSignaled  bool
 	closeEvents     sync.Once
 	shutdown        chan struct{}
 	shutdownOnce    sync.Once
@@ -309,14 +309,12 @@ func (a *Adapter) prompt(ctx context.Context, state *sessionState, text string) 
 	state.mu.Lock()
 	// Multi-turn: re-arm result signaling if a prior turn already completed.
 	// Keep the ACP process/session alive for later SendMessage (BidirectionalStream).
-	select {
-	case <-state.resultReady:
+	if state.resultSignaled {
 		state.resultReady = make(chan struct{})
-		state.resultOnce = sync.Once{}
+		state.resultSignaled = false
 		state.output.Reset()
 		state.final = nil
 		state.resultError = ""
-	default:
 	}
 	sessionID := state.acpSessionID
 	state.mu.Unlock()
@@ -328,7 +326,7 @@ func (a *Adapter) prompt(ctx context.Context, state *sessionState, text string) 
 		state.mu.Lock()
 		state.resultError = err.Error()
 		state.mu.Unlock()
-		state.resultOnce.Do(func() { close(state.resultReady) })
+		a.signalResult(state)
 		return fmt.Errorf("Grok ACP session/prompt: %w", err)
 	}
 	state.mu.Lock()
@@ -343,9 +341,19 @@ func (a *Adapter) prompt(ctx context.Context, state *sessionState, text string) 
 	_ = json.Unmarshal(result, &completion)
 	state.usage = adapter.Usage{InputTokens: completion.Usage.InputTokens, OutputTokens: completion.Usage.OutputTokens, Cost: completion.Usage.Cost, Currency: "USD"}
 	state.mu.Unlock()
-	state.resultOnce.Do(func() { close(state.resultReady) })
+	a.signalResult(state)
 	// Do not close stdin: multi-turn SendMessage requires a live ACP session.
 	return nil
+}
+
+func (a *Adapter) signalResult(state *sessionState) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.resultSignaled {
+		return
+	}
+	state.resultSignaled = true
+	close(state.resultReady)
 }
 
 func (a *Adapter) request(ctx context.Context, state *sessionState, method string, params any) (json.RawMessage, error) {
@@ -383,7 +391,7 @@ func (a *Adapter) readProcess(state *sessionState) {
 		state.mu.Unlock()
 		close(state.events)
 	})
-	defer state.resultOnce.Do(func() { close(state.resultReady) })
+	defer a.signalResult(state)
 	for line := range state.process.Lines() {
 		a.handleLine(state, line)
 	}

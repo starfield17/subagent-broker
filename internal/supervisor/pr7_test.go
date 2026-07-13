@@ -247,8 +247,8 @@ func TestPR7CancelIncompleteIdentityNoTreeExited(t *testing.T) {
 		snapshot: Snapshot{
 			Run: domain.Run{RunID: "r", Status: domain.RunRunning},
 			Tasks: []TaskState{{
-				Task: domain.Task{TaskID: "t", Status: state.TaskRunning},
-				Worker: &domain.WorkerSession{WorkerID: "w", TaskID: "t", NativeSessionID: session.NativeSessionID},
+				Task:       domain.Task{TaskID: "t", Status: state.TaskRunning},
+				Worker:     &domain.WorkerSession{WorkerID: "w", TaskID: "t", NativeSessionID: session.NativeSessionID},
 				Dimensions: state.Dimensions{Process: state.ProcessAlive, Task: state.TaskRunning},
 			}},
 		},
