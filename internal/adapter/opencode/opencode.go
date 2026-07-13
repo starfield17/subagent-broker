@@ -62,6 +62,7 @@ type sessionState struct {
 type ocTurnResult struct {
 	generation         uint64
 	ready              chan struct{}
+	baselineCaptured   bool // true even when baselineMessageIDs is empty (first turn)
 	baselineMessageIDs map[string]struct{}
 	promptMessageID    string
 	sawCurrentActivity bool
@@ -71,6 +72,16 @@ type ocTurnResult struct {
 	resultErr          string
 	usage              adapter.Usage
 	once               sync.Once
+}
+
+// collectedTurnResult is a generation-specific collection outcome that does not
+// mutate global session state during the HTTP request.
+type collectedTurnResult struct {
+	Final         []byte
+	Usage         adapter.Usage
+	SawActivity   bool
+	HasEnvelope   bool
+	InvalidOutput bool // assistant output exists but no valid Result Envelope
 }
 
 type sseEvent struct {
@@ -324,18 +335,8 @@ func (a *Adapter) CollectFinalResult(ctx context.Context, id string) (report.Env
 	turn := state.currentTurn
 	state.mu.Unlock()
 	if turn == nil {
-		// Fallback for tests that only call collectFinal without promptAsync.
-		state.mu.Lock()
-		raw := append([]byte(nil), state.final...)
-		reason := state.resultError
-		state.mu.Unlock()
-		if reason != "" {
-			return report.Envelope{}, fmt.Errorf("OpenCode session failed: %s", reason)
-		}
-		if len(raw) == 0 {
-			return report.Envelope{}, fmt.Errorf("OpenCode: no authoritative generation")
-		}
-		return protocol.ParseEnvelope(raw)
+		// No authoritative generation — do not fall back to historical envelopes.
+		return report.Envelope{}, fmt.Errorf("OpenCode: no authoritative generation")
 	}
 	select {
 	case <-turn.ready:
@@ -440,14 +441,28 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 	sessionID := state.sessionID
 	state.mu.Unlock()
 
-	// Capture baseline message IDs so collectFinal can attribute messages to this turn.
-	if baseline, err := a.captureMessageIDs(ctx, state); err == nil {
+	// Capture baseline before prompt_async. Failure fails prompt startup with no
+	// legacy history fallback — an empty baseline is authoritative for first turn.
+	baseline, baselineErr := a.captureMessageIDs(ctx, state)
+	if baselineErr != nil {
 		state.mu.Lock()
-		if turn.generation == gen {
-			turn.baselineMessageIDs = baseline
+		if state.promptGen == gen && state.currentTurn == turn {
+			state.promptInFlight = false
+			turn.resultErr = "baseline capture failed: " + baselineErr.Error()
+			turn.completed = true
+			turn.success = false
+			turn.once.Do(func() { close(turn.ready) })
+			state.resultError = turn.resultErr
 		}
 		state.mu.Unlock()
+		return fmt.Errorf("OpenCode baseline capture failed: %w", baselineErr)
 	}
+	state.mu.Lock()
+	if turn.generation == gen {
+		turn.baselineMessageIDs = baseline
+		turn.baselineCaptured = true
+	}
+	state.mu.Unlock()
 
 	parts := []map[string]string{{"type": "text", "text": req.Contract}}
 	body := map[string]any{"parts": parts}
@@ -466,6 +481,12 @@ func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adap
 		state.mu.Lock()
 		if state.promptGen == gen {
 			state.promptInFlight = false
+			if state.currentTurn == turn && !turn.completed {
+				turn.resultErr = err.Error()
+				turn.completed = true
+				turn.success = false
+				turn.once.Do(func() { close(turn.ready) })
+			}
 		}
 		state.mu.Unlock()
 		return err
@@ -550,45 +571,25 @@ func (a *Adapter) subscribeEvents(state *sessionState) {
 func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 	now := time.Now().UTC()
 	native := adapter.NativeEvent{Kind: "opencode." + value.Type, Timestamp: now, Payload: value.Properties}
+	publish := true
 	switch value.Type {
 	case "server.connected", "session.created":
 		native.Kind = event.SessionStarted
 	case "message.part.updated", "message.updated":
 		native.Kind = event.ModelOutputDelta
+		// Mark current-generation activity only for the in-flight turn.
+		state.mu.Lock()
+		if state.promptInFlight && state.currentTurn != nil && !state.currentTurn.completed {
+			state.currentTurn.sawCurrentActivity = true
+		}
+		state.mu.Unlock()
 	case "permission.asked":
 		native.Kind = event.PermissionRequested
 	case "session.idle":
-		// Freeze generation result and close readiness BEFORE publishing boundary.
-		state.mu.Lock()
-		gen := state.promptGen
-		turn := state.currentTurn
-		if state.promptInFlight && state.promptGen == gen {
-			state.promptInFlight = false
-		}
-		state.mu.Unlock()
-		success := true
-		if err := a.collectFinal(state); err != nil {
-			success = false
-			state.mu.Lock()
-			if turn != nil && turn.generation == gen {
-				turn.resultErr = err.Error()
-			}
-			state.resultError = err.Error()
-			state.mu.Unlock()
-			native.Kind = event.TurnFailed
-		} else {
-			native.Kind = event.ResultSubmitted
-		}
-		state.mu.Lock()
-		if turn != nil && turn.generation == gen && !turn.completed {
-			turn.final = append([]byte(nil), state.final...)
-			turn.usage = state.usage
-			turn.success = success
-			turn.completed = true
-			turn.once.Do(func() { close(turn.ready) })
-			state.resultSignaled = true
-		}
-		state.mu.Unlock()
+		publish = a.handleSessionIdle(state, &native)
+	}
+	if !publish {
+		return
 	}
 	state.mu.Lock()
 	state.history = append(state.history, native)
@@ -598,16 +599,108 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 	}
 }
 
-func (a *Adapter) collectFinal(state *sessionState) error {
-	return a.collectFinalTurn(state, nil)
+// handleSessionIdle implements the production current-turn idle path.
+// Returns false when the idle is ignored (stale/duplicate/early) so no boundary
+// event is published.
+func (a *Adapter) handleSessionIdle(state *sessionState, native *adapter.NativeEvent) bool {
+	// 1) Capture exact turn pointer, generation, and prompt state under lock.
+	state.mu.Lock()
+	turn := state.currentTurn
+	gen := state.promptGen
+	inFlight := state.promptInFlight
+	if !inFlight || turn == nil || turn.completed || turn.generation != gen {
+		state.mu.Unlock()
+		// No prompt in flight / already completed / generation mismatch: ignore.
+		return false
+	}
+	sawActivity := turn.sawCurrentActivity
+	state.mu.Unlock()
+
+	// 2) Without current-generation activity, treat idle as stale/early.
+	if !sawActivity {
+		return false
+	}
+
+	// 3) Collect outside the lock using the captured turn pointer.
+	collected, err := a.collectFinalTurn(state, turn)
+
+	// 4) Re-lock and verify ownership before freezing completion.
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.currentTurn != turn || state.promptGen != gen || !state.promptInFlight {
+		// Turn superseded or no longer in flight — collection must not mutate.
+		return false
+	}
+	if turn.completed {
+		return false
+	}
+
+	// 5) Apply collection semantics.
+	if err != nil {
+		// Transport/collection error with attributable activity → TurnFailed.
+		turn.resultErr = err.Error()
+		turn.success = false
+		turn.completed = true
+		state.promptInFlight = false
+		state.resultError = err.Error()
+		turn.once.Do(func() { close(turn.ready) })
+		state.resultSignaled = true
+		native.Kind = event.TurnFailed
+		return true
+	}
+	if collected.HasEnvelope {
+		turn.final = append([]byte(nil), collected.Final...)
+		turn.usage = collected.Usage
+		turn.success = true
+		turn.completed = true
+		state.final = append([]byte(nil), collected.Final...)
+		state.usage = collected.Usage
+		state.promptInFlight = false
+		turn.once.Do(func() { close(turn.ready) })
+		state.resultSignaled = true
+		native.Kind = event.ResultSubmitted
+		return true
+	}
+	if collected.InvalidOutput {
+		// Assistant output exists but no valid Result Envelope.
+		turn.resultErr = "OpenCode: current-turn assistant output without valid Result Envelope"
+		turn.success = false
+		turn.completed = true
+		state.promptInFlight = false
+		state.resultError = turn.resultErr
+		turn.once.Do(func() { close(turn.ready) })
+		state.resultSignaled = true
+		native.Kind = event.TurnFailed
+		return true
+	}
+	// No attributable current-turn assistant output → ignore as stale/early.
+	// Do not clear promptInFlight, do not close readiness, do not publish.
+	return false
 }
 
-// collectFinalTurn scans messages attributable to the current generation only.
-// When turn is nil, falls back to the legacy newest-to-oldest scan (backward compat
-// for tests that don't use promptAsync).
-// When turn has baselineMessageIDs, only messages not present at prompt start are
-// considered attributable to this turn.
-func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) error {
+// collectFinal is retained only as a narrowly named test utility for fixtures
+// that inject final state without promptAsync. Production idle uses collectFinalTurn.
+func (a *Adapter) collectFinal(state *sessionState) error {
+	result, err := a.collectFinalTurn(state, nil)
+	if err != nil {
+		return err
+	}
+	if !result.HasEnvelope {
+		return fmt.Errorf("OpenCode returned no valid Result Envelope in assistant messages")
+	}
+	state.mu.Lock()
+	state.final = append([]byte(nil), result.Final...)
+	state.usage = result.Usage
+	state.mu.Unlock()
+	return nil
+}
+
+// collectFinalTurn scans messages attributable to the captured turn only.
+// When turn is non-nil and baselineCaptured, filtering uses baselineMessageIDs
+// even when the map is empty (authoritative first-turn boundary).
+// When turn is nil (test utility only), scans newest→oldest without provenance.
+// Does not mutate global session state; returns a generation-specific result.
+func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) (collectedTurnResult, error) {
 	var messages []struct {
 		Info struct {
 			Role   string `json:"role"`
@@ -624,51 +717,21 @@ func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) erro
 		ID string `json:"id"`
 	}
 	if err := a.requestJSON(context.Background(), state, http.MethodGet, "/session/"+url.PathEscape(state.sessionID)+"/message", nil, nil, &messages); err != nil {
-		return err
+		return collectedTurnResult{}, err
 	}
 
-	// When turn provenance is available, only inspect messages attributable to this turn.
-	if turn != nil && len(turn.baselineMessageIDs) > 0 {
-		for i := len(messages) - 1; i >= 0; i-- {
-			message := messages[i]
-			if message.Info.Role != "assistant" {
-				continue
-			}
-			// Skip messages that existed before this turn.
-			if _, existed := turn.baselineMessageIDs[message.ID]; existed {
-				continue
-			}
-			var text strings.Builder
-			for _, part := range message.Parts {
-				if part.Type == "text" {
-					text.WriteString(part.Text)
-				}
-			}
-			if text.Len() == 0 {
-				continue
-			}
-			raw := []byte(text.String())
-			if _, err := protocol.ParseEnvelope(raw); err != nil {
-				continue
-			}
-			turn.sawCurrentActivity = true
-			state.mu.Lock()
-			state.final = raw
-			state.usage = adapter.Usage{
-				InputTokens: message.Info.Tokens.Input, OutputTokens: message.Info.Tokens.Output,
-				Cost: message.Info.Cost, Currency: "USD",
-			}
-			state.mu.Unlock()
-			return nil
-		}
-		return fmt.Errorf("OpenCode: no valid Result Envelope in current-turn messages")
-	}
-
-	// Legacy fallback: newest → oldest, accepting any valid Result Envelope.
+	filterBaseline := turn != nil && turn.baselineCaptured
+	var firstInvalid []byte
+	var firstInvalidUsage adapter.Usage
 	for i := len(messages) - 1; i >= 0; i-- {
 		message := messages[i]
 		if message.Info.Role != "assistant" {
 			continue
+		}
+		if filterBaseline {
+			if _, existed := turn.baselineMessageIDs[message.ID]; existed {
+				continue
+			}
 		}
 		var text strings.Builder
 		for _, part := range message.Parts {
@@ -680,19 +743,37 @@ func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) erro
 			continue
 		}
 		raw := []byte(text.String())
-		if _, err := protocol.ParseEnvelope(raw); err != nil {
-			continue
-		}
-		state.mu.Lock()
-		state.final = raw
-		state.usage = adapter.Usage{
+		usage := adapter.Usage{
 			InputTokens: message.Info.Tokens.Input, OutputTokens: message.Info.Tokens.Output,
 			Cost: message.Info.Cost, Currency: "USD",
 		}
-		state.mu.Unlock()
-		return nil
+		if _, err := protocol.ParseEnvelope(raw); err != nil {
+			// Track invalid assistant output for TurnFailed when no envelope found.
+			if firstInvalid == nil {
+				firstInvalid = raw
+				firstInvalidUsage = usage
+			}
+			continue
+		}
+		return collectedTurnResult{
+			Final: raw, Usage: usage, SawActivity: true, HasEnvelope: true,
+		}, nil
 	}
-	return fmt.Errorf("OpenCode returned no valid Result Envelope in assistant messages")
+	if filterBaseline {
+		if firstInvalid != nil {
+			return collectedTurnResult{
+				Final: firstInvalid, Usage: firstInvalidUsage,
+				SawActivity: true, InvalidOutput: true,
+			}, nil
+		}
+		// No attributable current-turn assistant output.
+		return collectedTurnResult{}, nil
+	}
+	// Test-utility path without turn provenance.
+	if firstInvalid != nil {
+		return collectedTurnResult{InvalidOutput: true, SawActivity: true}, nil
+	}
+	return collectedTurnResult{}, nil
 }
 
 func (a *Adapter) requestJSON(ctx context.Context, state *sessionState, method, route string, query url.Values, body any, target any) error {

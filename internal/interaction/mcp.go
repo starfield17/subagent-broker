@@ -17,10 +17,11 @@ import (
 )
 
 type WorkerServer struct {
-	RunDir   string
-	RunID    string
-	TaskID   string
-	WorkerID string
+	RunDir          string
+	RunID           string
+	TaskID          string
+	WorkerID        string
+	NativeSessionID string
 }
 
 type AskInput struct {
@@ -70,7 +71,17 @@ func (w WorkerServer) call(ctx context.Context, messageType message.Type, catego
 	if err != nil {
 		return ToolOutput{}, err
 	}
-	response, err := callSupervisor(ctx, w.RunDir, w.RunID, "worker_request", map[string]any{"task_id": w.TaskID, "worker_id": w.WorkerID, "type": messageType, "category": category, "payload": json.RawMessage(raw)})
+	params := map[string]any{
+		"task_id":   w.TaskID,
+		"worker_id": w.WorkerID,
+		"type":      messageType,
+		"category":  category,
+		"payload":   json.RawMessage(raw),
+	}
+	if w.NativeSessionID != "" {
+		params["native_session_id"] = w.NativeSessionID
+	}
+	response, err := callSupervisor(ctx, w.RunDir, w.RunID, "worker_request", params)
 	if err != nil {
 		return ToolOutput{}, err
 	}

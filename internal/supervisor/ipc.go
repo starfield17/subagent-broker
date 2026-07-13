@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/vnai/subagent-broker/internal/domain"
@@ -290,11 +291,12 @@ func (s *Service) handleRequest(ctx context.Context, request Request, plane Call
 			return response
 		}
 		var params struct {
-			TaskID   string           `json:"task_id"`
-			WorkerID string           `json:"worker_id"`
-			Type     message.Type     `json:"type"`
-			Category message.Category `json:"category"`
-			Payload  json.RawMessage  `json:"payload"`
+			TaskID          string           `json:"task_id"`
+			WorkerID        string           `json:"worker_id"`
+			NativeSessionID string           `json:"native_session_id"`
+			Type            message.Type     `json:"type"`
+			Category        message.Category `json:"category"`
+			Payload         json.RawMessage  `json:"payload"`
 		}
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			response.Error = err.Error()
@@ -306,6 +308,17 @@ func (s *Service) handleRequest(ctx context.Context, request Request, plane Call
 			return response
 		}
 		if params.WorkerID != "" && params.WorkerID != workerBinding.WorkerID {
+			response.Error = "unauthorized"
+			return response
+		}
+		// request native session ID == credential NativeSessionID == active session (when registered).
+		// Do not reveal expected session IDs in errors.
+		reqNative := strings.TrimSpace(params.NativeSessionID)
+		if reqNative == "" || reqNative != workerBinding.NativeSessionID {
+			response.Error = "unauthorized"
+			return response
+		}
+		if s.workerNativeSessionMismatch(workerBinding, reqNative) {
 			response.Error = "unauthorized"
 			return response
 		}
@@ -498,6 +511,24 @@ func (s *Service) workerCredentialStale(b *WorkerCredentialBinding) bool {
 		return true
 	}
 	if b.NativeSessionID != "" && active.sessionID != "" && b.NativeSessionID != active.sessionID {
+		return true
+	}
+	return false
+}
+
+// workerNativeSessionMismatch reports whether the request native session conflicts
+// with the active Worker session when one is registered.
+func (s *Service) workerNativeSessionMismatch(b *WorkerCredentialBinding, requestNative string) bool {
+	if b == nil {
+		return true
+	}
+	s.mu.Lock()
+	active, ok := s.active[b.TaskID]
+	s.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if active.sessionID != "" && active.sessionID != requestNative {
 		return true
 	}
 	return false

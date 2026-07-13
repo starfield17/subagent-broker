@@ -334,6 +334,12 @@ func dispatch(args []string) error {
 		return err
 	}
 	if err := service.Initialize(); err != nil {
+		_ = service.Close()
+		return err
+	}
+	// Release the exclusive lease so the child supervisor process can acquire it.
+	// Load+Initialize ran under lease; the long-lived owner is the supervisor child.
+	if err := service.Close(); err != nil {
 		return err
 	}
 	if err := spawnSupervisor(runDir, false); err != nil {
@@ -377,14 +383,14 @@ func runMCPWorker(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *runDir == "" || *taskID == "" || *workerID == "" {
-		return fmt.Errorf("mcp-worker requires --run-dir, --task, and --worker")
-	}
-	runID, err := interaction.LoadRunID(*runDir)
+	id, err := interaction.ResolveWorkerProcessIdentity(*runDir, *taskID, *workerID, os.Getenv)
 	if err != nil {
 		return err
 	}
-	return (interaction.WorkerServer{RunDir: *runDir, RunID: runID, TaskID: *taskID, WorkerID: *workerID}).Run(context.Background())
+	return (interaction.WorkerServer{
+		RunDir: id.RunDir, RunID: id.RunID, TaskID: id.TaskID, WorkerID: id.WorkerID,
+		NativeSessionID: id.NativeSessionID,
+	}).Run(context.Background())
 }
 
 func runClaudeHook(args []string) error {
@@ -396,14 +402,11 @@ func runClaudeHook(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *runDir == "" || *taskID == "" || *workerID == "" {
-		return fmt.Errorf("claude-hook requires --run-dir, --task, and --worker")
-	}
-	runID, err := interaction.LoadRunID(*runDir)
+	id, err := interaction.ResolveWorkerProcessIdentity(*runDir, *taskID, *workerID, os.Getenv)
 	if err != nil {
 		return err
 	}
-	return interaction.RunPermissionHook(context.Background(), *runDir, runID, *taskID, *workerID, os.Stdin, os.Stdout)
+	return interaction.RunPermissionHookWithIdentity(context.Background(), id, os.Stdin, os.Stdout)
 }
 
 func statusCommand(args []string) error {

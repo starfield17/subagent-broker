@@ -155,6 +155,10 @@ func (a *AuthState) AuthenticateControl(token string) bool {
 
 // IssueWorkerCredential creates a per-attempt Worker token. Returns the raw token
 // for injection into Worker env only (never argv).
+//
+// When nativeSessionID is non-empty the credential is issued already Bound to
+// that expected native session (Claude known-session design). Unbound credentials
+// cannot AuthenticateWorker.
 func (a *AuthState) IssueWorkerCredential(runID, taskID, workerID string, attempt int, nativeSessionID string) (string, error) {
 	if attempt <= 0 || taskID == "" || workerID == "" {
 		return "", fmt.Errorf("incomplete worker identity for credential")
@@ -165,6 +169,8 @@ func (a *AuthState) IssueWorkerCredential(runID, taskID, workerID string, attemp
 	}
 	h := hashToken(token)
 	key := attemptKey(taskID, workerID, attempt)
+	nativeSessionID = strings.TrimSpace(nativeSessionID)
+	bound := nativeSessionID != ""
 	a.mu.Lock()
 	// Revoke any prior credential for this attempt key.
 	if old, ok := a.byAttempt[key]; ok {
@@ -175,6 +181,7 @@ func (a *AuthState) IssueWorkerCredential(runID, taskID, workerID string, attemp
 	a.workers[h] = &WorkerCredentialBinding{
 		TokenHash: h, RunID: runID, TaskID: taskID, WorkerID: workerID,
 		AttemptNumber: attempt, NativeSessionID: nativeSessionID,
+		Bound: bound,
 	}
 	a.byAttempt[key] = h
 	a.mu.Unlock()
@@ -227,6 +234,8 @@ func (a *AuthState) RevokeWorkerAttempt(taskID, workerID string, attempt int) {
 }
 
 // AuthenticateWorker validates a Worker token and returns its binding.
+// Rejects missing, revoked, unbound, and empty native-session bindings.
+// Never reveals the expected session ID or token in errors (caller sees only bool).
 func (a *AuthState) AuthenticateWorker(token string) (*WorkerCredentialBinding, bool) {
 	if token == "" {
 		return nil, false
@@ -236,6 +245,10 @@ func (a *AuthState) AuthenticateWorker(token string) (*WorkerCredentialBinding, 
 	defer a.mu.RUnlock()
 	b := a.workers[h]
 	if b == nil || b.Revoked {
+		return nil, false
+	}
+	// Credentials must be active (bound) with a non-empty native session.
+	if !b.Bound || strings.TrimSpace(b.NativeSessionID) == "" {
 		return nil, false
 	}
 	// Copy to avoid races.

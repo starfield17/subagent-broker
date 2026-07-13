@@ -86,6 +86,9 @@ type InteractionConfig struct {
 	// environment / MCP env — never argv. Not for control-plane use.
 	WorkerToken  string `json:"-"`
 	WorkerSocket string `json:"-"`
+	// NativeSessionID is the expected Claude native session identity for Worker
+	// plane auth. Passed only via process environment (BROKER_NATIVE_SESSION_ID).
+	NativeSessionID string `json:"-"`
 }
 
 type ResumeRequest struct {
