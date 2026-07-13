@@ -192,8 +192,13 @@ func (a *Adapter) InterruptTurn(ctx context.Context, id string) error {
 	state.mu.Lock()
 	sessionID := state.acpSessionID
 	state.mu.Unlock()
-	_, err = a.request(ctx, state, "session/cancel", map[string]any{"sessionId": sessionID})
-	return err
+	// ACP session/cancel is a notification: no id, no response waiter.
+	// Completion is observed through the original prompt request and events.
+	return state.process.WriteJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "session/cancel",
+		"params":  map[string]any{"sessionId": sessionID},
+	})
 }
 
 func (a *Adapter) TerminateSession(ctx context.Context, id string) error {
@@ -302,6 +307,17 @@ func (a *Adapter) SessionConfigFact(req adapter.StartRequest) adapter.SessionCon
 
 func (a *Adapter) prompt(ctx context.Context, state *sessionState, text string) error {
 	state.mu.Lock()
+	// Multi-turn: re-arm result signaling if a prior turn already completed.
+	// Keep the ACP process/session alive for later SendMessage (BidirectionalStream).
+	select {
+	case <-state.resultReady:
+		state.resultReady = make(chan struct{})
+		state.resultOnce = sync.Once{}
+		state.output.Reset()
+		state.final = nil
+		state.resultError = ""
+	default:
+	}
 	sessionID := state.acpSessionID
 	state.mu.Unlock()
 	result, err := a.request(ctx, state, "session/prompt", map[string]any{
@@ -328,7 +344,7 @@ func (a *Adapter) prompt(ctx context.Context, state *sessionState, text string) 
 	state.usage = adapter.Usage{InputTokens: completion.Usage.InputTokens, OutputTokens: completion.Usage.OutputTokens, Cost: completion.Usage.Cost, Currency: "USD"}
 	state.mu.Unlock()
 	state.resultOnce.Do(func() { close(state.resultReady) })
-	go func() { _ = state.process.CloseInput() }()
+	// Do not close stdin: multi-turn SendMessage requires a live ACP session.
 	return nil
 }
 

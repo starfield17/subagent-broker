@@ -362,6 +362,19 @@ func (a *Adapter) waitHealth(ctx context.Context, baseURL string) error {
 }
 
 func (a *Adapter) promptAsync(ctx context.Context, state *sessionState, req adapter.StartRequest) error {
+	// Multi-turn: re-arm result readiness after a prior session.idle completed.
+	state.mu.Lock()
+	select {
+	case <-state.resultReady:
+		state.resultReady = make(chan struct{})
+		state.finishOnce = sync.Once{}
+		state.resultOnce = sync.Once{}
+		state.final = nil
+		state.resultError = ""
+	default:
+	}
+	state.mu.Unlock()
+
 	parts := []map[string]string{{"type": "text", "text": req.Contract}}
 	body := map[string]any{"parts": parts}
 	if req.Model != "" {
@@ -419,7 +432,8 @@ func (a *Adapter) handleEvent(state *sessionState, value sseEvent) {
 			state.mu.Unlock()
 			native.Kind = event.TurnFailed
 		}
-		go func() { _ = a.stop(state) }()
+		// Keep the server alive for next-turn delivery (BidirectionalStream).
+		// Supervisor TerminateSession / Worker end owns process teardown.
 	}
 	state.mu.Lock()
 	if state.closed {
@@ -457,27 +471,36 @@ func (a *Adapter) collectFinal(state *sessionState) error {
 	if err := a.requestJSON(context.Background(), state, http.MethodGet, "/session/"+url.PathEscape(state.sessionID)+"/message", nil, nil, &messages); err != nil {
 		return err
 	}
-	var final strings.Builder
-	for _, message := range messages {
+	// Newest → oldest: pick the newest assistant text that is a valid Result Envelope.
+	// Do not concatenate historical turns into one document.
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
 		if message.Info.Role != "assistant" {
 			continue
 		}
-		state.mu.Lock()
-		state.usage = adapter.Usage{InputTokens: message.Info.Tokens.Input, OutputTokens: message.Info.Tokens.Output, Cost: message.Info.Cost, Currency: "USD"}
-		state.mu.Unlock()
+		var text strings.Builder
 		for _, part := range message.Parts {
 			if part.Type == "text" {
-				final.WriteString(part.Text)
+				text.WriteString(part.Text)
 			}
 		}
+		if text.Len() == 0 {
+			continue
+		}
+		raw := []byte(text.String())
+		if _, err := protocol.ParseEnvelope(raw); err != nil {
+			continue
+		}
+		state.mu.Lock()
+		state.final = raw
+		state.usage = adapter.Usage{
+			InputTokens: message.Info.Tokens.Input, OutputTokens: message.Info.Tokens.Output,
+			Cost: message.Info.Cost, Currency: "USD",
+		}
+		state.mu.Unlock()
+		return nil
 	}
-	state.mu.Lock()
-	state.final = []byte(final.String())
-	state.mu.Unlock()
-	if final.Len() == 0 {
-		return fmt.Errorf("OpenCode returned no assistant text")
-	}
-	return nil
+	return fmt.Errorf("OpenCode returned no valid Result Envelope in assistant messages")
 }
 
 func (a *Adapter) requestJSON(ctx context.Context, state *sessionState, method, route string, query url.Values, body any, target any) error {
