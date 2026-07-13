@@ -118,29 +118,10 @@ func (s *Service) ResolveMessage(id string, resolution message.Resolution) error
 		}
 	}
 
-	// Native permission: deliver to the adapter BEFORE recording Answered.
-	// On delivery failure keep a failed durable state (never false success).
-	if handled, deliverErr := s.deliverNativePermissionResponse(context.Background(), value, resolution); handled && deliverErr != nil {
-		failed, tErr := s.router.Transition(id, message.Failed, "", nil, deliverErr)
-		if tErr != nil {
-			return fmt.Errorf("permission adapter delivery failed: %w (also transition: %v)", deliverErr, tErr)
-		}
-		if cErr := s.CommitMessageProjection(context.Background(), failed, event.MessageFailed); cErr != nil {
-			return cErr
-		}
-		_ = s.appendEvent(event.Input{
-			TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router",
-			Type: event.PermissionResolved, Severity: "error",
-			Payload: map[string]any{"message_id": id, "status": string(message.Failed), "error": deliverErr.Error()},
-		})
-		// Keep task waiting semantics honest: no successful resolution.
-		if err := s.refreshQuestionProjection(value.TaskID); err != nil {
-			return err
-		}
-		if err := s.recomputeTaskWaiting(value.TaskID); err != nil {
-			return err
-		}
-		return deliverErr
+	// Native permission: freeze intent, bind exactly, deliver with retryable failures.
+	// Claude hooks (no NativePermissionID) use the Answered + waiter path below.
+	if isNativePermission(value) {
+		return s.resolveNativePermission(context.Background(), value, resolution)
 	}
 
 	answerPayload, _ := json.Marshal(resolution)
@@ -744,10 +725,13 @@ func (s *Service) recomputeTaskWaiting(taskID string) error {
 		}
 		if hasPending {
 			// Stay blocked; refresh protocol from highest priority pending.
+			// Failed native permission delivery remains pending and must keep
+			// Task blocked / waiting_permission / quiet (never false running).
 			pending := s.router.PendingDecisions(taskID)
 			if len(pending) > 0 {
 				candidate.Tasks[index].Task.Status = state.TaskBlocked
 				candidate.Tasks[index].Dimensions.Task = state.TaskBlocked
+				candidate.Tasks[index].Dimensions.Progress = state.ProgressQuiet
 				candidate.Tasks[index].BlockKind = BlockKindWaitingMessage
 				switch pending[0].Type {
 				case message.ScopeExpansionRequest:
@@ -846,6 +830,13 @@ func (s *Service) questionEnvelopeFor(value message.Message) message.QuestionEnv
 		_ = json.Unmarshal(value.Payload, &payload)
 		result.Question = "May the Worker use " + payload.ToolName + "?"
 		result.Reason = "The Harness requested permission for a tool call."
+		// When a decision is frozen but native delivery is still pending, say so.
+		if len(value.Resolution) > 0 && !message.IsTerminal(value.Status) {
+			result.Reason = "Decision recorded; native delivery is pending/requires retry."
+			if value.Error != "" {
+				result.Suggestion = "Last delivery error: " + value.Error
+			}
+		}
 	default:
 		var payload message.QuestionEnvelope
 		if json.Unmarshal(value.Payload, &payload) == nil {

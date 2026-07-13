@@ -7,12 +7,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
-	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/event"
 	"github.com/vnai/subagent-broker/internal/message"
 )
+
+// nativePermissionDeliveryTimeout bounds RespondPermission calls. Timeout is a
+// retryable delivery failure (decision stays frozen, message stays pending).
+const nativePermissionDeliveryTimeout = 15 * time.Second
 
 // nativePermissionParse is the normalized view of a protocol-native permission event.
 type nativePermissionParse struct {
@@ -20,13 +24,18 @@ type nativePermissionParse struct {
 	ToolName  string
 	Input     json.RawMessage
 	Options   []message.PermissionOption
+	TurnID    string
 }
 
 // bridgeNativePermission persists a Broker permission_request for a protocol-native
 // PermissionRequested event. Claude hook-backed permissions still use RequestMessage
 // via the interaction hook and do not go through this path.
 //
-// Replay of the same native request ID is idempotent: no duplicate message is created.
+// Replay of the same full identity tuple is idempotent: no duplicate message is created.
+//
+// Crash semantics: resolution intent is persisted before adapter delivery. A crash
+// after the harness receives a response but before Answered is persisted may cause
+// an identical retry to resend (at-least-once across that window, not exactly-once).
 func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Adapter, native adapter.NativeEvent, workerID string) {
 	if s.router == nil || runtime == nil || runtime.Worker == nil {
 		return
@@ -62,9 +71,41 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 		}
 		s.mu.Unlock()
 	}
+	if sessionID == "" {
+		_ = s.appendEvent(event.Input{
+			TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
+			Type: "permission.bridge_failed", Severity: "error",
+			Payload: map[string]any{"reason": "missing native session id for permission"},
+		})
+		return
+	}
 
-	// Deduplicate: same native request already present (pending or terminal).
-	if existing := s.findPermissionByNativeID(string(runtime.Task.TaskID), sessionID, parsed.RequestID); existing != nil {
+	// Prefer the active Worker's persisted attempt; fail closed if unknown.
+	attemptNumber := runtime.Worker.Attempt
+	if attemptNumber <= 0 && runtime.ActiveAttempt > 0 {
+		attemptNumber = runtime.ActiveAttempt
+	}
+	if attemptNumber <= 0 {
+		s.mu.Lock()
+		if active, ok := s.active[string(runtime.Task.TaskID)]; ok && active.attempt > 0 {
+			attemptNumber = active.attempt
+		}
+		s.mu.Unlock()
+	}
+	if attemptNumber <= 0 {
+		_ = s.appendEvent(event.Input{
+			TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
+			Type: "permission.bridge_failed", Severity: "error",
+			Payload: map[string]any{"reason": "no trustworthy attempt number for native permission"},
+		})
+		return
+	}
+	if workerID == "" {
+		workerID = string(runtime.Worker.WorkerID)
+	}
+
+	// Deduplicate by full originating identity (not request ID alone).
+	if existing := s.findPermissionByIdentity(string(runtime.Task.TaskID), harnessName, sessionID, parsed.RequestID, workerID, attemptNumber); existing != nil {
 		return
 	}
 
@@ -76,35 +117,54 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 	if len(input) == 0 {
 		input = json.RawMessage(`{}`)
 	}
+	turnID := parsed.TurnID
+	if turnID == "" {
+		turnID = runtime.Worker.NativeTurnID
+	}
 	payload := message.PermissionRequestPayload{
 		ToolName:           toolName,
 		Input:              input,
 		Harness:            harnessName,
 		NativeSessionID:    sessionID,
 		NativePermissionID: parsed.RequestID,
+		NativeTurnID:       turnID,
 		NativeOptions:      parsed.Options,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	value, err := s.router.EnqueueDecision(string(runtime.Task.TaskID), workerID, message.PermissionRequest, message.Permission, raw)
+	value, err := s.router.EnqueueDecisionWithAttempt(
+		string(runtime.Task.TaskID), workerID, attemptNumber,
+		message.PermissionRequest, message.Permission, raw,
+	)
 	if err != nil {
 		return
 	}
 	if err := s.CommitMessageProjection(context.Background(), value, event.MessageQueued); err != nil {
+		// Fail-closed: durable enqueue succeeded but projection failed.
 		return
 	}
 	question := s.questionEnvelopeFor(value)
 	taskDir := filepath.Join(s.paths.Tasks, string(runtime.Task.TaskID))
+	// Projection failure must not terminal-fail the permission while the harness is blocked.
 	if err := message.PublishQuestionProjection(taskDir, value.MessageID, string(runtime.Task.TaskID), question, false); err != nil {
-		failed, tErr := s.router.Transition(value.MessageID, message.Failed, "", nil, err)
-		if tErr == nil {
-			_ = s.CommitMessageProjection(context.Background(), failed, event.MessageFailed)
-		}
+		_ = s.appendEvent(event.Input{
+			TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
+			Type: "permission.projection_failed", Severity: "error",
+			Payload: map[string]any{"message_id": value.MessageID, "error": err.Error()},
+		})
+		// Keep pending and blocked.
+		_ = s.setTaskWaiting(string(runtime.Task.TaskID), message.PermissionRequest)
 		return
 	}
 	if err := s.refreshQuestionProjection(string(runtime.Task.TaskID)); err != nil {
+		_ = s.appendEvent(event.Input{
+			TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
+			Type: "permission.projection_failed", Severity: "error",
+			Payload: map[string]any{"message_id": value.MessageID, "error": err.Error()},
+		})
+		_ = s.setTaskWaiting(string(runtime.Task.TaskID), message.PermissionRequest)
 		return
 	}
 	if err := s.setTaskWaiting(string(runtime.Task.TaskID), message.PermissionRequest); err != nil {
@@ -119,11 +179,14 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 			"native_permission_id": parsed.RequestID,
 			"harness":              harnessName,
 			"native_session_id":    sessionID,
+			"attempt_number":       attemptNumber,
+			"worker_id":            workerID,
 		},
 	})
 }
 
-func (s *Service) findPermissionByNativeID(taskID, sessionID, nativeID string) *message.Message {
+// findPermissionByIdentity matches the full originating identity tuple.
+func (s *Service) findPermissionByIdentity(taskID, harness, sessionID, nativeID, workerID string, attempt int) *message.Message {
 	if s.router == nil || nativeID == "" {
 		return nil
 	}
@@ -138,7 +201,16 @@ func (s *Service) findPermissionByNativeID(taskID, sessionID, nativeID string) *
 		if payload.NativePermissionID != nativeID {
 			continue
 		}
-		if sessionID != "" && payload.NativeSessionID != "" && payload.NativeSessionID != sessionID {
+		if payload.Harness != "" && harness != "" && payload.Harness != harness {
+			continue
+		}
+		if payload.NativeSessionID != sessionID {
+			continue
+		}
+		if item.WorkerID != workerID {
+			continue
+		}
+		if item.AttemptNumber != attempt {
 			continue
 		}
 		copy := item
@@ -147,70 +219,222 @@ func (s *Service) findPermissionByNativeID(taskID, sessionID, nativeID string) *
 	return nil
 }
 
-// deliverNativePermissionResponse calls Adapter.RespondPermission when the
-// message carries native routing metadata. Returns (false, nil) when the
-// message is not a native permission request (Claude hook path).
-// Construction/delivery failures return handled=true with an error so the
-// caller never records Answered.
-func (s *Service) deliverNativePermissionResponse(ctx context.Context, value message.Message, resolution message.Resolution) (handled bool, err error) {
-	if value.Type != message.PermissionRequest {
-		return false, nil
-	}
+// resolveNativePermission freezes decision intent, validates exact binding, and
+// attempts Adapter.RespondPermission. On delivery failure the message stays
+// non-terminal Queued with frozen Resolution for identical retry.
+func (s *Service) resolveNativePermission(ctx context.Context, value message.Message, resolution message.Resolution) error {
 	var payload message.PermissionRequestPayload
 	if err := json.Unmarshal(value.Payload, &payload); err != nil {
-		return false, nil
+		return err
 	}
 	if payload.NativePermissionID == "" {
-		// Claude hook path: response is delivered via the blocked RequestMessage waiter.
-		return false, nil
+		return fmt.Errorf("not a native permission message")
 	}
 
-	sessionID := payload.NativeSessionID
-	var harness adapter.Adapter
+	// 1) Freeze decision intent before physical delivery.
+	resJSON, err := json.Marshal(resolution)
+	if err != nil {
+		return err
+	}
+	frozen, err := s.router.RecordResolutionIntent(value.MessageID, resJSON)
+	if err != nil {
+		return err
+	}
+	if err := s.CommitMessageProjection(ctx, frozen, event.MessageQueued); err != nil {
+		return err
+	}
+	// Re-load frozen message for delivery.
+	value = frozen
+	if err := json.Unmarshal(value.Payload, &payload); err != nil {
+		return err
+	}
+
+	// 2) Exact binding to the originating active session.
+	bindErr := s.validatePermissionBinding(value, payload)
+	if bindErr != nil {
+		// Routing attempt without adapter call.
+		updated, tErr := s.router.RecordDeliveryAttempt(value.MessageID, "", bindErr)
+		if tErr == nil {
+			_ = s.CommitMessageProjection(ctx, updated, event.MessageQueued)
+		}
+		_ = s.appendEvent(event.Input{
+			TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router",
+			Type: "permission.reconciliation_required", Severity: "error",
+			Payload: s.permissionBindingEventPayload(value, payload, bindErr),
+		})
+		_ = s.refreshQuestionProjection(value.TaskID)
+		_ = s.recomputeTaskWaiting(value.TaskID)
+		return bindErr
+	}
+
 	s.mu.Lock()
-	active, isActive := s.active[value.TaskID]
+	active := s.active[value.TaskID]
 	s.mu.Unlock()
-	if isActive {
-		harness = active.adapter
-		if sessionID == "" {
-			sessionID = active.sessionID
-		}
-	}
-	if harness == nil {
-		if runtime, ok := s.taskState(domain.TaskID(value.TaskID)); ok {
-			if a, ok := s.adapterForTask(runtime.Task, runtime.Worker); ok {
-				harness = a
-			}
-			if sessionID == "" && runtime.Worker != nil {
-				sessionID = runtime.Worker.NativeSessionID
-			}
-		}
-	}
-	if harness == nil {
-		return true, fmt.Errorf("no adapter available to deliver permission response for %s", value.MessageID)
-	}
-	if sessionID == "" {
-		return true, fmt.Errorf("native session id missing for permission %s", value.MessageID)
-	}
 
 	decision := adapter.PermissionDecision{
 		RequestID: payload.NativePermissionID,
 		Allowed:   resolution.Decision.Allowed,
 		Reason:    resolution.Decision.Reason,
 	}
-	// ACP / option-based harnesses: select opaque optionId before delivery.
 	if len(payload.NativeOptions) > 0 {
 		optionID, optErr := message.SelectPermissionOptionID(payload.NativeOptions, resolution.Decision.Allowed)
 		if optErr != nil {
-			return true, optErr
+			updated, tErr := s.router.RecordDeliveryAttempt(value.MessageID, "", optErr)
+			if tErr == nil {
+				_ = s.CommitMessageProjection(ctx, updated, event.MessageQueued)
+			}
+			_ = s.refreshQuestionProjection(value.TaskID)
+			_ = s.recomputeTaskWaiting(value.TaskID)
+			return optErr
 		}
 		decision.OptionID = optionID
 	}
 
-	if err := harness.RespondPermission(ctx, sessionID, decision); err != nil {
-		return true, err
+	// 3) Bounded delivery context (not context.Background).
+	deliverCtx, cancel := context.WithTimeout(ctx, nativePermissionDeliveryTimeout)
+	defer cancel()
+	if deliverCtx.Err() != nil {
+		// Parent already cancelled — still treat as retryable failure.
+		deliverCtx, cancel = context.WithTimeout(context.Background(), nativePermissionDeliveryTimeout)
+		defer cancel()
 	}
-	return true, nil
+
+	sendErr := active.adapter.RespondPermission(deliverCtx, payload.NativeSessionID, decision)
+	if sendErr != nil {
+		// Keep non-terminal Queued with frozen resolution for identical retry.
+		updated, tErr := s.router.RecordDeliveryAttempt(value.MessageID, "", sendErr)
+		if tErr != nil {
+			return fmt.Errorf("permission delivery failed: %w (also record attempt: %v)", sendErr, tErr)
+		}
+		if cErr := s.CommitMessageProjection(ctx, updated, event.MessageQueued); cErr != nil {
+			return cErr
+		}
+		_ = s.appendEvent(event.Input{
+			TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router",
+			Type: "permission.delivery_failed", Severity: "error",
+			Payload: map[string]any{
+				"message_id":        value.MessageID,
+				"status":            string(message.Queued),
+				"delivery_attempts": updated.DeliveryAttempts,
+				"error":             sendErr.Error(),
+				"retry_pending":     true,
+			},
+		})
+		_ = s.refreshQuestionProjection(value.TaskID)
+		_ = s.recomputeTaskWaiting(value.TaskID)
+		return sendErr
+	}
+
+	// 4) Success: Answered (clears Error, increments attempts).
+	// Status change Queued → Answered; Resolution already frozen (must not rewrite).
+	updated, tErr := s.router.RecordDeliveryAttempt(value.MessageID, message.Answered, nil)
+	if tErr != nil {
+		return fmt.Errorf("permission delivered but failed to record Answered: %w", tErr)
+	}
+	if updated.Status != message.Answered {
+		return fmt.Errorf("permission delivered but status is %s after record", updated.Status)
+	}
+	if err := s.CommitMessageProjection(ctx, updated, event.MessageAnswered); err != nil {
+		return err
+	}
+	if err := s.refreshQuestionProjection(value.TaskID); err != nil {
+		return err
+	}
+	if err := s.recomputeTaskWaiting(value.TaskID); err != nil {
+		return err
+	}
+	if err := s.appendEvent(event.Input{
+		TaskID: value.TaskID, WorkerID: value.WorkerID, Source: "message-router",
+		Type: event.PermissionResolved, Severity: "info",
+		Payload: map[string]any{"message_id": value.MessageID, "status": string(message.Answered)},
+	}); err != nil {
+		return err
+	}
+	if !s.router.HasPendingDecisions(value.TaskID) {
+		s.signalAdvance()
+	}
+	return nil
+}
+
+// validatePermissionBinding enforces exact harness/session/worker/attempt match.
+// AttemptNumber 0 is never a wildcard for a newer attempt.
+func (s *Service) validatePermissionBinding(value message.Message, payload message.PermissionRequestPayload) error {
+	if payload.NativePermissionID == "" {
+		return fmt.Errorf("native permission id is required")
+	}
+	// Incomplete identity → reconciliation (legacy journals).
+	if payload.Harness == "" || payload.NativeSessionID == "" {
+		return fmt.Errorf("incomplete native permission routing identity; reconciliation required")
+	}
+	// AttemptNumber 0 must not match an arbitrary newer attempt.
+	if value.AttemptNumber <= 0 {
+		return fmt.Errorf("permission attempt_number %d is not a delivery wildcard; reconciliation required", value.AttemptNumber)
+	}
+	if value.WorkerID == "" {
+		return fmt.Errorf("permission worker_id is required for delivery")
+	}
+
+	s.mu.Lock()
+	active, isActive := s.active[value.TaskID]
+	s.mu.Unlock()
+	if !isActive {
+		return fmt.Errorf("no active worker for exact permission delivery (session %s attempt %d)", payload.NativeSessionID, value.AttemptNumber)
+	}
+
+	actualHarness := string(active.adapter.Descriptor().Name)
+	if payload.Harness != actualHarness {
+		return fmt.Errorf("permission harness mismatch: expected %q actual %q", payload.Harness, actualHarness)
+	}
+	if payload.NativeSessionID != active.sessionID {
+		return fmt.Errorf("permission session mismatch: expected %q actual %q", payload.NativeSessionID, active.sessionID)
+	}
+	if value.WorkerID != active.workerID {
+		return fmt.Errorf("permission worker mismatch: expected %q actual %q", value.WorkerID, active.workerID)
+	}
+	if value.AttemptNumber != active.attempt {
+		return fmt.Errorf("permission attempt mismatch: expected %d actual %d", value.AttemptNumber, active.attempt)
+	}
+	if active.taskID != "" && value.TaskID != active.taskID {
+		return fmt.Errorf("permission task mismatch: expected %q actual %q", value.TaskID, active.taskID)
+	}
+	return nil
+}
+
+func (s *Service) permissionBindingEventPayload(value message.Message, payload message.PermissionRequestPayload, cause error) map[string]any {
+	out := map[string]any{
+		"message_id":          value.MessageID,
+		"expected_harness":    payload.Harness,
+		"expected_session_id": payload.NativeSessionID,
+		"expected_worker_id":  value.WorkerID,
+		"expected_attempt":    value.AttemptNumber,
+		"reason":              "permission binding mismatch",
+	}
+	if cause != nil {
+		out["error"] = cause.Error()
+	}
+	s.mu.Lock()
+	active, isActive := s.active[value.TaskID]
+	s.mu.Unlock()
+	if isActive {
+		out["actual_harness"] = string(active.adapter.Descriptor().Name)
+		out["actual_session_id"] = active.sessionID
+		out["actual_worker_id"] = active.workerID
+		out["actual_attempt"] = active.attempt
+	}
+	return out
+}
+
+// isNativePermission reports whether the message is a protocol-native permission
+// (has NativePermissionID). Claude hooks have no native id.
+func isNativePermission(value message.Message) bool {
+	if value.Type != message.PermissionRequest {
+		return false
+	}
+	var payload message.PermissionRequestPayload
+	if json.Unmarshal(value.Payload, &payload) != nil {
+		return false
+	}
+	return payload.NativePermissionID != ""
 }
 
 // parseNativePermission dispatches harness-specific normalization, then falls
@@ -238,11 +462,6 @@ func parseGrokACPPermission(raw json.RawMessage) (nativePermissionParse, bool) {
 	}
 	if err := json.Unmarshal(raw, &rpc); err != nil || len(rpc.ID) == 0 {
 		return nativePermissionParse{}, false
-	}
-	// Accept request_permission methods; also allow generic server requests with options.
-	method := strings.ToLower(strings.TrimSpace(rpc.Method))
-	if method != "" && !strings.Contains(method, "permission") && !strings.Contains(method, "request_permission") {
-		// Still try if params carry options (some fixtures).
 	}
 	requestID := normalizeJSONID(rpc.ID)
 	if requestID == "" {
@@ -298,13 +517,11 @@ func parseOpenCodePermission(raw json.RawMessage) (nativePermissionParse, bool) 
 	if len(raw) == 0 || string(raw) == "null" {
 		return nativePermissionParse{}, false
 	}
-	// Top-level object only — avoid recursive nested id capture.
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return nativePermissionParse{}, false
 	}
 	requestID := firstStringField(top, "id", "permissionID", "permission_id", "request_id")
-	// If this is a full SSE envelope {type, properties}, unwrap properties once.
 	if requestID == "" {
 		if props, ok := top["properties"]; ok {
 			var nested map[string]json.RawMessage
@@ -320,7 +537,6 @@ func parseOpenCodePermission(raw json.RawMessage) (nativePermissionParse, bool) 
 		return nativePermissionParse{}, false
 	}
 	toolName := firstStringField(top, "tool_name", "title", "name")
-	// tool may be a string or an object (messageID/callID); never require string.
 	if toolName == "" {
 		if toolRaw, ok := top["tool"]; ok {
 			var asString string
@@ -342,7 +558,6 @@ func parseOpenCodePermission(raw json.RawMessage) (nativePermissionParse, bool) 
 			}
 		}
 	}
-	// Preserve useful metadata without secrets: keep the flat payload as input.
 	input := raw
 	if props, ok := top["properties"]; ok && len(top) <= 3 {
 		input = props
@@ -364,7 +579,6 @@ func firstStringField(m map[string]json.RawMessage, keys ...string) string {
 		if json.Unmarshal(raw, &s) == nil && strings.TrimSpace(s) != "" {
 			return s
 		}
-		// Numeric ids encoded as JSON numbers.
 		var n json.Number
 		if json.Unmarshal(raw, &n) == nil && n.String() != "" {
 			return n.String()
@@ -379,7 +593,6 @@ func parseGenericNativePermission(raw json.RawMessage) nativePermissionParse {
 		return nativePermissionParse{}
 	}
 
-	// JSON-RPC server request: {"id":..., "method":"...", "params":{...}}
 	var rpc struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
@@ -396,7 +609,6 @@ func parseGenericNativePermission(raw json.RawMessage) nativePermissionParse {
 		}
 	}
 
-	// Flat fake payload: tool may be string; do not fail if tool is object.
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return nativePermissionParse{}
@@ -451,7 +663,6 @@ func extractToolFromParams(params json.RawMessage) (toolName string, input json.
 	if len(params) == 0 {
 		return "", nil
 	}
-	// Use map so object-valued tool does not fail the whole unmarshal.
 	var value map[string]json.RawMessage
 	if json.Unmarshal(params, &value) != nil {
 		return "", params

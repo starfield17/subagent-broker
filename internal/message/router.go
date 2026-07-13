@@ -1,6 +1,7 @@
 package message
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -123,6 +124,19 @@ func (r *Router) EnqueueDecision(
 	category Category,
 	payload json.RawMessage,
 ) (Message, error) {
+	return r.EnqueueDecisionWithAttempt(taskID, workerID, 0, messageType, category, payload)
+}
+
+// EnqueueDecisionWithAttempt persists a decision message with attempt linkage.
+// Native permission requests must pass a non-zero attempt when known; 0 is
+// reserved for legacy/non-native callers and is not a delivery wildcard.
+func (r *Router) EnqueueDecisionWithAttempt(
+	taskID, workerID string,
+	attemptNumber int,
+	messageType Type,
+	category Category,
+	payload json.RawMessage,
+) (Message, error) {
 	if strings.TrimSpace(taskID) == "" {
 		return Message{}, fmt.Errorf("task id is required")
 	}
@@ -140,6 +154,7 @@ func (r *Router) EnqueueDecision(
 		RunID:         r.runID,
 		TaskID:        taskID,
 		WorkerID:      workerID,
+		AttemptNumber: attemptNumber,
 		Type:          messageType,
 		Category:      category,
 		Status:        Queued,
@@ -154,6 +169,61 @@ func (r *Router) EnqueueDecision(
 	r.index[id] = copyMessage(value)
 	r.mu.Unlock()
 	return copyMessage(value), nil
+}
+
+// RecordResolutionIntent freezes a decision Resolution without making the
+// message terminal. Journal append precedes the in-memory index update.
+// Identical semantic resolutions are idempotent; conflicts are rejected.
+// Does not increment DeliveryAttempts.
+func (r *Router) RecordResolutionIntent(messageID string, resolution json.RawMessage) (Message, error) {
+	if len(resolution) == 0 {
+		return Message{}, fmt.Errorf("resolution is required")
+	}
+	r.mu.Lock()
+	current, ok := r.index[messageID]
+	if !ok {
+		r.mu.Unlock()
+		return Message{}, fmt.Errorf("message %q was not found", messageID)
+	}
+	current = copyMessage(current)
+	r.mu.Unlock()
+
+	if IsTerminal(current.Status) {
+		return Message{}, fmt.Errorf("message %q is already terminal (%s)", messageID, current.Status)
+	}
+	if current.Type != PermissionRequest {
+		return Message{}, fmt.Errorf("resolution intent is only supported for permission_request")
+	}
+	if current.Status != Queued {
+		return Message{}, fmt.Errorf("resolution intent requires queued status (status=%s)", current.Status)
+	}
+
+	// Normalize to stable JSON for durable equality.
+	normalized, err := normalizeResolutionJSON(resolution)
+	if err != nil {
+		return Message{}, err
+	}
+	if len(current.Resolution) > 0 {
+		existing, err := normalizeResolutionJSON(current.Resolution)
+		if err != nil {
+			return Message{}, err
+		}
+		if bytesEqualJSON(existing, normalized) {
+			return current, nil // idempotent
+		}
+		return Message{}, fmt.Errorf("conflicting resolution: decision is already frozen")
+	}
+
+	candidate := copyMessage(current)
+	candidate.Resolution = append(json.RawMessage(nil), normalized...)
+	candidate.UpdatedAt = r.now().UTC()
+	if err := r.store.Append(candidate); err != nil {
+		return Message{}, err
+	}
+	r.mu.Lock()
+	r.index[messageID] = copyMessage(candidate)
+	r.mu.Unlock()
+	return copyMessage(candidate), nil
 }
 
 // ReclassifyDelivery updates DeliveryMode for a still-queued instruction.
@@ -194,6 +264,9 @@ func (r *Router) ReclassifyDelivery(messageID string, mode DeliveryMode) (Messag
 }
 
 // RecordDeliveryAttempt increments delivery_attempts and optionally updates status.
+// On success (cause == nil) a previous Error is cleared. On failure the message
+// may remain Queued (next empty) with Error set — used for retryable native
+// permission delivery.
 func (r *Router) RecordDeliveryAttempt(messageID string, next Status, cause error) (Message, error) {
 	r.mu.Lock()
 	current, ok := r.index[messageID]
@@ -215,6 +288,9 @@ func (r *Router) RecordDeliveryAttempt(messageID string, next Status, cause erro
 	}
 	if cause != nil {
 		candidate.Error = cause.Error()
+	} else {
+		// Successful delivery clears a prior retry error.
+		candidate.Error = ""
 	}
 	if err := r.store.Append(candidate); err != nil {
 		return Message{}, err
@@ -409,6 +485,36 @@ func decisionPriority(t Type) int {
 	default:
 		return 3
 	}
+}
+
+// ResolutionsEqual reports whether two resolution payloads are semantically equal.
+func ResolutionsEqual(a, b json.RawMessage) bool {
+	na, errA := normalizeResolutionJSON(a)
+	nb, errB := normalizeResolutionJSON(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return bytesEqualJSON(na, nb)
+}
+
+func normalizeResolutionJSON(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty resolution")
+	}
+	var value Resolution
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, fmt.Errorf("invalid resolution: %w", err)
+	}
+	// Canonical encode so formatting differences do not create false conflicts.
+	out, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func bytesEqualJSON(a, b json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b))
 }
 
 func copyIndex(values map[string]Message) map[string]Message {

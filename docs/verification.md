@@ -178,3 +178,34 @@ Results: all packages PASS under `go test` and `go test -race` (including adapte
 | Claude | **Not migrated** — single `readProcess` goroutine is the sole sender/closer of `Session.Events` (already satisfies the invariant) |
 
 **Live authenticated harness smoke was not performed** (concurrency-only PR).
+
+## Phase 4 PR 8.10 — retryable attempt-bound permission delivery
+
+Executed after making native permission delivery durable and session-bound:
+
+```bash
+gofmt -w .
+go test ./...
+go test -race ./...
+go test -race ./internal/supervisor/... -count=5
+go test -race ./internal/message/... -count=5
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Results: all packages PASS; race stress used `-count=5` for supervisor/message (reduced from 20 for runtime); `go vet` clean; build success.
+
+### Coverage
+
+| Area | Tests |
+|---|---|
+| Retryable delivery | failure remains `Queued` with frozen `Resolution`; identical retry succeeds; conflicting retry rejected |
+| Binding | harness/session/worker/attempt mismatch never calls adapter; attempt-1 not delivered to attempt-2 |
+| Dedup | full identity tuple; same request id across attempts is distinct |
+| Legacy journals | `AttemptNumber == 0` is not a wildcard |
+| Router | `RecordResolutionIntent` idempotent/conflict; delivery attempts clear error on success |
+| PR 8.7–8.9 | permission wire, next-turn, EventStream regressions remain green |
+
+Crash window is **at-least-once** (intent persisted before adapter send; retry may resend). **Not exactly-once.**
+
+**Live authenticated permission retry smoke was not performed.**

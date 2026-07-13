@@ -48,7 +48,7 @@ func newLifecycleService(t *testing.T, harness *fake.Adapter, taskID string) (*S
 	service.snapshot.Tasks = []TaskState{{
 		Task: domain.Task{TaskID: domain.TaskID(taskID), WriteScope: []string{"a/**"}, ProjectRoot: t.TempDir(), WaveID: "wave-1"},
 		Worker: &domain.WorkerSession{
-			WorkerID: "worker-a", TaskID: domain.TaskID(taskID), Harness: string(adapter.HarnessFake),
+			WorkerID: "worker-a", TaskID: domain.TaskID(taskID), Attempt: 1, Harness: string(adapter.HarnessFake),
 			Capabilities: adapter.CapabilityMap(adapter.Capabilities{
 				BidirectionalStream: true, PermissionEvents: true, StructuredStream: true,
 			}),
@@ -57,7 +57,8 @@ func newLifecycleService(t *testing.T, harness *fake.Adapter, taskID string) (*S
 				Progress: state.ProgressActive, Task: state.TaskRunning,
 			},
 		},
-		Dimensions: state.Dimensions{Task: state.TaskRunning, Process: state.ProcessAlive},
+		ActiveAttempt: 1,
+		Dimensions:    state.Dimensions{Task: state.TaskRunning, Process: state.ProcessAlive},
 	}}
 	_ = harness
 	return service, path
@@ -332,8 +333,12 @@ func TestRunWorkerSessionSecondTurnPermissionNoDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service.active["task-a"] = activeWorker{adapter: harness, sessionID: session.NativeSessionID, cancel: func() {}, taskID: "task-a", workerID: "worker-a"}
+	service.active["task-a"] = activeWorker{
+		adapter: harness, sessionID: session.NativeSessionID, cancel: func() {},
+		taskID: "task-a", workerID: "worker-a", attempt: 1,
+	}
 	service.snapshot.Tasks[0].Worker.NativeSessionID = session.NativeSessionID
+	service.snapshot.Tasks[0].Worker.Attempt = 1
 	if _, err := service.SendInstruction(context.Background(), "task-a", "go-turn-2"); err != nil {
 		t.Fatal(err)
 	}
