@@ -1,3 +1,8 @@
+---
+name: subagent-broker
+description: Coordinate parallel subagents through the subagent broker.
+---
+
 # Multi-Harness Parallel Subagent Broker Skill
 
 ## Status
