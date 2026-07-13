@@ -27,31 +27,31 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu              sync.Mutex
-	process         *transport.Process
-	acpSessionID    string
-	workerID        string
-	events          chan adapter.NativeEvent
-	resultReady     chan struct{}
-	resultSignaled  bool
-	closeEvents     sync.Once
-	shutdown        chan struct{}
-	shutdownOnce    sync.Once
-	history         []adapter.NativeEvent
-	output          strings.Builder
-	final           []byte
-	resultError     string
-	usage           adapter.Usage
-	droppedProgress uint64
-	closed          bool
-	nextID          int64
-	pending         map[int64]chan rpcMessage
-	serverRequest   map[string]struct{}
+	mu             sync.Mutex
+	process        *transport.Process
+	acpSessionID   string
+	workerID       string
+	stream         *protocol.EventStream
+	resultReady    chan struct{}
+	resultSignaled bool
+	shutdown       chan struct{}
+	shutdownOnce   sync.Once
+	history        []adapter.NativeEvent
+	output         strings.Builder
+	final          []byte
+	resultError    string
+	usage          adapter.Usage
+	nextID         int64
+	pending        map[int64]chan rpcMessage
+	serverRequest  map[string]struct{}
 	// Multi-turn generation: only the latest generation may finalize results.
 	generation     uint64
 	promptInFlight bool
 	promptGen      uint64
 	promptRPCID    int64
+	// Producer coordination: all Adds happen before readerExited; then Wait.
+	producers    sync.WaitGroup
+	readerExited bool
 }
 
 type rpcMessage struct {
@@ -118,7 +118,8 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 		return adapter.Session{}, fmt.Errorf("start Grok ACP: %w", err)
 	}
 	state := &sessionState{
-		process: p, workerID: req.WorkerID, events: make(chan adapter.NativeEvent, 256),
+		process: p, workerID: req.WorkerID,
+		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 256, ProgressQueueLimit: 256}),
 		resultReady: make(chan struct{}), shutdown: make(chan struct{}),
 		pending: map[int64]chan rpcMessage{}, serverRequest: map[string]struct{}{},
 	}
@@ -208,6 +209,9 @@ func (a *Adapter) TerminateSession(ctx context.Context, id string) error {
 		return err
 	}
 	state.shutdownOnce.Do(func() { close(state.shutdown) })
+	if state.stream != nil {
+		go state.stream.Abort()
+	}
 	if err := state.process.Terminate(ctx); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		_ = state.process.CloseInput()
 		return err
@@ -317,7 +321,7 @@ func (a *Adapter) SessionConfigFact(req adapter.StartRequest) adapter.SessionCon
 // Turn completion is finalized asynchronously by waitPromptCompletion.
 func (a *Adapter) startPrompt(ctx context.Context, state *sessionState, text string) error {
 	state.mu.Lock()
-	if state.closed {
+	if state.readerExited {
 		state.mu.Unlock()
 		return fmt.Errorf("Grok session is closed")
 	}
@@ -343,6 +347,9 @@ func (a *Adapter) startPrompt(ctx context.Context, state *sessionState, text str
 	state.promptRPCID = rpcID
 	response := make(chan rpcMessage, 1)
 	state.pending[rpcID] = response
+	// Register producer under the same lock as the readerExited check so Wait
+	// in readProcess cannot start until this Add is visible.
+	state.producers.Add(1)
 	state.mu.Unlock()
 
 	params := map[string]any{
@@ -351,10 +358,14 @@ func (a *Adapter) startPrompt(ctx context.Context, state *sessionState, text str
 	}
 	if err := state.process.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": rpcID, "method": "session/prompt", "params": params}); err != nil {
 		a.clearPromptInFlight(state, gen, rpcID)
+		state.producers.Done()
 		return fmt.Errorf("Grok ACP session/prompt write: %w", err)
 	}
 	// Completion phase runs async; SendMessage returns before turn completion.
-	go a.waitPromptCompletion(ctx, state, gen, rpcID, response)
+	go func() {
+		defer state.producers.Done()
+		a.waitPromptCompletion(ctx, state, gen, rpcID, response)
+	}()
 	return nil
 }
 
@@ -493,14 +504,20 @@ func (a *Adapter) respondServerRequest(_ context.Context, state *sessionState, r
 }
 
 func (a *Adapter) readProcess(state *sessionState) {
-	defer state.shutdownOnce.Do(func() { close(state.shutdown) })
-	defer state.closeEvents.Do(func() {
+	// LIFO: stream close after producers finish after shutdown signal.
+	defer func() {
+		if state.stream != nil {
+			state.stream.CloseGracefully()
+		}
+	}()
+	defer func() {
 		state.mu.Lock()
-		state.closed = true
+		state.readerExited = true
 		state.mu.Unlock()
-		close(state.events)
-	})
+		state.producers.Wait()
+	}()
 	defer a.signalResult(state)
+	defer state.shutdownOnce.Do(func() { close(state.shutdown) })
 	for line := range state.process.Lines() {
 		a.handleLine(state, line)
 	}
@@ -588,18 +605,11 @@ func (a *Adapter) handleLine(state *sessionState, line []byte) {
 
 func (a *Adapter) recordEvent(state *sessionState, native adapter.NativeEvent) {
 	state.mu.Lock()
-	if state.closed {
-		state.mu.Unlock()
-		return
-	}
 	state.history = append(state.history, native)
 	state.mu.Unlock()
-	protocol.EmitNativeEvent(protocol.EmitOptions{
-		Events:          state.events,
-		Shutdown:        state.shutdown,
-		Mu:              &state.mu,
-		DroppedProgress: &state.droppedProgress,
-	}, native)
+	if state.stream != nil {
+		_ = state.stream.Publish(native)
+	}
 }
 
 func (a *Adapter) removePending(state *sessionState, id int64) {
@@ -620,7 +630,11 @@ func (a *Adapter) requireSession(id string) (*sessionState, error) {
 
 func sessionFromState(state *sessionState) adapter.Session {
 	i := state.process.Identity()
-	return adapter.Session{NativeSessionID: state.acpSessionID, PID: i.PID, ProcessStartToken: i.StartToken, Events: state.events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
+	var events <-chan adapter.NativeEvent
+	if state.stream != nil {
+		events = state.stream.Events()
+	}
+	return adapter.Session{NativeSessionID: state.acpSessionID, PID: i.PID, ProcessStartToken: i.StartToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
 }
 
 func responseSessionID(raw json.RawMessage) string {

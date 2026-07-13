@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/vnai/subagent-broker/internal/adapter"
+	"github.com/vnai/subagent-broker/internal/adapter/protocol"
 )
 
 const validEnvelope = `{"schema_version":"v1alpha1","task_id":"t","worker_id":"w","status":"succeeded","summary":"latest","work_completed":["done"],"files_changed":[],"no_files_changed_reason":"fixture","validation":[{"command":"fixture","passed":true}],"remaining_work":[],"blocking_issues":[],"risks":[],"handoff_notes":[]}`
@@ -74,7 +75,7 @@ func TestCollectFinalSelectsNewestValidEnvelope(t *testing.T) {
 func TestSessionIdleDoesNotStopServer(t *testing.T) {
 	a := New("")
 	state := &sessionState{
-		events:      make(chan adapter.NativeEvent, 8),
+		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 8, ProgressQueueLimit: 8}),
 		shutdown:    make(chan struct{}),
 		resultReady: make(chan struct{}),
 		sessionID:   "ses-idle",
@@ -87,8 +88,8 @@ func TestSessionIdleDoesNotStopServer(t *testing.T) {
 	default:
 		t.Fatal("session.idle should signal resultReady without stopping server")
 	}
-	// Session still open for next-turn.
-	if state.closed {
+	// Stream still accepting for next-turn (not aborted/closed by idle).
+	if state.stream.Publish(adapter.NativeEvent{Kind: "opencode.ping"}) == protocol.PublishRejected {
 		t.Fatal("session must remain open after idle for multi-turn delivery")
 	}
 }
@@ -129,7 +130,8 @@ func TestTwoTurnIdleFreezesSecondResult(t *testing.T) {
 	a := New("")
 	state := &sessionState{
 		baseURL: server.URL, directory: t.TempDir(), sessionID: "ses-2t",
-		events: make(chan adapter.NativeEvent, 8), shutdown: make(chan struct{}),
+		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 8, ProgressQueueLimit: 8}),
+		shutdown:    make(chan struct{}),
 		resultReady: make(chan struct{}), generation: 1, promptGen: 1, promptInFlight: true,
 	}
 	a.handleEvent(state, sseEvent{Type: "session.idle", Properties: []byte(`{}`)})
@@ -154,7 +156,7 @@ func TestTwoTurnIdleFreezesSecondResult(t *testing.T) {
 	if !strings.Contains(string(state.final), "second") {
 		t.Fatalf("second final=%s", state.final)
 	}
-	if state.closed {
+	if state.stream.Publish(adapter.NativeEvent{Kind: "opencode.ping"}) == protocol.PublishRejected {
 		t.Fatal("server/session must stay open across idles")
 	}
 }

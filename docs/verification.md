@@ -142,3 +142,39 @@ OpenCode two-turn fixtures:
 | Concurrent prompt | rejected while in flight |
 
 **Live authenticated next-turn smoke against real Grok/OpenCode was not performed.**
+
+## Phase 4 PR 8.9 — single-owner native event streams
+
+Executed after serializing `Session.Events` ownership:
+
+```bash
+gofmt -w .
+go test ./...
+go test -race ./...
+go test -race ./internal/adapter/... -count=10
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Results: all packages PASS under `go test` and `go test -race` (including adapter stress `-count=10`); `go vet` clean; build success.
+
+### EventStream invariants tested (`internal/adapter/protocol/stream_test.go`)
+
+- Critical events survive public-channel saturation (progress may drop with counter)
+- Progress drop accounting under concurrent pressure
+- Publish vs `CloseGracefully` race (no panic; post-close publish rejected)
+- Publish vs `Abort` race (publishers unblock without a consumer)
+- Concurrent `CloseGracefully`/`Abort` idempotence
+- Serialized FIFO for a single producer
+
+### Adapters migrated
+
+| Adapter | Ownership model |
+|---|---|
+| Codex | `EventStream`; protocol reader graceful close; terminate aborts |
+| Grok | `EventStream`; reader + async prompt completion producers; WaitGroup coordination |
+| OpenCode | `EventStream`; SSE producer graceful close; `watchExit`/terminate aborts if stalled |
+| Fake | `EventStream`; initial + follow-up batch producers; terminate aborts |
+| Claude | **Not migrated** — single `readProcess` goroutine is the sole sender/closer of `Session.Events` (already satisfies the invariant) |
+
+**Live authenticated harness smoke was not performed** (concurrency-only PR).

@@ -27,29 +27,26 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu              sync.Mutex
-	process         *transport.Process
-	threadID        string
-	turnID          string
-	workerID        string
-	events          chan adapter.NativeEvent
-	resultReady     chan struct{}
-	resultOnce      sync.Once
-	closeEvents     sync.Once
-	shutdown        chan struct{}
-	shutdownOnce    sync.Once
-	history         []adapter.NativeEvent
-	final           []byte
-	output          strings.Builder
-	resultError     string
-	usage           adapter.Usage
-	diff            []string
-	closed          bool
-	droppedProgress uint64
-	nextID          int64
-	pending         map[int64]chan rpcMessage
-	serverRequest   map[string]struct{}
-	agentPhases     map[string]string
+	mu            sync.Mutex
+	process       *transport.Process
+	threadID      string
+	turnID        string
+	workerID      string
+	stream        *protocol.EventStream
+	resultReady   chan struct{}
+	resultOnce    sync.Once
+	shutdown      chan struct{}
+	shutdownOnce  sync.Once
+	history       []adapter.NativeEvent
+	final         []byte
+	output        strings.Builder
+	resultError   string
+	usage         adapter.Usage
+	diff          []string
+	nextID        int64
+	pending       map[int64]chan rpcMessage
+	serverRequest map[string]struct{}
+	agentPhases   map[string]string
 }
 
 type rpcMessage struct {
@@ -116,7 +113,8 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 		return adapter.Session{}, fmt.Errorf("start Codex app-server: %w", err)
 	}
 	state := &sessionState{
-		process: p, workerID: req.WorkerID, events: make(chan adapter.NativeEvent, 256),
+		process: p, workerID: req.WorkerID,
+		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 256, ProgressQueueLimit: 256}),
 		resultReady: make(chan struct{}), shutdown: make(chan struct{}),
 		pending: map[int64]chan rpcMessage{}, serverRequest: map[string]struct{}{}, agentPhases: map[string]string{},
 	}
@@ -245,6 +243,10 @@ func (a *Adapter) TerminateSession(ctx context.Context, id string) error {
 		return err
 	}
 	state.shutdownOnce.Do(func() { close(state.shutdown) })
+	// Abort unblocks the event owner if the consumer is stalled.
+	if state.stream != nil {
+		go state.stream.Abort()
+	}
 	if err := state.process.Terminate(ctx); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		_ = state.process.CloseInput()
 		return err
@@ -414,13 +416,13 @@ func (a *Adapter) respondServerRequest(ctx context.Context, state *sessionState,
 
 func (a *Adapter) readProcess(state *sessionState) {
 	defer state.shutdownOnce.Do(func() { close(state.shutdown) })
-	defer state.closeEvents.Do(func() {
-		state.mu.Lock()
-		state.closed = true
-		state.mu.Unlock()
-		close(state.events)
-	})
 	defer state.resultOnce.Do(func() { close(state.resultReady) })
+	// Single producer (this reader): graceful close after protocol EOF.
+	defer func() {
+		if state.stream != nil {
+			state.stream.CloseGracefully()
+		}
+	}()
 	for line := range state.process.Lines() {
 		a.handleLine(state, line)
 	}
@@ -582,21 +584,14 @@ func (a *Adapter) notificationEvent(state *sessionState, method string, params j
 }
 
 func (a *Adapter) recordEvent(state *sessionState, native adapter.NativeEvent) {
+	// History under session mutex; publication never holds the mutex while
+	// waiting on the public consumer (EventStream owns that).
 	state.mu.Lock()
-	if state.closed {
-		state.mu.Unlock()
-		return
-	}
 	state.history = append(state.history, native)
 	state.mu.Unlock()
-	// Critical lifecycle events block under backpressure; progress may drop.
-	// Shutdown unblocks producers so adapter exit cannot deadlock.
-	protocol.EmitNativeEvent(protocol.EmitOptions{
-		Events:          state.events,
-		Shutdown:        state.shutdown,
-		Mu:              &state.mu,
-		DroppedProgress: &state.droppedProgress,
-	}, native)
+	if state.stream != nil {
+		_ = state.stream.Publish(native)
+	}
 }
 
 func (a *Adapter) removePending(state *sessionState, id int64) {
@@ -617,7 +612,11 @@ func (a *Adapter) requireSession(id string) (*sessionState, error) {
 
 func sessionFromState(state *sessionState) adapter.Session {
 	identity := state.process.Identity()
-	return adapter.Session{NativeSessionID: state.threadID, NativeTurnID: state.turnID, PID: identity.PID, ProcessStartToken: identity.StartToken, Events: state.events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
+	var events <-chan adapter.NativeEvent
+	if state.stream != nil {
+		events = state.stream.Events()
+	}
+	return adapter.Session{NativeSessionID: state.threadID, NativeTurnID: state.turnID, PID: identity.PID, ProcessStartToken: identity.StartToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
 }
 
 func responseID(raw json.RawMessage) string {

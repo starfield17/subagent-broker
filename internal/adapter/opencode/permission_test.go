@@ -10,7 +10,10 @@ import (
 	"sync"
 	"testing"
 
+	"time"
+
 	"github.com/vnai/subagent-broker/internal/adapter"
+	"github.com/vnai/subagent-broker/internal/adapter/protocol"
 	"github.com/vnai/subagent-broker/internal/event"
 )
 
@@ -135,12 +138,12 @@ func TestHandleEventPermissionAskedObjectTool(t *testing.T) {
 	}`)
 	a := New("")
 	state := &sessionState{
-		events:   make(chan adapter.NativeEvent, 4),
+		stream:   protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 4, ProgressQueueLimit: 4}),
 		shutdown: make(chan struct{}),
 	}
 	a.handleEvent(state, sseEvent{Type: "permission.asked", Properties: props})
 	select {
-	case native := <-state.events:
+	case native := <-state.stream.Events():
 		if native.Kind != event.PermissionRequested {
 			t.Fatalf("kind=%s", native.Kind)
 		}
@@ -153,7 +156,7 @@ func TestHandleEventPermissionAskedObjectTool(t *testing.T) {
 		if err := json.Unmarshal(m["id"], &id); err != nil || id != "perm-obj-1" {
 			t.Fatalf("id=%q err=%v payload=%s", id, err, native.Payload)
 		}
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("expected permission event")
 	}
 }
