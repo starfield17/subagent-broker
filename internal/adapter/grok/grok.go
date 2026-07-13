@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -229,9 +230,16 @@ func (a *Adapter) RespondPermission(ctx context.Context, id string, decision ada
 	if err != nil {
 		return err
 	}
-	result := map[string]any{"outcome": "denied"}
-	if decision.Allowed {
-		result = map[string]any{"outcome": "allowed"}
+	// ACP v1: client must select one of the Agent-supplied options by opaque optionId.
+	optionID := strings.TrimSpace(decision.OptionID)
+	if optionID == "" {
+		return fmt.Errorf("Grok ACP permission response requires a native optionId")
+	}
+	result := map[string]any{
+		"outcome": map[string]any{
+			"outcome":  "selected",
+			"optionId": optionID,
+		},
 	}
 	return a.respondServerRequest(ctx, state, decision.RequestID, result)
 }
@@ -380,7 +388,15 @@ func (a *Adapter) request(ctx context.Context, state *sessionState, method strin
 }
 
 func (a *Adapter) respondServerRequest(_ context.Context, state *sessionState, requestID string, result any) error {
-	return state.process.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(requestID), "result": result})
+	if strings.TrimSpace(requestID) == "" {
+		return fmt.Errorf("permission request id is required")
+	}
+	// Preserve numeric vs string JSON-RPC ids (same encoding rules as Codex).
+	var rawID json.RawMessage
+	if err := json.Unmarshal([]byte(requestID), &rawID); err != nil {
+		rawID = json.RawMessage(strconv.Quote(requestID))
+	}
+	return state.process.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": rawID, "result": result})
 }
 
 func (a *Adapter) readProcess(state *sessionState) {

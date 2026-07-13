@@ -225,11 +225,16 @@ func (a *Adapter) RespondPermission(ctx context.Context, id string, decision ada
 	if err != nil {
 		return err
 	}
-	response := "reject"
-	if decision.Allowed {
-		response = "once"
+	if strings.TrimSpace(decision.RequestID) == "" {
+		return fmt.Errorf("permission request id is required")
 	}
-	return a.requestJSON(ctx, state, http.MethodPost, "/session/"+url.PathEscape(state.sessionID)+"/permissions/"+url.PathEscape(decision.RequestID), nil, map[string]string{"response": response}, nil)
+	// OpenCode 1.17.15: POST /permission/{requestID}/reply with {"reply":"once"|"reject"}.
+	// Session id is not part of the route; directory is still attached by requestJSON.
+	reply := "reject"
+	if decision.Allowed {
+		reply = "once"
+	}
+	return a.requestJSON(ctx, state, http.MethodPost, "/permission/"+url.PathEscape(decision.RequestID)+"/reply", nil, map[string]string{"reply": reply}, nil)
 }
 
 func (a *Adapter) GetDiff(ctx context.Context, id string) ([]string, error) {

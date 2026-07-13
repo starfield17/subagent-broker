@@ -71,3 +71,31 @@ Supervisor-level integration coverage (`internal/supervisor/phase4_integration_t
 - Live cancel tree honesty under real process-group failure modes beyond existing process tests
 
 A simple historical `StartSession`/`CollectFinalResult` smoke is **not** treated as evidence for permission, resume, next-turn, or cancellation claims.
+
+## Phase 4 PR 8.7 — native permission wire protocols
+
+Executed on 2026-07-13 after aligning Grok ACP and OpenCode 1.17.15 permission responses:
+
+```bash
+gofmt -w .
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Results: all packages PASS under `go test` and `go test -race`; `go vet` clean; build success.
+
+Protocol fixtures covered (scripted / unit, not live authenticated harnesses):
+
+| Fixture | Coverage |
+|---|---|
+| Grok ACP `session/request_permission` with numeric JSON-RPC `id` | option parse, allow → `selected` + native `optionId`, exact response shape |
+| Grok ACP with string JSON-RPC `id` | id encoding preserved; allow_always / reject_always fallback |
+| Grok missing compatible option | delivery fails; Broker message not `Answered` |
+| OpenCode `permission.asked` with object-valued `tool` | request id extracted; allow/deny → `POST /permission/{id}/reply` with `{"reply":"once"|"reject"}` |
+| OpenCode HTTP failure | not recorded as `Answered` |
+| Codex accept/decline | still `{"decision":"accept"}` / `{"decision":"decline"}` |
+| Claude hook path | protocol events do not enter native `RespondPermission` |
+
+**Live authenticated Grok/OpenCode permission smoke was not performed in this patch.**

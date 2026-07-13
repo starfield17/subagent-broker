@@ -141,6 +141,9 @@ type PermissionDecision struct {
 	RequestID string `json:"request_id"`
 	Allowed   bool   `json:"allowed"`
 	Reason    string `json:"reason,omitempty"`
+	// OptionID is the opaque native option selected for ACP-style responses.
+	// Empty for Codex/OpenCode decision shapes that do not use option IDs.
+	OptionID string `json:"option_id,omitempty"`
 }
 
 type Usage struct {

@@ -200,14 +200,14 @@ func TestNativePermissionAdapterFailureNotRecordedAnswered(t *testing.T) {
 
 func TestParseNativePermissionPayloadJSONRPC(t *testing.T) {
 	raw := json.RawMessage(`{"id":42,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /"}}`)
-	id, tool, input := parseNativePermissionPayload(raw)
-	if id != "42" {
-		t.Fatalf("id=%q", id)
+	p := parseGenericNativePermission(raw)
+	if p.RequestID != "42" {
+		t.Fatalf("id=%q", p.RequestID)
 	}
-	if tool == "" {
+	if p.ToolName == "" {
 		t.Fatal("expected tool/method")
 	}
-	if len(input) == 0 {
+	if len(p.Input) == 0 {
 		t.Fatal("expected input")
 	}
 }

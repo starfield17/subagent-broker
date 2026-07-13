@@ -173,6 +173,14 @@ type ScopeRequestPayload struct {
 	RequiresPublicInterfaceChange bool     `json:"requires_public_interface_change,omitempty"`
 }
 
+// PermissionOption is one native permission choice (e.g. ACP option).
+// OptionID is the opaque protocol id that must be returned on selection.
+type PermissionOption struct {
+	OptionID string `json:"option_id"`
+	Kind     string `json:"kind,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
 type PermissionRequestPayload struct {
 	ToolName string          `json:"tool_name"`
 	Input    json.RawMessage `json:"input"`
@@ -181,6 +189,41 @@ type PermissionRequestPayload struct {
 	Harness            string `json:"harness,omitempty"`
 	NativeSessionID    string `json:"native_session_id,omitempty"`
 	NativePermissionID string `json:"native_permission_id,omitempty"`
+	// NativeOptions carries protocol options (ACP) needed to form a valid response.
+	// Omitted for Claude hooks and Codex; old journals without this field still decode.
+	NativeOptions []PermissionOption `json:"native_options,omitempty"`
+}
+
+// SelectPermissionOptionID chooses a native option by protocol kind for allow/deny.
+// Prefer once over always; never infers from display names when kind is present.
+func SelectPermissionOptionID(options []PermissionOption, allowed bool) (string, error) {
+	if len(options) == 0 {
+		return "", fmt.Errorf("no native permission options available")
+	}
+	prefer := []string{"reject_once", "reject_always"}
+	if allowed {
+		prefer = []string{"allow_once", "allow_always"}
+	}
+	byKind := map[string]string{}
+	for _, opt := range options {
+		kind := strings.TrimSpace(strings.ToLower(opt.Kind))
+		id := strings.TrimSpace(opt.OptionID)
+		if kind == "" || id == "" {
+			continue
+		}
+		if _, exists := byKind[kind]; !exists {
+			byKind[kind] = id
+		}
+	}
+	for _, kind := range prefer {
+		if id := byKind[kind]; id != "" {
+			return id, nil
+		}
+	}
+	if allowed {
+		return "", fmt.Errorf("no compatible allow option among native permission options")
+	}
+	return "", fmt.Errorf("no compatible reject option among native permission options")
 }
 
 type DecisionPayload struct {

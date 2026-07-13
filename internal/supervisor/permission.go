@@ -14,6 +14,14 @@ import (
 	"github.com/vnai/subagent-broker/internal/message"
 )
 
+// nativePermissionParse is the normalized view of a protocol-native permission event.
+type nativePermissionParse struct {
+	RequestID string
+	ToolName  string
+	Input     json.RawMessage
+	Options   []message.PermissionOption
+}
+
 // bridgeNativePermission persists a Broker permission_request for a protocol-native
 // PermissionRequested event. Claude hook-backed permissions still use RequestMessage
 // via the interaction hook and do not go through this path.
@@ -37,8 +45,8 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 		return
 	}
 
-	nativeID, toolName, input := parseNativePermissionPayload(native.Payload)
-	if nativeID == "" {
+	parsed := parseNativePermission(harnessName, native.Payload)
+	if parsed.RequestID == "" {
 		_ = s.appendEvent(event.Input{
 			TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor",
 			Type: "permission.bridge_failed", Severity: "error",
@@ -56,13 +64,15 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 	}
 
 	// Deduplicate: same native request already present (pending or terminal).
-	if existing := s.findPermissionByNativeID(string(runtime.Task.TaskID), sessionID, nativeID); existing != nil {
+	if existing := s.findPermissionByNativeID(string(runtime.Task.TaskID), sessionID, parsed.RequestID); existing != nil {
 		return
 	}
 
+	toolName := parsed.ToolName
 	if toolName == "" {
 		toolName = "unknown"
 	}
+	input := parsed.Input
 	if len(input) == 0 {
 		input = json.RawMessage(`{}`)
 	}
@@ -71,7 +81,8 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 		Input:              input,
 		Harness:            harnessName,
 		NativeSessionID:    sessionID,
-		NativePermissionID: nativeID,
+		NativePermissionID: parsed.RequestID,
+		NativeOptions:      parsed.Options,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -105,7 +116,7 @@ func (s *Service) bridgeNativePermission(runtime *TaskState, harness adapter.Ada
 		Payload: map[string]any{
 			"message_id":           value.MessageID,
 			"type":                 message.PermissionRequest,
-			"native_permission_id": nativeID,
+			"native_permission_id": parsed.RequestID,
 			"harness":              harnessName,
 			"native_session_id":    sessionID,
 		},
@@ -139,6 +150,8 @@ func (s *Service) findPermissionByNativeID(taskID, sessionID, nativeID string) *
 // deliverNativePermissionResponse calls Adapter.RespondPermission when the
 // message carries native routing metadata. Returns (false, nil) when the
 // message is not a native permission request (Claude hook path).
+// Construction/delivery failures return handled=true with an error so the
+// caller never records Answered.
 func (s *Service) deliverNativePermissionResponse(ctx context.Context, value message.Message, resolution message.Resolution) (handled bool, err error) {
 	if value.Type != message.PermissionRequest {
 		return false, nil
@@ -179,96 +192,239 @@ func (s *Service) deliverNativePermissionResponse(ctx context.Context, value mes
 	if sessionID == "" {
 		return true, fmt.Errorf("native session id missing for permission %s", value.MessageID)
 	}
+
 	decision := adapter.PermissionDecision{
 		RequestID: payload.NativePermissionID,
 		Allowed:   resolution.Decision.Allowed,
 		Reason:    resolution.Decision.Reason,
 	}
+	// ACP / option-based harnesses: select opaque optionId before delivery.
+	if len(payload.NativeOptions) > 0 {
+		optionID, optErr := message.SelectPermissionOptionID(payload.NativeOptions, resolution.Decision.Allowed)
+		if optErr != nil {
+			return true, optErr
+		}
+		decision.OptionID = optionID
+	}
+
 	if err := harness.RespondPermission(ctx, sessionID, decision); err != nil {
 		return true, err
 	}
 	return true, nil
 }
 
-// parseNativePermissionPayload extracts a stable native request id, tool name,
-// and input from Codex/Grok JSON-RPC server requests or OpenCode/fake payloads.
-func parseNativePermissionPayload(raw json.RawMessage) (requestID, toolName string, input json.RawMessage) {
+// parseNativePermission dispatches harness-specific normalization, then falls
+// back to a conservative generic parser for fake/Codex fixtures.
+func parseNativePermission(harnessName string, raw json.RawMessage) nativePermissionParse {
+	switch harnessName {
+	case string(adapter.HarnessGrokBuild):
+		if p, ok := parseGrokACPPermission(raw); ok {
+			return p
+		}
+	case string(adapter.HarnessOpenCode):
+		if p, ok := parseOpenCodePermission(raw); ok {
+			return p
+		}
+	}
+	return parseGenericNativePermission(raw)
+}
+
+// parseGrokACPPermission handles session/request_permission JSON-RPC server requests.
+func parseGrokACPPermission(raw json.RawMessage) (nativePermissionParse, bool) {
+	var rpc struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &rpc); err != nil || len(rpc.ID) == 0 {
+		return nativePermissionParse{}, false
+	}
+	// Accept request_permission methods; also allow generic server requests with options.
+	method := strings.ToLower(strings.TrimSpace(rpc.Method))
+	if method != "" && !strings.Contains(method, "permission") && !strings.Contains(method, "request_permission") {
+		// Still try if params carry options (some fixtures).
+	}
+	requestID := normalizeJSONID(rpc.ID)
+	if requestID == "" {
+		return nativePermissionParse{}, false
+	}
+	var params struct {
+		SessionID string `json:"sessionId"`
+		ToolCall  struct {
+			ToolCallID string `json:"toolCallId"`
+			Title      string `json:"title"`
+			Kind       string `json:"kind"`
+		} `json:"toolCall"`
+		Options []struct {
+			OptionID string `json:"optionId"`
+			Name     string `json:"name"`
+			Kind     string `json:"kind"`
+		} `json:"options"`
+	}
+	_ = json.Unmarshal(rpc.Params, &params)
+	toolName := params.ToolCall.Title
+	if toolName == "" {
+		toolName = params.ToolCall.Kind
+	}
+	if toolName == "" {
+		toolName = rpc.Method
+	}
+	input := rpc.Params
+	if params.ToolCall.ToolCallID != "" {
+		input, _ = json.Marshal(params.ToolCall)
+	}
+	options := make([]message.PermissionOption, 0, len(params.Options))
+	for _, opt := range params.Options {
+		if strings.TrimSpace(opt.OptionID) == "" {
+			continue
+		}
+		options = append(options, message.PermissionOption{
+			OptionID: opt.OptionID,
+			Kind:     opt.Kind,
+			Name:     opt.Name,
+		})
+	}
+	return nativePermissionParse{
+		RequestID: requestID,
+		ToolName:  toolName,
+		Input:     input,
+		Options:   options,
+	}, true
+}
+
+// parseOpenCodePermission handles permission.asked SSE properties, including
+// object-valued tool fields. Does not recurse into nested objects for id.
+func parseOpenCodePermission(raw json.RawMessage) (nativePermissionParse, bool) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return "", "", nil
+		return nativePermissionParse{}, false
+	}
+	// Top-level object only — avoid recursive nested id capture.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nativePermissionParse{}, false
+	}
+	requestID := firstStringField(top, "id", "permissionID", "permission_id", "request_id")
+	// If this is a full SSE envelope {type, properties}, unwrap properties once.
+	if requestID == "" {
+		if props, ok := top["properties"]; ok {
+			var nested map[string]json.RawMessage
+			if json.Unmarshal(props, &nested) == nil {
+				requestID = firstStringField(nested, "id", "permissionID", "permission_id", "request_id")
+				if requestID != "" {
+					top = nested
+				}
+			}
+		}
+	}
+	if requestID == "" {
+		return nativePermissionParse{}, false
+	}
+	toolName := firstStringField(top, "tool_name", "title", "name")
+	// tool may be a string or an object (messageID/callID); never require string.
+	if toolName == "" {
+		if toolRaw, ok := top["tool"]; ok {
+			var asString string
+			if json.Unmarshal(toolRaw, &asString) == nil && asString != "" {
+				toolName = asString
+			} else {
+				var toolObj map[string]any
+				if json.Unmarshal(toolRaw, &toolObj) == nil {
+					if v, ok := toolObj["name"].(string); ok && v != "" {
+						toolName = v
+					} else if v, ok := toolObj["callID"].(string); ok && v != "" {
+						toolName = "tool:" + v
+					} else if v, ok := toolObj["callId"].(string); ok && v != "" {
+						toolName = "tool:" + v
+					} else {
+						toolName = "tool"
+					}
+				}
+			}
+		}
+	}
+	// Preserve useful metadata without secrets: keep the flat payload as input.
+	input := raw
+	if props, ok := top["properties"]; ok && len(top) <= 3 {
+		input = props
+	}
+	return nativePermissionParse{
+		RequestID: requestID,
+		ToolName:  toolName,
+		Input:     input,
+	}, true
+}
+
+func firstStringField(m map[string]json.RawMessage, keys ...string) string {
+	for _, key := range keys {
+		raw, ok := m[key]
+		if !ok || len(raw) == 0 {
+			continue
+		}
+		var s string
+		if json.Unmarshal(raw, &s) == nil && strings.TrimSpace(s) != "" {
+			return s
+		}
+		// Numeric ids encoded as JSON numbers.
+		var n json.Number
+		if json.Unmarshal(raw, &n) == nil && n.String() != "" {
+			return n.String()
+		}
+	}
+	return ""
+}
+
+// parseGenericNativePermission covers Codex server requests and flat fake fixtures.
+func parseGenericNativePermission(raw json.RawMessage) nativePermissionParse {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nativePermissionParse{}
 	}
 
-	// JSON-RPC server request (Codex / Grok ACP): {"id":..., "method":"...", "params":{...}}
+	// JSON-RPC server request: {"id":..., "method":"...", "params":{...}}
 	var rpc struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
 	}
 	if err := json.Unmarshal(raw, &rpc); err == nil && len(rpc.ID) > 0 && (rpc.Method != "" || len(rpc.Params) > 0) {
-		requestID = normalizeJSONID(rpc.ID)
-		toolName, input = extractToolFromParams(rpc.Params)
+		requestID := normalizeJSONID(rpc.ID)
+		toolName, input := extractToolFromParams(rpc.Params)
 		if toolName == "" && rpc.Method != "" {
 			toolName = rpc.Method
 		}
 		if requestID != "" {
-			return requestID, toolName, input
+			return nativePermissionParse{RequestID: requestID, ToolName: toolName, Input: input}
 		}
 	}
 
-	// Flat / OpenCode-style / fake payload.
-	var flat struct {
-		ID            json.RawMessage `json:"id"`
-		RequestID     string          `json:"request_id"`
-		PermissionID  string          `json:"permissionID"`
-		PermissionID2 string          `json:"permission_id"`
-		ToolName      string          `json:"tool_name"`
-		Tool          string          `json:"tool"`
-		Title         string          `json:"title"`
-		Input         json.RawMessage `json:"input"`
-		Params        json.RawMessage `json:"params"`
-		Properties    json.RawMessage `json:"properties"`
+	// Flat fake payload: tool may be string; do not fail if tool is object.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nativePermissionParse{}
 	}
-	if err := json.Unmarshal(raw, &flat); err != nil {
-		return "", "", nil
-	}
-	switch {
-	case flat.RequestID != "":
-		requestID = flat.RequestID
-	case flat.PermissionID != "":
-		requestID = flat.PermissionID
-	case flat.PermissionID2 != "":
-		requestID = flat.PermissionID2
-	case len(flat.ID) > 0:
-		requestID = normalizeJSONID(flat.ID)
-	}
-	toolName = flat.ToolName
+	requestID := firstStringField(top, "request_id", "permissionID", "permission_id", "id")
+	toolName := firstStringField(top, "tool_name", "title", "name")
 	if toolName == "" {
-		toolName = flat.Tool
-	}
-	if toolName == "" {
-		toolName = flat.Title
-	}
-	input = flat.Input
-	if len(input) == 0 && len(flat.Params) > 0 {
-		toolName2, input2 := extractToolFromParams(flat.Params)
-		if toolName == "" {
-			toolName = toolName2
-		}
-		input = input2
-	}
-	if len(input) == 0 && len(flat.Properties) > 0 {
-		// Nested OpenCode properties may themselves hold id/tool.
-		nestedID, nestedTool, nestedInput := parseNativePermissionPayload(flat.Properties)
-		if requestID == "" {
-			requestID = nestedID
-		}
-		if toolName == "" {
-			toolName = nestedTool
-		}
-		if len(input) == 0 {
-			input = nestedInput
+		if toolRaw, ok := top["tool"]; ok {
+			var asString string
+			if json.Unmarshal(toolRaw, &asString) == nil {
+				toolName = asString
+			}
 		}
 	}
-	return requestID, toolName, input
+	var input json.RawMessage
+	if in, ok := top["input"]; ok {
+		input = in
+	}
+	if len(input) == 0 {
+		if p, ok := top["params"]; ok {
+			toolName2, input2 := extractToolFromParams(p)
+			if toolName == "" {
+				toolName = toolName2
+			}
+			input = input2
+		}
+	}
+	return nativePermissionParse{RequestID: requestID, ToolName: toolName, Input: input}
 }
 
 func normalizeJSONID(raw json.RawMessage) string {
@@ -284,7 +440,6 @@ func normalizeJSONID(raw json.RawMessage) string {
 	if json.Unmarshal(raw, &asNumber) == nil {
 		return asNumber.String()
 	}
-	// Keep compact JSON form (e.g. quoted already stripped).
 	text := strings.TrimSpace(string(raw))
 	if unquoted, err := strconv.Unquote(text); err == nil {
 		return unquoted
@@ -296,34 +451,30 @@ func extractToolFromParams(params json.RawMessage) (toolName string, input json.
 	if len(params) == 0 {
 		return "", nil
 	}
-	var value struct {
-		ToolName  string          `json:"tool_name"`
-		Tool      string          `json:"tool"`
-		Name      string          `json:"name"`
-		Command   string          `json:"command"`
-		Title     string          `json:"title"`
-		Input     json.RawMessage `json:"input"`
-		Arguments json.RawMessage `json:"arguments"`
-	}
+	// Use map so object-valued tool does not fail the whole unmarshal.
+	var value map[string]json.RawMessage
 	if json.Unmarshal(params, &value) != nil {
 		return "", params
 	}
-	toolName = value.ToolName
+	toolName = firstStringField(value, "tool_name", "name", "title", "command")
 	if toolName == "" {
-		toolName = value.Tool
+		if toolRaw, ok := value["tool"]; ok {
+			var asString string
+			if json.Unmarshal(toolRaw, &asString) == nil {
+				toolName = asString
+			}
+		}
 	}
-	if toolName == "" {
-		toolName = value.Name
-	}
-	if toolName == "" {
-		toolName = value.Title
-	}
-	if toolName == "" && value.Command != "" {
+	if toolName == "" && firstStringField(value, "command") != "" {
 		toolName = "command"
 	}
-	input = value.Input
+	if in, ok := value["input"]; ok {
+		input = in
+	}
 	if len(input) == 0 {
-		input = value.Arguments
+		if args, ok := value["arguments"]; ok {
+			input = args
+		}
 	}
 	if len(input) == 0 {
 		input = params
