@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/vnai/subagent-broker/internal/adapter"
 	"github.com/vnai/subagent-broker/internal/state"
 )
 
@@ -166,13 +167,18 @@ type WorkerSession struct {
 	ExitCode             *int            `json:"exit_code,omitempty"`
 	Capabilities         map[string]bool `json:"capabilities"` // EffectiveCapabilities map form
 	// Capability layers for audit (JSON-friendly maps).
-	DeclaredCapabilities   map[string]bool  `json:"declared_capabilities,omitempty"`
-	ProbeCapabilities      map[string]bool  `json:"probe_capabilities,omitempty"`
-	ConfiguredCapabilities map[string]bool  `json:"configured_capabilities,omitempty"`
-	CapabilityDowngrades   []string         `json:"capability_downgrades,omitempty"`
-	PermissionMode         string           `json:"permission_mode,omitempty"`
-	HooksInstalled         bool             `json:"hooks_installed,omitempty"`
-	Attempt                int              `json:"attempt"`
-	AttemptMode            string           `json:"attempt_mode,omitempty"`
-	StatusDimensions       state.Dimensions `json:"status_dimensions"`
+	DeclaredCapabilities   map[string]bool `json:"declared_capabilities,omitempty"`
+	ProbeCapabilities      map[string]bool `json:"probe_capabilities,omitempty"`
+	ConfiguredCapabilities map[string]bool `json:"configured_capabilities,omitempty"`
+	CapabilityDowngrades   []string        `json:"capability_downgrades,omitempty"`
+	// RuntimeIdentity is Supervisor/Adapter evidence, not part of the Result
+	// Envelope. RequestedModel is retained even when native observations are
+	// unavailable; observed fields are never populated from the request.
+	RuntimeIdentity  adapter.RuntimeIdentity `json:"runtime_identity,omitempty"`
+	IdentityWarnings []string                `json:"identity_warnings,omitempty"`
+	PermissionMode   string                  `json:"permission_mode,omitempty"`
+	HooksInstalled   bool                    `json:"hooks_installed,omitempty"`
+	Attempt          int                     `json:"attempt"`
+	AttemptMode      string                  `json:"attempt_mode,omitempty"`
+	StatusDimensions state.Dimensions        `json:"status_dimensions"`
 }

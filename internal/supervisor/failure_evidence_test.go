@@ -156,6 +156,9 @@ func TestFailureEvidencePreservesWorkspaceObservationAndRunLink(t *testing.T) {
 	if err := json.Unmarshal(raw, &evidence); err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(string(raw), `"result_observed": true`) {
+		t.Fatalf("invalid collected result must record exact result_observed=true JSON: %s", raw)
+	}
 	if evidence.Workspace.BaselineSource != "wave" || !evidence.Workspace.DiffAvailable {
 		t.Fatalf("unexpected baseline evidence: %+v", evidence.Workspace)
 	}
@@ -227,6 +230,13 @@ func TestGenericFailureReportLeavesOwnershipUnverified(t *testing.T) {
 	var failed report.Envelope
 	if err := json.Unmarshal(mustReadReportEnvelope(t, paths.Root), &failed); err != nil {
 		t.Fatal(err)
+	}
+	evidenceRaw, err := os.ReadFile(paths.FailureEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(evidenceRaw), `"result_observed": false`) {
+		t.Fatalf("start failure must record exact result_observed=false JSON: %s", evidenceRaw)
 	}
 	if len(failed.FilesChanged) != 0 {
 		t.Fatalf("generic failure report claimed files: %+v", failed.FilesChanged)

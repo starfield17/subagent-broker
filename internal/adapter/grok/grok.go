@@ -27,23 +27,24 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu             sync.Mutex
-	process        *transport.Process
-	acpSessionID   string
-	workerID       string
-	stream         *protocol.EventStream
-	resultReady    chan struct{}
-	resultSignaled bool
-	shutdown       chan struct{}
-	shutdownOnce   sync.Once
-	history        []adapter.NativeEvent
-	output         strings.Builder
-	final          []byte
-	resultError    string
-	usage          adapter.Usage
-	nextID         int64
-	pending        map[int64]chan rpcMessage
-	serverRequest  map[string]struct{}
+	mu              sync.Mutex
+	process         *transport.Process
+	acpSessionID    string
+	workerID        string
+	runtimeIdentity adapter.RuntimeIdentity
+	stream          *protocol.EventStream
+	resultReady     chan struct{}
+	resultSignaled  bool
+	shutdown        chan struct{}
+	shutdownOnce    sync.Once
+	history         []adapter.NativeEvent
+	output          strings.Builder
+	final           []byte
+	resultError     string
+	usage           adapter.Usage
+	nextID          int64
+	pending         map[int64]chan rpcMessage
+	serverRequest   map[string]struct{}
 	// Multi-turn generation: only the latest generation may finalize results.
 	generation     uint64
 	promptInFlight bool
@@ -136,6 +137,11 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 256, ProgressQueueLimit: 256}),
 		resultReady: make(chan struct{}), shutdown: make(chan struct{}),
 		pending: map[int64]chan rpcMessage{}, serverRequest: map[string]struct{}{},
+		runtimeIdentity: adapter.RuntimeIdentity{
+			RequestedModel: req.Model,
+			ProviderSource: adapter.EvidenceUnavailable,
+			ModelSource:    adapter.EvidenceUnavailable,
+		},
 	}
 	go a.readProcess(state)
 	if _, err := a.request(ctx, state, "initialize", map[string]any{
@@ -241,6 +247,16 @@ func (a *Adapter) ReadHistory(_ context.Context, id string) ([]adapter.NativeEve
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	return append([]adapter.NativeEvent(nil), state.history...), nil
+}
+
+func (a *Adapter) RuntimeIdentity(_ context.Context, id string) (adapter.RuntimeIdentity, error) {
+	state, err := a.requireSession(id)
+	if err != nil {
+		return adapter.RuntimeIdentity{}, err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.runtimeIdentity, nil
 }
 
 func (a *Adapter) RespondPermission(ctx context.Context, id string, decision adapter.PermissionDecision) error {
@@ -547,6 +563,7 @@ func (a *Adapter) request(ctx context.Context, state *sessionState, method strin
 		if len(message.Error) > 0 && string(message.Error) != "null" {
 			return nil, fmt.Errorf("%s: %s", method, string(message.Error))
 		}
+		a.captureRuntimeIdentity(state, message.Result)
 		return message.Result, nil
 	case <-ctx.Done():
 		a.removePending(state, id)
@@ -619,6 +636,7 @@ func (a *Adapter) handleLine(state *sessionState, line []byte) {
 		return
 	}
 	now := time.Now().UTC()
+	a.captureRuntimeIdentity(state, message.Params)
 	if message.Method == "session/update" {
 		var value struct {
 			Update struct {
@@ -669,6 +687,58 @@ func (a *Adapter) handleLine(state *sessionState, line []byte) {
 	a.recordEvent(state, adapter.NativeEvent{Kind: kind, Timestamp: now, Payload: append([]byte(nil), line...)})
 }
 
+func (a *Adapter) captureRuntimeIdentity(state *sessionState, payload []byte) {
+	var value struct {
+		Provider    string `json:"provider"`
+		ProviderID  string `json:"providerId"`
+		ProviderID2 string `json:"provider_id"`
+		Model       string `json:"model"`
+		ModelID     string `json:"modelId"`
+		ModelID2    string `json:"model_id"`
+		ModelID3    string `json:"modelID"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &value) != nil {
+		return
+	}
+	provider := strings.TrimSpace(value.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(value.ProviderID)
+	}
+	if provider == "" {
+		provider = strings.TrimSpace(value.ProviderID2)
+	}
+	model := strings.TrimSpace(value.Model)
+	if model == "" {
+		model = strings.TrimSpace(value.ModelID)
+	}
+	if model == "" {
+		model = strings.TrimSpace(value.ModelID2)
+	}
+	if model == "" {
+		model = strings.TrimSpace(value.ModelID3)
+	}
+	nativeProvider, nativeModel := adapter.RuntimeIdentityFields(payload)
+	if provider == "" {
+		provider = nativeProvider
+	}
+	if model == "" {
+		model = nativeModel
+	}
+	if provider == "" && model == "" {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if provider != "" {
+		state.runtimeIdentity.ObservedProvider = provider
+		state.runtimeIdentity.ProviderSource = adapter.EvidenceNativeProtocol
+	}
+	if model != "" {
+		state.runtimeIdentity.ObservedModel = model
+		state.runtimeIdentity.ModelSource = adapter.EvidenceNativeProtocol
+	}
+}
+
 func (a *Adapter) recordEvent(state *sessionState, native adapter.NativeEvent) {
 	state.mu.Lock()
 	state.history = append(state.history, native)
@@ -700,7 +770,7 @@ func sessionFromState(state *sessionState) adapter.Session {
 	if state.stream != nil {
 		events = state.stream.Events()
 	}
-	return adapter.Session{NativeSessionID: state.acpSessionID, PID: i.PID, ProcessStartToken: i.StartToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
+	return adapter.Session{NativeSessionID: state.acpSessionID, PID: i.PID, ProcessStartToken: i.StartToken, ProcessGroupToken: i.ProcessGroupToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
 }
 
 func responseSessionID(raw json.RawMessage) string {

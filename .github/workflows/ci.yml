@@ -43,6 +43,10 @@ jobs:
         timeout-minutes: 20
         run: go test -race ./internal/adapter/... ./internal/message/... ./internal/supervisor/... -count=5
 
+      - name: Doctor fake race stress
+        timeout-minutes: 10
+        run: go test -race ./internal/doctor/... -count=20
+
       - name: Production-path worker identity regressions
         timeout-minutes: 10
         run: go test -race ./cmd/subagent-broker -run 'TestMCPWorkerEnvIdentity|TestClaudeHookEnvIdentity|TestWorkerIdentityMismatch' -count=3

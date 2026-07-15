@@ -71,12 +71,49 @@ Workers may read the project, but may only write within the approved scope. When
 
 ## Operator workflow
 
-Build and probe all available Harnesses before dispatching:
+Build and statically probe all available Harnesses before dispatching. The
+ordinary `doctor` command does not start an authenticated model session:
 
 ```bash
 go build -o /tmp/subagent-broker ./cmd/subagent-broker
 /tmp/subagent-broker doctor
 ```
+
+Doctor reports evidence levels separately. A declared or probe-reported
+capability is not runtime-verified, and a requested model is not an observed
+runtime model. Unknown provider/model identity remains unknown. Doctor never
+prints or persists authentication tokens, API keys, raw authorization headers,
+full environments, or control/Worker credentials.
+
+The opt-in live smoke makes one authenticated model request per selected
+Harness, so it may consume tokens, incur provider cost, and require network
+access. Each smoke uses a fresh isolated temporary workspace and removes it
+only after cleanup is confirmed. Use `--keep-workspace` to retain it for
+inspection:
+
+```bash
+subagent-broker doctor --harness all
+
+subagent-broker doctor \
+  --harness codex \
+  --smoke \
+  --timeout 2m
+
+subagent-broker doctor \
+  --harness claude-code \
+  --smoke \
+  --model <model-name> \
+  --keep-workspace
+```
+
+Live smoke defaults are `--smoke=false`, `--timeout=2m`, and
+`--keep-workspace=false`. `--executable` and `--model` require a single
+Harness; `--harness all --smoke` runs selected Harnesses serially. The basic
+smoke exercises session startup, structured events, the current-turn terminal
+boundary, structured final output, result Task/Worker binding, and cleanup.
+It does not verify resume, steering, bidirectional streaming, permissions,
+interrupts, cancellation, diffs, usage, hooks, history, native subagents,
+native server mode, or ACP-specific behavior.
 
 Dispatch accepts the legacy Task array as one Wave or an ordered plan containing `waves`, per-Wave `integration_checks`, and optional `final_checks`.
 

@@ -57,6 +57,10 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	if err != nil {
 		return err
 	}
+	model := s.config.Model
+	if runtime.Task.ModelPreference != "" {
+		model = runtime.Task.ModelPreference
+	}
 
 	workerID := fmt.Sprintf("worker-%d", time.Now().UTC().UnixNano())
 	capSet := s.computeSessionCapabilities(harness, runtime.Task)
@@ -69,8 +73,13 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		ProbeCapabilities:      adapter.CapabilityMap(capSet.Probe),
 		ConfiguredCapabilities: adapter.CapabilityMap(capSet.Configured),
 		CapabilityDowngrades:   append([]string(nil), capSet.Downgrades...),
-		PermissionMode:         s.config.PermissionMode,
-		HooksInstalled:         capSet.Configured.Hooks,
+		RuntimeIdentity: adapter.RuntimeIdentity{
+			RequestedModel: model,
+			ProviderSource: adapter.EvidenceUnavailable,
+			ModelSource:    adapter.EvidenceUnavailable,
+		},
+		PermissionMode: s.config.PermissionMode,
+		HooksInstalled: capSet.Configured.Hooks,
 		StatusDimensions: state.Dimensions{
 			Process: state.ProcessStarting, Protocol: state.ProtocolInitializing,
 			Progress: state.ProgressActive, Task: state.TaskRunning,
@@ -152,10 +161,6 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	options := map[string]string{"permission_mode": s.config.PermissionMode, "max_turns": fmt.Sprintf("%d", s.config.MaxTurns), "scenario": s.config.Scenario}
 	if s.config.SafeMode {
 		options["safe_mode"] = "true"
-	}
-	model := s.config.Model
-	if runtime.Task.ModelPreference != "" {
-		model = runtime.Task.ModelPreference
 	}
 	runID := s.Snapshot().Run.RunID
 	prompt := buildWorkerPrompt(runtime.Task, runID, workerID)
@@ -281,6 +286,9 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		return err
 	}
 	s.refreshTaskRuntime(runtime)
+	// Runtime identity is optional evidence. A provider error is recorded as a
+	// warning/evidence gap and never changes the selected model or run outcome.
+	s.refreshWorkerRuntimeIdentity(runtime, harness, session.NativeSessionID, "session_start")
 	if err := s.appendEvent(event.Input{TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.SessionStarted, Severity: "info"}); err != nil {
 		return err
 	}
@@ -299,6 +307,7 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		return drainErr
 	}
 	s.refreshTaskRuntime(runtime)
+	s.refreshWorkerRuntimeIdentity(runtime, harness, session.NativeSessionID, "result_boundary")
 
 	if sessionResult.Resolution.OrphanRisk || sessionResult.Resolution.ProcessState == state.ProcessOrphaned || sessionResult.Resolution.ProcessState == state.ProcessUnknown {
 		// Cannot forge success; surface as failure with honest process state already committed.
@@ -331,10 +340,11 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 
 	result, err := harness.CollectFinalResult(context.Background(), session.NativeSessionID)
 	if err != nil {
-		return s.failTask(runtime, "result", err)
+		return s.failTaskWithEvidence(runtime, "result", err, true)
 	}
+	s.refreshWorkerRuntimeIdentity(runtime, harness, session.NativeSessionID, "result_collected")
 	if result.TaskID != string(runtime.Task.TaskID) || result.WorkerID != workerID {
-		return s.failTask(runtime, "result", fmt.Errorf("result identity mismatch: task=%q worker=%q", result.TaskID, result.WorkerID))
+		return s.failTaskWithEvidence(runtime, "result", fmt.Errorf("result identity mismatch: task=%q worker=%q", result.TaskID, result.WorkerID), true)
 	}
 	if latest, ok := s.taskState(runtime.Task.TaskID); ok {
 		runtime.Task.WriteScope = append([]string(nil), latest.Task.WriteScope...)
@@ -343,13 +353,13 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 	taskDir := s.taskDir(runtime.Task)
 	attemptNumber := reportAttemptNumber(runtime)
 	if err := report.Publish(taskDir, result, attemptNumber, time.Now().UTC()); err != nil {
-		return s.failTask(runtime, "result_validation", err)
+		return s.failTaskWithEvidence(runtime, "result_validation", err, true)
 	}
 	runtime.ReportPath = filepath.Join(taskDir, "report.md")
 	// Freeze producing-attempt identity at publication time (not Barrier-time latest).
 	meta, _, verifyErr := report.VerifyDiskArtifacts(taskDir)
 	if verifyErr != nil {
-		return s.failTask(runtime, "result_validation", verifyErr)
+		return s.failTaskWithEvidence(runtime, "result_validation", verifyErr, true)
 	}
 	reportID := ReportIdentity{
 		TaskID: meta.TaskID, WorkerID: meta.WorkerID, AttemptNumber: meta.AttemptNumber,
@@ -361,14 +371,14 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 		attemptOutcome = workerpkg.AttemptOrphaned
 	}
 	if finErr := s.finishAttempt(runtime, attemptOutcome, "result collected"); finErr != nil {
-		return finErr
+		return s.failTaskWithEvidence(runtime, "attempt", finErr, true)
 	}
 	// Re-apply frozen identity after finishAttempt (refresh may have overwritten runtime).
 	s.refreshTaskRuntime(runtime)
 	runtime.ReportPath = filepath.Join(taskDir, "report.md")
 	runtime.ReportIdentity = &reportID
 	if err := s.saveRuntime(*runtime); err != nil {
-		return err
+		return s.failTaskWithEvidence(runtime, "result_validation", err, true)
 	}
 	if err := s.appendEvent(event.Input{
 		TaskID: string(runtime.Task.TaskID), WorkerID: workerID, Source: "supervisor", Type: event.ReportPublished, Severity: "info",
@@ -377,7 +387,7 @@ func (s *Service) executeTask(parent context.Context, runtime *TaskState) error 
 			"envelope_hash": reportID.EnvelopeHash, "markdown_hash": reportID.MarkdownHash,
 		},
 	}); err != nil {
-		return err
+		return s.failTaskWithEvidence(runtime, "result_validation", err, true)
 	}
 	return s.applyResultEnvelope(runtime, result, workerID)
 }
@@ -969,6 +979,6 @@ func (s *Service) applyResultEnvelope(runtime *TaskState, result report.Envelope
 		})
 
 	default:
-		return s.failTask(runtime, "result", fmt.Errorf("unknown result status %q", result.Status))
+		return s.failTaskWithEvidence(runtime, "result", fmt.Errorf("unknown result status %q", result.Status), true)
 	}
 }

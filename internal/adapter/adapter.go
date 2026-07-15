@@ -66,6 +66,34 @@ type ProbeResult struct {
 	Warnings      []string     `json:"warnings,omitempty"`
 }
 
+// EvidenceSource identifies where an identity fact came from. Configuration
+// and descriptor values are expectations; they are never runtime observations.
+type EvidenceSource string
+
+const (
+	EvidenceNativeProtocol  EvidenceSource = "native_protocol"
+	EvidenceHarnessMetadata EvidenceSource = "harness_metadata"
+	EvidenceRequestedConfig EvidenceSource = "requested_config"
+	EvidenceUnavailable     EvidenceSource = "unavailable"
+)
+
+// RuntimeIdentity contains runtime facts without conflating them with the
+// requested model or the Harness descriptor. Empty observed fields are
+// intentional: a protocol that does not expose a fact remains unavailable.
+type RuntimeIdentity struct {
+	RequestedModel   string         `json:"requested_model,omitempty"`
+	ObservedProvider string         `json:"observed_provider,omitempty"`
+	ObservedModel    string         `json:"observed_model,omitempty"`
+	ProviderSource   EvidenceSource `json:"provider_source,omitempty"`
+	ModelSource      EvidenceSource `json:"model_source,omitempty"`
+}
+
+// RuntimeIdentityProvider is optional so existing and test adapters do not
+// need a new parameter on every core Adapter operation.
+type RuntimeIdentityProvider interface {
+	RuntimeIdentity(context.Context, string) (RuntimeIdentity, error)
+}
+
 type StartRequest struct {
 	RunID       string            `json:"run_id"`
 	TaskID      string            `json:"task_id"`
@@ -113,6 +141,7 @@ type Session struct {
 	NativeTurnID      string             `json:"native_turn_id,omitempty"`
 	PID               int                `json:"pid,omitempty"`
 	ProcessStartToken string             `json:"process_start_token,omitempty"`
+	ProcessGroupToken string             `json:"process_group_token,omitempty"`
 	Events            <-chan NativeEvent `json:"-"`
 	Exited            <-chan ExitStatus  `json:"-"`
 	Stderr            <-chan OutputChunk `json:"-"`

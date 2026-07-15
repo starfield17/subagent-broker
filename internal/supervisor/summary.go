@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vnai/subagent-broker/internal/adapter"
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/message"
 	"github.com/vnai/subagent-broker/internal/stall"
@@ -47,15 +48,17 @@ type WaveSummaryEntry struct {
 }
 
 type TaskSummaryEntry struct {
-	TaskID              string            `json:"task_id"`
-	Status              string            `json:"status"`
-	BlockKind           string            `json:"block_kind,omitempty"`
-	ReportPath          string            `json:"report_path,omitempty"`
-	FailureEvidencePath string            `json:"failure_evidence_path,omitempty"`
-	Attempts            int               `json:"attempts"`
-	LastError           string            `json:"last_error,omitempty"`
-	WriteScope          []string          `json:"write_scope,omitempty"`
-	Stall               *stall.Assessment `json:"stall_assessment,omitempty"`
+	TaskID              string                   `json:"task_id"`
+	Status              string                   `json:"status"`
+	BlockKind           string                   `json:"block_kind,omitempty"`
+	ReportPath          string                   `json:"report_path,omitempty"`
+	FailureEvidencePath string                   `json:"failure_evidence_path,omitempty"`
+	Attempts            int                      `json:"attempts"`
+	LastError           string                   `json:"last_error,omitempty"`
+	WriteScope          []string                 `json:"write_scope,omitempty"`
+	Stall               *stall.Assessment        `json:"stall_assessment,omitempty"`
+	RuntimeIdentity     *adapter.RuntimeIdentity `json:"runtime_identity,omitempty"`
+	IdentityWarnings    []string                 `json:"identity_warnings,omitempty"`
 }
 
 type MessageSummaryEntry struct {
@@ -142,6 +145,12 @@ func (s *Service) buildRunSummary(baseline verify.WorkspaceSnapshot) (RunSummary
 			WriteScope: append([]string(nil), runtime.Task.WriteScope...),
 			Stall:      runtime.Stall,
 		})
+		if runtime.Worker != nil {
+			entry := &summary.Tasks[len(summary.Tasks)-1]
+			identity := runtime.Worker.RuntimeIdentity
+			entry.RuntimeIdentity = &identity
+			entry.IdentityWarnings = append([]string(nil), runtime.Worker.IdentityWarnings...)
+		}
 		if failureEvidencePath != "" {
 			summary.FailureEvidence = append(summary.FailureEvidence, failureEvidencePath)
 		}
@@ -213,6 +222,9 @@ func renderAggregatedSummary(summary RunSummary) string {
 		}
 		if t.LastError != "" {
 			fmt.Fprintf(&b, "- Error: %s\n", t.LastError)
+		}
+		if t.RuntimeIdentity != nil {
+			fmt.Fprintf(&b, "- Requested model: `%s`\n- Observed provider: `%s`\n- Observed model: `%s`\n- Identity evidence source: provider=`%s`, model=`%s`\n", displayEvidence(t.RuntimeIdentity.RequestedModel), displayEvidence(t.RuntimeIdentity.ObservedProvider), displayEvidence(t.RuntimeIdentity.ObservedModel), displayEvidence(string(t.RuntimeIdentity.ProviderSource)), displayEvidence(string(t.RuntimeIdentity.ModelSource)))
 		}
 		if t.Stall != nil {
 			fmt.Fprintf(&b, "- Progress assessment: `%s`\n- Stall confidence: `%s`\n- Stall reason: %s\n", t.Stall.State, t.Stall.Confidence, t.Stall.Reason)

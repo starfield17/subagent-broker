@@ -33,27 +33,28 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu             sync.Mutex
-	process        *transport.Process
-	baseURL        string
-	directory      string
-	sessionID      string
-	workerID       string
-	stream         *protocol.EventStream
-	resultReady    chan struct{}
-	resultOnce     sync.Once
-	finishOnce     sync.Once
-	shutdown       chan struct{}
-	shutdownOnce   sync.Once
-	history        []adapter.NativeEvent
-	final          []byte
-	resultError    string
-	usage          adapter.Usage
-	generation     uint64
-	promptInFlight bool
-	promptGen      uint64
-	resultSignaled bool
-	currentTurn    *ocTurnResult
+	mu              sync.Mutex
+	process         *transport.Process
+	baseURL         string
+	directory       string
+	sessionID       string
+	workerID        string
+	stream          *protocol.EventStream
+	resultReady     chan struct{}
+	resultOnce      sync.Once
+	finishOnce      sync.Once
+	shutdown        chan struct{}
+	shutdownOnce    sync.Once
+	history         []adapter.NativeEvent
+	final           []byte
+	resultError     string
+	usage           adapter.Usage
+	runtimeIdentity adapter.RuntimeIdentity
+	generation      uint64
+	promptInFlight  bool
+	promptGen       uint64
+	resultSignaled  bool
+	currentTurn     *ocTurnResult
 	// SSE producer coordination with watchExit.
 	sseDone chan struct{}
 }
@@ -93,10 +94,12 @@ type sseEvent struct {
 // Message identity and session ownership live under info, never top-level id.
 type openCodeMessage struct {
 	Info struct {
-		ID        string `json:"id"`
-		SessionID string `json:"sessionID"`
-		Role      string `json:"role"`
-		Tokens    struct {
+		ID         string `json:"id"`
+		SessionID  string `json:"sessionID"`
+		Role       string `json:"role"`
+		ProviderID string `json:"providerID"`
+		ModelID    string `json:"modelID"`
+		Tokens     struct {
 			Input     int64 `json:"input"`
 			Output    int64 `json:"output"`
 			Reasoning int64 `json:"reasoning"`
@@ -219,6 +222,11 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 256, ProgressQueueLimit: 256}),
 		resultReady: make(chan struct{}), shutdown: make(chan struct{}),
 		sseDone: make(chan struct{}),
+		runtimeIdentity: adapter.RuntimeIdentity{
+			RequestedModel: req.Model,
+			ProviderSource: adapter.EvidenceUnavailable,
+			ModelSource:    adapter.EvidenceUnavailable,
+		},
 	}
 	go a.drainServerOutput(p)
 	go a.watchExit(state)
@@ -308,6 +316,23 @@ func (a *Adapter) ReadHistory(ctx context.Context, id string) ([]adapter.NativeE
 		result = append(result, adapter.NativeEvent{Kind: event.ModelMessageCompleted, Timestamp: time.Now().UTC(), Payload: message})
 	}
 	return result, nil
+}
+
+func (a *Adapter) RuntimeIdentity(_ context.Context, id string) (adapter.RuntimeIdentity, error) {
+	state, err := a.requireSession(id)
+	if err != nil {
+		return adapter.RuntimeIdentity{}, err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	identity := state.runtimeIdentity
+	if identity.ProviderSource == "" {
+		identity.ProviderSource = adapter.EvidenceUnavailable
+	}
+	if identity.ModelSource == "" {
+		identity.ModelSource = adapter.EvidenceUnavailable
+	}
+	return identity, nil
 }
 
 func (a *Adapter) RespondPermission(ctx context.Context, id string, decision adapter.PermissionDecision) error {
@@ -906,6 +931,7 @@ func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) (col
 	var firstInvalidUsage adapter.Usage
 	for i := len(messages) - 1; i >= 0; i-- {
 		message := messages[i]
+		a.captureRuntimeIdentity(state, message.Info.ProviderID, message.Info.ModelID)
 		// Validate ownership before examining result contents.
 		if err := validateOpenCodeMessage(message, state.sessionID); err != nil {
 			return collectedTurnResult{}, err
@@ -950,6 +976,24 @@ func (a *Adapter) collectFinalTurn(state *sessionState, turn *ocTurnResult) (col
 	}
 	// No attributable current-turn assistant output.
 	return collectedTurnResult{}, nil
+}
+
+func (a *Adapter) captureRuntimeIdentity(state *sessionState, provider, model string) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" && model == "" {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if provider != "" {
+		state.runtimeIdentity.ObservedProvider = provider
+		state.runtimeIdentity.ProviderSource = adapter.EvidenceNativeProtocol
+	}
+	if model != "" {
+		state.runtimeIdentity.ObservedModel = model
+		state.runtimeIdentity.ModelSource = adapter.EvidenceNativeProtocol
+	}
 }
 
 func (a *Adapter) requestJSON(ctx context.Context, state *sessionState, method, route string, query url.Values, body any, target any) error {
@@ -1053,5 +1097,5 @@ func sessionFromState(state *sessionState) adapter.Session {
 	if state.stream != nil {
 		events = state.stream.Events()
 	}
-	return adapter.Session{NativeSessionID: state.sessionID, PID: i.PID, ProcessStartToken: i.StartToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
+	return adapter.Session{NativeSessionID: state.sessionID, PID: i.PID, ProcessStartToken: i.StartToken, ProcessGroupToken: i.ProcessGroupToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
 }

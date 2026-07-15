@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 	"github.com/vnai/subagent-broker/internal/adapter/opencode"
 	"github.com/vnai/subagent-broker/internal/clioutcome"
 	"github.com/vnai/subagent-broker/internal/cliread"
+	doctorpkg "github.com/vnai/subagent-broker/internal/doctor"
 	"github.com/vnai/subagent-broker/internal/domain"
 	"github.com/vnai/subagent-broker/internal/event"
 	"github.com/vnai/subagent-broker/internal/interaction"
@@ -41,10 +41,18 @@ func main() {
 	os.Exit(runMain(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+var commandOutput io.Writer = os.Stdout
+
+var runDoctor = func(ctx context.Context, registry *adapter.Registry, cfg doctorpkg.Config) (doctorpkg.RunResult, error) {
+	return doctorpkg.Run(ctx, registry, cfg)
+}
+
 // runMain executes a CLI invocation and returns a stable process exit code.
 // Tests call this instead of os.Exit.
 func runMain(args []string, stdout, stderr io.Writer) int {
-	_ = stdout // command bodies still write to os.Stdout; error path is testable.
+	previousOutput := commandOutput
+	commandOutput = stdout
+	defer func() { commandOutput = previousOutput }()
 	err := execute(args)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -1177,59 +1185,45 @@ func doctorCommand(args []string) error {
 	flags.SetOutput(io.Discard)
 	harness := flags.String("harness", "all", "harness name or all")
 	executable := flags.String("executable", "", "harness executable override")
+	smoke := flags.Bool("smoke", false, "perform an authenticated live model smoke")
+	timeout := flags.Duration("timeout", 2*time.Minute, "live smoke timeout per Harness")
+	model := flags.String("model", "", "requested model for a single Harness smoke")
+	brokerHome := flags.String("broker-home", "", "Broker Home override")
+	keepWorkspace := flags.Bool("keep-workspace", false, "retain an isolated smoke workspace")
 	if err := flags.Parse(args); err != nil {
 		return usageWrap("doctor", err)
 	}
+	if *timeout <= 0 {
+		return clioutcome.New(clioutcome.ExitUsage, "doctor", "--timeout must be positive", nil)
+	}
+	if *harness == "all" && (strings.TrimSpace(*executable) != "" || strings.TrimSpace(*model) != "") {
+		return clioutcome.New(clioutcome.ExitUsage, "doctor", "--executable and --model require a single Harness; they cannot be used with --harness all", nil)
+	}
+	if *harness != "all" && !supportedHarness(*harness) {
+		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", fmt.Sprintf("unsupported harness %q", *harness), nil)
+	}
+	home, err := resolveBrokerHome(*brokerHome)
+	if err != nil {
+		return usageWrap("doctor", err)
+	}
 	adapters := registry(*executable)
-	descriptors := adapters.Descriptors()
-	selected := descriptors
+	cfg := doctorpkg.Config{Mode: doctorpkg.ModeProbe, Executable: *executable, Model: *model, BrokerHome: home, Timeout: *timeout, KeepWorkspace: *keepWorkspace}
+	if *smoke {
+		cfg.Mode = doctorpkg.ModeSmoke
+	}
 	if *harness != "all" {
-		if !supportedHarness(*harness) {
-			return clioutcome.New(clioutcome.ExitCompatibility, "doctor", fmt.Sprintf("unsupported harness %q", *harness), nil)
-		}
-		selected = nil
-		if value, ok := adapters.Get(adapter.HarnessName(*harness)); ok {
-			selected = []adapter.Descriptor{value.Descriptor()}
-		}
+		cfg.Harnesses = []adapter.HarnessName{adapter.HarnessName(*harness)}
 	}
-	type doctorItem struct {
-		Harness       adapter.HarnessName  `json:"harness"`
-		Implemented   bool                 `json:"implemented"`
-		Compatibility string               `json:"compatibility"`
-		Installed     bool                 `json:"installed"`
-		Version       string               `json:"version,omitempty"`
-		Authenticated *bool                `json:"authenticated,omitempty"`
-		Capabilities  adapter.Capabilities `json:"capabilities"`
-		Warnings      []string             `json:"warnings,omitempty"`
-	}
-	items := make([]doctorItem, 0, len(selected))
-	failed := false
-	for _, descriptor := range selected {
-		value, ok := adapters.Get(descriptor.Name)
-		if !ok {
-			failed = true
-			continue
-		}
-		probe, probeErr := value.Probe(context.Background(), adapter.ProbeRequest{Executable: *executable})
-		if probeErr != nil {
-			probe.Compatibility = "probe_failed"
-			probe.Warnings = append(probe.Warnings, probeErr.Error())
-		}
-		items = append(items, doctorItem{Harness: descriptor.Name, Implemented: descriptor.RuntimeImplemented, Compatibility: probe.Compatibility, Installed: probe.Installed, Version: probe.Version, Authenticated: probe.Authenticated, Capabilities: probe.Capabilities, Warnings: probe.Warnings})
-		if !probe.Installed || probe.Compatibility == "incompatible" || probe.Compatibility == "probe_failed" || probe.Compatibility == "unavailable" || (probe.Authenticated != nil && !*probe.Authenticated) {
-			failed = true
-		}
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Harness < items[j].Harness })
-	encoder := json.NewEncoder(os.Stdout)
+	result, runErr := runDoctor(context.Background(), adapters, cfg)
+	result = doctorpkg.SanitizeResult(result)
+	encoder := json.NewEncoder(commandOutput)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(struct {
-		Harnesses []doctorItem `json:"harnesses"`
-	}{Harnesses: items}); err != nil {
+	if err := encoder.Encode(result); err != nil {
 		return err
 	}
-	if failed {
-		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", "one or more requested Harnesses are unavailable, unauthenticated, or failed probe", nil)
+	if runErr != nil {
+		runErr = doctorpkg.SanitizeError(runErr)
+		return clioutcome.New(clioutcome.ExitCompatibility, "doctor", runErr.Error(), runErr)
 	}
 	return nil
 }

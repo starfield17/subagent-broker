@@ -35,24 +35,25 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu            sync.Mutex
-	id            string
-	cmd           *exec.Cmd
-	stdin         io.WriteCloser
-	events        chan adapter.NativeEvent
-	exited        chan adapter.ExitStatus
-	stderr        chan adapter.OutputChunk
-	resultReady   chan struct{}
-	resultOnce    sync.Once
-	result        json.RawMessage
-	resultSubtype string
-	usage         adapter.Usage
-	history       []adapter.NativeEvent
-	identity      process.Identity
-	projectRoot   string
-	closed        bool
-	closeEvents   sync.Once
-	closeStderr   sync.Once
+	mu              sync.Mutex
+	id              string
+	cmd             *exec.Cmd
+	stdin           io.WriteCloser
+	events          chan adapter.NativeEvent
+	exited          chan adapter.ExitStatus
+	stderr          chan adapter.OutputChunk
+	resultReady     chan struct{}
+	resultOnce      sync.Once
+	result          json.RawMessage
+	resultSubtype   string
+	usage           adapter.Usage
+	history         []adapter.NativeEvent
+	identity        process.Identity
+	projectRoot     string
+	runtimeIdentity adapter.RuntimeIdentity
+	closed          bool
+	closeEvents     sync.Once
+	closeStderr     sync.Once
 }
 
 func New(executable string) *Adapter {
@@ -216,6 +217,11 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 		resultReady: make(chan struct{}),
 		identity:    identity,
 		projectRoot: req.ProjectRoot,
+		runtimeIdentity: adapter.RuntimeIdentity{
+			RequestedModel: req.Model,
+			ProviderSource: adapter.EvidenceUnavailable,
+			ModelSource:    adapter.EvidenceUnavailable,
+		},
 	}
 	a.mu.Lock()
 	a.sessions[id] = state
@@ -311,6 +317,18 @@ func (a *Adapter) ReadHistory(_ context.Context, id string) ([]adapter.NativeEve
 	return result, nil
 }
 
+// RuntimeIdentity returns native Claude metadata without deriving a provider
+// from the executable or adapter name.
+func (a *Adapter) RuntimeIdentity(_ context.Context, id string) (adapter.RuntimeIdentity, error) {
+	state, err := a.requireSession(id)
+	if err != nil {
+		return adapter.RuntimeIdentity{}, err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.runtimeIdentity, nil
+}
+
 func (a *Adapter) RespondPermission(context.Context, string, adapter.PermissionDecision) error {
 	return adapter.ErrUnsupported
 }
@@ -390,7 +408,7 @@ func (a *Adapter) requireSession(id string) (*sessionState, error) {
 
 func sessionFromState(state *sessionState) adapter.Session {
 	return adapter.Session{
-		NativeSessionID: state.id, PID: state.identity.PID, ProcessStartToken: state.identity.StartToken,
+		NativeSessionID: state.id, PID: state.identity.PID, ProcessStartToken: state.identity.StartToken, ProcessGroupToken: state.identity.ProcessGroupToken,
 		Events: state.events, Exited: state.exited, Stderr: state.stderr,
 	}
 }
@@ -424,6 +442,7 @@ func (a *Adapter) readStdout(state *sessionState, stdout io.Reader) {
 		line, err := reader.ReadBytes('\n')
 		if len(strings.TrimSpace(string(line))) > 0 {
 			native := nativeEvent(line)
+			captureRuntimeIdentity(state, native.Payload)
 			state.mu.Lock()
 			state.history = append(state.history, native)
 			state.mu.Unlock()
@@ -441,6 +460,46 @@ func (a *Adapter) readStdout(state *sessionState, stdout io.Reader) {
 			state.events <- adapter.NativeEvent{Kind: "protocol.error", Timestamp: time.Now().UTC(), Payload: payload}
 			return
 		}
+	}
+}
+
+func captureRuntimeIdentity(state *sessionState, payload []byte) {
+	var value struct {
+		Provider   string `json:"provider"`
+		ProviderID string `json:"provider_id"`
+		Model      string `json:"model"`
+		ModelID    string `json:"model_id"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &value) != nil {
+		return
+	}
+	provider := strings.TrimSpace(value.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(value.ProviderID)
+	}
+	model := strings.TrimSpace(value.Model)
+	if model == "" {
+		model = strings.TrimSpace(value.ModelID)
+	}
+	nativeProvider, nativeModel := adapter.RuntimeIdentityFields(payload)
+	if provider == "" {
+		provider = nativeProvider
+	}
+	if model == "" {
+		model = nativeModel
+	}
+	if provider == "" && model == "" {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if provider != "" {
+		state.runtimeIdentity.ObservedProvider = provider
+		state.runtimeIdentity.ProviderSource = adapter.EvidenceNativeProtocol
+	}
+	if model != "" {
+		state.runtimeIdentity.ObservedModel = model
+		state.runtimeIdentity.ModelSource = adapter.EvidenceNativeProtocol
 	}
 }
 

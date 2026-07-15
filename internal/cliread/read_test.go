@@ -207,11 +207,16 @@ func writeJSON(path string, value any) error {
 
 func listenSocket(t *testing.T, runDir string) (net.Listener, string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(supervisor.ControlTokenPath(runDir)), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Dir(supervisor.SocketPath(runDir)), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	// Control credential required by CallIPC after auth hardening.
-	_ = os.WriteFile(supervisor.ControlTokenPath(runDir), []byte("test-control-token\n"), 0o600)
+	if err := os.WriteFile(supervisor.ControlTokenPath(runDir), []byte("test-control-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	listener, err := net.Listen("unix", supervisor.SocketPath(runDir))
 	if err != nil {
 		t.Fatal(err)

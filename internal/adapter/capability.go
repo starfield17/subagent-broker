@@ -12,6 +12,96 @@ type CapabilitySet struct {
 	Downgrades []string `json:"downgrades,omitempty"`
 }
 
+// CapabilityEvidence separates what a Harness declares, what a probe reports,
+// and what a live operation actually demonstrated. RuntimeVerified must only
+// contain capabilities exercised by the current evidence-producing operation.
+type CapabilityEvidence struct {
+	Declared        Capabilities `json:"declared"`
+	ProbeReported   Capabilities `json:"probe_reported"`
+	RuntimeVerified Capabilities `json:"runtime_verified"`
+	NotExercised    []string     `json:"not_exercised,omitempty"`
+	Contradicted    []string     `json:"contradicted,omitempty"`
+}
+
+// CapabilityNames returns stable JSON-friendly capability names in descriptor
+// order. Keeping this mapping in one place prevents Doctor reports from
+// accidentally treating a true descriptor bit as runtime evidence.
+func CapabilityNames() []string {
+	return []string{
+		"structured_stream", "bidirectional_stream", "resume_session", "steer_active_turn",
+		"interrupt_turn", "structured_final_output", "permission_events", "diff_events",
+		"usage_events", "native_subagents", "native_server_mode", "acp", "hooks", "session_history",
+	}
+}
+
+func (c Capabilities) Has(name string) bool {
+	switch name {
+	case "structured_stream":
+		return c.StructuredStream
+	case "bidirectional_stream":
+		return c.BidirectionalStream
+	case "resume_session":
+		return c.ResumeSession
+	case "steer_active_turn":
+		return c.SteerActiveTurn
+	case "interrupt_turn":
+		return c.InterruptTurn
+	case "structured_final_output":
+		return c.StructuredFinalOutput
+	case "permission_events":
+		return c.PermissionEvents
+	case "diff_events":
+		return c.DiffEvents
+	case "usage_events":
+		return c.UsageEvents
+	case "native_subagents":
+		return c.NativeSubagents
+	case "native_server_mode":
+		return c.NativeServerMode
+	case "acp":
+		return c.ACP
+	case "hooks":
+		return c.Hooks
+	case "session_history":
+		return c.SessionHistory
+	default:
+		return false
+	}
+}
+
+func (c *Capabilities) Set(name string, value bool) {
+	switch name {
+	case "structured_stream":
+		c.StructuredStream = value
+	case "bidirectional_stream":
+		c.BidirectionalStream = value
+	case "resume_session":
+		c.ResumeSession = value
+	case "steer_active_turn":
+		c.SteerActiveTurn = value
+	case "interrupt_turn":
+		c.InterruptTurn = value
+	case "structured_final_output":
+		c.StructuredFinalOutput = value
+	case "permission_events":
+		c.PermissionEvents = value
+	case "diff_events":
+		c.DiffEvents = value
+	case "usage_events":
+		c.UsageEvents = value
+	case "native_subagents":
+		c.NativeSubagents = value
+	case "native_server_mode":
+		c.NativeServerMode = value
+	case "acp":
+		c.ACP = value
+	case "hooks":
+		c.Hooks = value
+	case "session_history":
+		c.SessionHistory = value
+	}
+}
+
 // SessionConfigFact records what was actually installed for a session.
 type SessionConfigFact struct {
 	PermissionMode string `json:"permission_mode,omitempty"`

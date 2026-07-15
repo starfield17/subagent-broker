@@ -31,7 +31,7 @@ The Phase 4 runtime was verified with the locally installed tools:
 - Grok Build `0.2.99`
 - OpenCode `1.17.15`
 
-`subagent-broker doctor` probes all four Harnesses and reports installed, authenticated, compatible status and capabilities without printing credentials. Scripted Adapter contracts cover Codex App Server JSONL and Grok ACP multiplexing; the native contract smoke completed authenticated `StartSession`/`CollectFinalResult` flows for Claude Code, Codex, Grok Build, and OpenCode. A full Codex dispatch completed through Supervisor, Barrier verification, and report publication; OpenCode also passed a real loopback server health probe.
+`subagent-broker doctor` without `--smoke` performs static environment probing for all four Harnesses and reports installed, authenticated, compatible status and declared/probe-reported capabilities without printing credentials. It does not complete a live authenticated model session. Scripted Adapter contracts cover Codex App Server JSONL and Grok ACP multiplexing; the historical native contract smoke completed authenticated `StartSession`/`CollectFinalResult` flows for Claude Code, Codex, Grok Build, and OpenCode. A full Codex dispatch completed through Supervisor, Barrier verification, and report publication; OpenCode also passed a real loopback server health probe.
 
 Capability claims remain protocol-specific: Codex active-turn steering is sent through `turn/steer`; Grok Build and OpenCode expose next-turn/resume delivery rather than immediate steering. Versions outside the tested versions are reported as `compatibility_unverified`.
 
@@ -350,6 +350,63 @@ Results:
 
 No live authenticated Harness smoke was run for Patch C. The pre-existing
 repeated Codex EOF fixture timeout was not changed by this patch.
+
+## Patch D — live Doctor smoke and runtime identity evidence
+
+Doctor now has two explicit modes:
+
+- `doctor` / `--smoke=false` performs static probing only. Descriptor and probe
+  capabilities are labeled as declared or probe-reported evidence; they are
+  not called runtime-verified.
+- `doctor --smoke` requires installed, usable authentication and performs one
+  bounded live model request per selected Harness. It may consume tokens,
+  incur provider cost, and require network access. `--timeout` defaults to two
+  minutes per Harness and `--keep-workspace` defaults to false.
+
+Live smoke uses a fresh isolated temporary project, requires the current-turn
+`ResultSubmitted` boundary plus a valid canonical Result Envelope, checks the
+exact synthetic Task and Worker IDs, requires no workspace changes, and
+confirms cleanup/process-tree exit when a complete OS identity is available.
+`--harness all` runs serially and reports every selected Harness before the
+aggregate exit status. The basic smoke exercises only session startup,
+structured event streaming, the current-turn terminal boundary, structured
+final output, result identity binding, and session/process cleanup. Resume,
+steering, bidirectional streaming, permission events, interrupts,
+cancellation, diff/usage events, hooks, history, and native subagents remain
+unverified unless a future smoke explicitly exercises them. Native server mode
+and ACP-specific behavior also remain unverified as capabilities.
+
+Runtime identity is separate evidence: requested model, observed provider,
+observed model, and the source of each observation are persisted independently.
+Native protocol metadata is preferred; missing or malformed metadata remains
+`unavailable` rather than being inferred from an executable, Adapter name,
+Descriptor, or requested model. Fixed-provider expectations are not observed
+provider facts. Doctor never prints or persists authentication tokens, API
+keys, raw Authorization headers, full environments, control tokens, or Worker
+tokens. Compact JSON and Markdown evidence remain under
+`<broker-home>/doctor/runs/<doctor-run-id>/`; raw Result Envelopes are not
+duplicated unnecessarily.
+
+Patch D automated coverage uses fake/scripted Adapters only. No real
+authenticated Harness smoke was executed for this implementation.
+
+### Patch D validation — 2026-07-15
+
+Executed:
+
+```bash
+gofmt -w .
+test -z "$(gofmt -l .)"
+go test ./...
+go test -race ./...
+go test -race ./internal/doctor/... ./internal/adapter/... ./internal/supervisor/... ./cmd/subagent-broker/... -count=10
+go vet ./...
+go build ./cmd/subagent-broker
+```
+
+Results: formatting, all tests, full race tests, repeated Doctor/Adapter/
+Supervisor/CLI race coverage, vet, and build passed. No real authenticated
+Harness smoke was executed for Patch D.
 
 ## Result envelope and resolution protocol invariants
 

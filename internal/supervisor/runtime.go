@@ -2164,7 +2164,29 @@ func (s *Service) markPartial(runtime *TaskState, status report.Status) error {
 	return s.saveRuntime(*runtime)
 }
 
+type taskFailureContext struct {
+	Stage          string
+	Cause          error
+	ResultObserved bool
+}
+
+// failTask is the compatibility path for failures known to occur before a
+// result boundary. Callers that have observed ResultSubmitted must use
+// failTaskWithEvidence so failure evidence records that boundary even when
+// collection, normalization, or publication fails afterward.
 func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
+	return s.failTaskWithContext(runtime, taskFailureContext{Stage: stage, Cause: err})
+}
+
+func (s *Service) failTaskWithEvidence(runtime *TaskState, stage string, err error, resultObserved bool) error {
+	return s.failTaskWithContext(runtime, taskFailureContext{Stage: stage, Cause: err, ResultObserved: resultObserved})
+}
+
+func (s *Service) failTaskWithContext(runtime *TaskState, failure taskFailureContext) error {
+	stage, err := failure.Stage, failure.Cause
+	if err == nil {
+		err = errors.New("unknown task failure")
+	}
 	runtime.LastError = err.Error()
 	if runtime.Worker != nil {
 		runtime.Worker.StatusDimensions.Protocol = state.ProtocolError
@@ -2181,8 +2203,7 @@ func (s *Service) failTask(runtime *TaskState, stage string, err error) error {
 		// Fail-closed: terminal cleanup persistence errors must surface.
 		durabilityErrs = append(durabilityErrs, fmt.Errorf("expire messages: %w", expireErr))
 	}
-	resultObserved := runtime.ReportPath != "" || stage == "result_validation"
-	evidencePublication, evidenceErr := s.recordFailureEvidence(runtime, stage, err, resultObserved)
+	evidencePublication, evidenceErr := s.recordFailureEvidence(runtime, stage, err, failure.ResultObserved)
 	if evidenceErr != nil {
 		durabilityErrs = append(durabilityErrs, fmt.Errorf("publish failure evidence: %w", evidenceErr))
 	}

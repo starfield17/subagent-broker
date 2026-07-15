@@ -27,26 +27,27 @@ type Adapter struct {
 }
 
 type sessionState struct {
-	mu            sync.Mutex
-	process       *transport.Process
-	threadID      string
-	turnID        string
-	workerID      string
-	stream        *protocol.EventStream
-	resultReady   chan struct{}
-	resultOnce    sync.Once
-	shutdown      chan struct{}
-	shutdownOnce  sync.Once
-	history       []adapter.NativeEvent
-	final         []byte
-	output        strings.Builder
-	resultError   string
-	usage         adapter.Usage
-	diff          []string
-	nextID        int64
-	pending       map[int64]chan rpcMessage
-	serverRequest map[string]struct{}
-	agentPhases   map[string]string
+	mu              sync.Mutex
+	process         *transport.Process
+	threadID        string
+	turnID          string
+	workerID        string
+	stream          *protocol.EventStream
+	resultReady     chan struct{}
+	resultOnce      sync.Once
+	shutdown        chan struct{}
+	shutdownOnce    sync.Once
+	history         []adapter.NativeEvent
+	final           []byte
+	output          strings.Builder
+	resultError     string
+	usage           adapter.Usage
+	diff            []string
+	nextID          int64
+	pending         map[int64]chan rpcMessage
+	serverRequest   map[string]struct{}
+	agentPhases     map[string]string
+	runtimeIdentity adapter.RuntimeIdentity
 	// terminalCommitted is true after exactly one terminal boundary has been
 	// recorded in history (ResultSubmitted or TurnFailed). Prevents double commit
 	// when process EOF races with a protocol terminal notification.
@@ -129,6 +130,11 @@ func (a *Adapter) start(ctx context.Context, req adapter.StartRequest, resumeID 
 		stream:      protocol.NewEventStream(protocol.EventStreamOptions{OutputBuffer: 256, ProgressQueueLimit: 256}),
 		resultReady: make(chan struct{}), shutdown: make(chan struct{}),
 		pending: map[int64]chan rpcMessage{}, serverRequest: map[string]struct{}{}, agentPhases: map[string]string{},
+		runtimeIdentity: adapter.RuntimeIdentity{
+			RequestedModel: req.Model,
+			ProviderSource: adapter.EvidenceUnavailable,
+			ModelSource:    adapter.EvidenceUnavailable,
+		},
 	}
 	go a.readProcess(state)
 	if err := a.initialize(ctx, state); err != nil {
@@ -276,6 +282,16 @@ func (a *Adapter) ReadHistory(_ context.Context, id string) ([]adapter.NativeEve
 	return append([]adapter.NativeEvent(nil), state.history...), nil
 }
 
+func (a *Adapter) RuntimeIdentity(_ context.Context, id string) (adapter.RuntimeIdentity, error) {
+	state, err := a.requireSession(id)
+	if err != nil {
+		return adapter.RuntimeIdentity{}, err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.runtimeIdentity, nil
+}
+
 func (a *Adapter) RespondPermission(ctx context.Context, id string, decision adapter.PermissionDecision) error {
 	state, err := a.requireSession(id)
 	if err != nil {
@@ -408,6 +424,7 @@ func (a *Adapter) request(ctx context.Context, state *sessionState, method strin
 		if len(message.Error) > 0 && string(message.Error) != "null" {
 			return nil, fmt.Errorf("%s: %s", method, string(message.Error))
 		}
+		a.captureRuntimeIdentity(state, message.Result)
 		return message.Result, nil
 	case <-ctx.Done():
 		a.removePending(state, id)
@@ -484,6 +501,7 @@ func (a *Adapter) handleLine(state *sessionState, line []byte) {
 
 func (a *Adapter) notificationEvent(state *sessionState, method string, params json.RawMessage) codexNotification {
 	now := time.Now().UTC()
+	a.captureRuntimeIdentity(state, params)
 	switch method {
 	case "thread/started", "thread/resumed":
 		return codexNotification{Event: adapter.NativeEvent{Kind: event.SessionStarted, Timestamp: now, Payload: params}}
@@ -605,6 +623,60 @@ func (a *Adapter) notificationEvent(state *sessionState, method string, params j
 	}
 }
 
+// captureRuntimeIdentity accepts only explicit provider/model fields emitted by
+// Codex responses or notifications. It never falls back to the requested model.
+func (a *Adapter) captureRuntimeIdentity(state *sessionState, payload []byte) {
+	var value struct {
+		Provider    string `json:"provider"`
+		ProviderID  string `json:"providerId"`
+		ProviderID2 string `json:"provider_id"`
+		Model       string `json:"model"`
+		ModelID     string `json:"modelId"`
+		ModelID2    string `json:"model_id"`
+		ModelID3    string `json:"modelID"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &value) != nil {
+		return
+	}
+	provider := strings.TrimSpace(value.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(value.ProviderID)
+	}
+	if provider == "" {
+		provider = strings.TrimSpace(value.ProviderID2)
+	}
+	model := strings.TrimSpace(value.Model)
+	if model == "" {
+		model = strings.TrimSpace(value.ModelID)
+	}
+	if model == "" {
+		model = strings.TrimSpace(value.ModelID2)
+	}
+	if model == "" {
+		model = strings.TrimSpace(value.ModelID3)
+	}
+	nativeProvider, nativeModel := adapter.RuntimeIdentityFields(payload)
+	if provider == "" {
+		provider = nativeProvider
+	}
+	if model == "" {
+		model = nativeModel
+	}
+	if provider == "" && model == "" {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if provider != "" {
+		state.runtimeIdentity.ObservedProvider = provider
+		state.runtimeIdentity.ProviderSource = adapter.EvidenceNativeProtocol
+	}
+	if model != "" {
+		state.runtimeIdentity.ObservedModel = model
+		state.runtimeIdentity.ModelSource = adapter.EvidenceNativeProtocol
+	}
+}
+
 // recordTerminalEvent commits terminal state and history before unblocking
 // resultReady. Order:
 //  1. Freeze final / usage / resultError (already applied by caller where needed)
@@ -698,7 +770,7 @@ func sessionFromState(state *sessionState) adapter.Session {
 	if state.stream != nil {
 		events = state.stream.Events()
 	}
-	return adapter.Session{NativeSessionID: state.threadID, NativeTurnID: state.turnID, PID: identity.PID, ProcessStartToken: identity.StartToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
+	return adapter.Session{NativeSessionID: state.threadID, NativeTurnID: state.turnID, PID: identity.PID, ProcessStartToken: identity.StartToken, ProcessGroupToken: identity.ProcessGroupToken, Events: events, Exited: state.process.Exited(), Stderr: state.process.Stderr()}
 }
 
 func responseID(raw json.RawMessage) string {

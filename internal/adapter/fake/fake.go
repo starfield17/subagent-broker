@@ -17,13 +17,17 @@ import (
 )
 
 type Scenario struct {
-	Name     string
-	Events   []adapter.NativeEvent
-	Final    *report.Envelope
-	Diff     []string
-	Usage    adapter.Usage
-	KeepOpen bool
-	ExitCode int
+	Name              string
+	Events            []adapter.NativeEvent
+	Final             *report.Envelope
+	Diff              []string
+	Usage             adapter.Usage
+	KeepOpen          bool
+	ExitCode          int
+	ProcessGroupToken string
+	// RuntimeIdentity contains explicit native-protocol facts for Doctor and
+	// Supervisor tests. It is never filled from the requested model.
+	RuntimeIdentity adapter.RuntimeIdentity
 	// FollowUpBatches: each SendMessage consumes the next batch and emits those
 	// events on the live session channel (multi-turn lifecycle tests).
 	FollowUpBatches [][]adapter.NativeEvent
@@ -45,6 +49,7 @@ type sessionState struct {
 	promptInFlight  bool
 	producers       sync.WaitGroup
 	readerExited    bool
+	runtimeIdentity adapter.RuntimeIdentity
 }
 
 type Adapter struct {
@@ -121,7 +126,7 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 	fakePID := int(1_000_000_000 + n)
 	session := adapter.Session{
 		NativeSessionID: id, NativeTurnID: "turn-1", Events: stream.Events(), Exited: exited,
-		PID: fakePID, ProcessStartToken: "fake-start-" + id,
+		PID: fakePID, ProcessStartToken: "fake-start-" + id, ProcessGroupToken: scenario.ProcessGroupToken,
 	}
 	final := cloneEnvelope(scenario.Final)
 	if final != nil {
@@ -132,11 +137,26 @@ func (a *Adapter) StartSession(ctx context.Context, req adapter.StartRequest) (a
 			final.WorkerID = req.WorkerID
 		}
 	}
+	runtimeIdentity := scenario.RuntimeIdentity
+	runtimeIdentity.RequestedModel = req.Model
+	if runtimeIdentity.ObservedProvider != "" && runtimeIdentity.ProviderSource == "" {
+		runtimeIdentity.ProviderSource = adapter.EvidenceNativeProtocol
+	}
+	if runtimeIdentity.ObservedModel != "" && runtimeIdentity.ModelSource == "" {
+		runtimeIdentity.ModelSource = adapter.EvidenceNativeProtocol
+	}
+	if runtimeIdentity.ProviderSource == "" {
+		runtimeIdentity.ProviderSource = adapter.EvidenceUnavailable
+	}
+	if runtimeIdentity.ModelSource == "" {
+		runtimeIdentity.ModelSource = adapter.EvidenceUnavailable
+	}
 	state := &sessionState{
 		session: session, stream: stream, done: make(chan struct{}), final: final,
 		diff: append([]string(nil), scenario.Diff...), usage: scenario.Usage,
 		followUpBatches: append([][]adapter.NativeEvent(nil), scenario.FollowUpBatches...),
 		followUpFinals:  append([]*report.Envelope(nil), scenario.FollowUpFinals...),
+		runtimeIdentity: runtimeIdentity,
 	}
 	a.sessions[id] = state
 	a.mu.Unlock()
@@ -222,6 +242,7 @@ func (a *Adapter) ResumeSession(ctx context.Context, req adapter.ResumeRequest) 
 		Exited:            exited,
 		PID:               pid,
 		ProcessStartToken: startTok,
+		ProcessGroupToken: state.session.ProcessGroupToken,
 	}
 	if state.final == nil {
 		// Ensure resume always has a collectable result for full lifecycle tests.
@@ -405,6 +426,16 @@ func (a *Adapter) ReadHistory(_ context.Context, id string) ([]adapter.NativeEve
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]adapter.NativeEvent(nil), state.history...), nil
+}
+
+func (a *Adapter) RuntimeIdentity(_ context.Context, id string) (adapter.RuntimeIdentity, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state, ok := a.sessions[id]
+	if !ok {
+		return adapter.RuntimeIdentity{}, fmt.Errorf("unknown fake session %q", id)
+	}
+	return state.runtimeIdentity, nil
 }
 
 func (a *Adapter) RespondPermission(_ context.Context, id string, decision adapter.PermissionDecision) error {

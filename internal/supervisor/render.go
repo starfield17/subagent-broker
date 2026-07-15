@@ -21,6 +21,10 @@ func renderStatus(snapshot Snapshot) string {
 		fmt.Fprintf(&b, "  progress: %s\n", runtime.Dimensions.Progress)
 		if runtime.Worker != nil {
 			fmt.Fprintf(&b, "  harness: %s\n", runtime.Worker.Harness)
+			fmt.Fprintf(&b, "  requested model: %s\n", displayEvidence(runtime.Worker.RuntimeIdentity.RequestedModel))
+			fmt.Fprintf(&b, "  observed provider: %s\n", displayEvidence(runtime.Worker.RuntimeIdentity.ObservedProvider))
+			fmt.Fprintf(&b, "  observed model: %s\n", displayEvidence(runtime.Worker.RuntimeIdentity.ObservedModel))
+			fmt.Fprintf(&b, "  identity evidence source: provider=%s model=%s\n", displayEvidence(string(runtime.Worker.RuntimeIdentity.ProviderSource)), displayEvidence(string(runtime.Worker.RuntimeIdentity.ModelSource)))
 			if !runtime.LastProgress.IsZero() {
 				fmt.Fprintf(&b, "  last progress: %s\n", runtime.LastProgress.UTC().Format(time.RFC3339))
 			}
@@ -41,6 +45,13 @@ func renderStatus(snapshot Snapshot) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+func displayEvidence(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unavailable"
+	}
+	return value
 }
 
 // RenderStatus exposes the same projection used for status.md so IPC-first CLI
